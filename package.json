@@ -1,0 +1,18 @@
+{
+  "name": "xitter-bridge",
+  "version": "1.0.0",
+  "description": "Twitter API v1.1 to X API v2 Translation Proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "form-data": "^4.0.0",
+    "multer": "^1.4.5-lts.1",
+    "oauth-1.0a": "^2.2.6"
+  }
+}
