@@ -53,7 +53,7 @@ function getKeys(req) {
 }
 
 /**
- * Mock OAuth Authentication Handshake
+ * OAuth Authentication Handshake (Passes Render tokens to bypass X restrictions)
  */
 app.all('/oauth/request_token', (req, res) => {
   res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true');
@@ -76,7 +76,7 @@ app.all('/oauth/access_token', (req, res) => {
 
 /**
  * 1. Verify Credentials Endpoint (GET)
- * Legacy: GET /1.1/account/verify_credentials.json
+ * Fetches real user profile info from X API v2
  */
 app.get('/1.1/account/verify_credentials.json', async (req, res) => {
   try {
@@ -99,7 +99,7 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
 
     return res.status(200).json(v11User);
   } catch (err) {
-    // Fallback profile if X API v2 rate-limits or fails
+    console.error('Verify credentials error:', err.response?.data || err.message);
     return res.status(200).json({
       id: 12345678,
       id_str: "12345678",
@@ -112,8 +112,7 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
 
 /**
  * 2. Home Timeline Endpoint (GET)
- * Legacy: GET /1.1/statuses/home_timeline.json
- * Returns a stable mock tweet array to prevent 404 crashes
+ * Fetches real live tweets from your account using the v2 User Tweets endpoint
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   try {
@@ -121,9 +120,11 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
     const meUrl = `${X_API_BASE}/2/users/me`;
     const meAuth = getOAuthHeader(meUrl, 'GET', keys);
     const meRes = await axios.get(meUrl, { headers: { ...meAuth } });
-    const userId = meRes.data.data.id;
+    const userData = meRes.data.data;
+    const userId = userData.id;
 
-    const targetUrl = `${X_API_BASE}/2/users/${userId}/timelines/home_timeline?tweet.fields=created_at,text,author_id&expansions=author_id&user.fields=name,username,profile_image_url`;
+    // Fetch real user tweets
+    const targetUrl = `${X_API_BASE}/2/users/${userId}/tweets?tweet.fields=created_at,text,author_id&expansions=author_id&user.fields=name,username,profile_image_url&max_results=20`;
     const authHeaders = getOAuthHeader(targetUrl, 'GET', keys);
 
     const xResponse = await axios.get(targetUrl, {
@@ -131,20 +132,20 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
     });
 
     const tweets = xResponse.data.data || [];
-    const users = xResponse.data.includes?.users || [];
+    const users = xResponse.data.includes?.users || [userData];
     const userMap = {};
     users.forEach(u => { userMap[u.id] = u; });
 
     const v11Tweets = tweets.map(tweet => {
-      const author = userMap[tweet.author_id] || {};
+      const author = userMap[tweet.author_id] || userData;
       return {
         created_at: tweet.created_at || new Date().toUTCString(),
         id: parseInt(tweet.id, 10),
         id_str: tweet.id,
         text: tweet.text,
         user: {
-          id: parseInt(author.id || '0', 10),
-          id_str: author.id || '0',
+          id: parseInt(author.id || userId, 10),
+          id_str: author.id || userId,
           name: author.name || 'Daniel\'s Doodles',
           screen_name: author.username || 'daniels_doodles',
           profile_image_url_https: author.profile_image_url || '',
@@ -152,19 +153,16 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
       };
     });
 
-    if (v11Tweets.length === 0) {
-      throw new Error('Empty timeline');
-    }
-
     return res.status(200).json(v11Tweets);
   } catch (err) {
-    // Graceful fallback timeline so the app loads successfully without crashing
+    console.error('Timeline fetch error:', err.response?.data || err.message);
+    // Fallback if rate limited or empty
     return res.status(200).json([
       {
         created_at: new Date().toUTCString(),
         id: 999999999,
         id_str: "999999999",
-        text: "🎉 XitterBridge is successfully connected to your Windows Phone!",
+        text: "XitterBridge connected! (Post a tweet on X to see it appear here live)",
         user: {
           id: 12345,
           id_str: "12345",
@@ -259,12 +257,9 @@ app.post('/1.1/statuses/update.json', async (req, res) => {
 
     return res.status(200).json(v11Response);
   } catch (err) {
-    return res.status(200).json({
-      id_str: "987654321",
-      id: 987654321,
-      text: req.body.status || "Posted via XitterBridge",
-      created_at: new Date().toUTCString(),
-    });
+    const status = err.response?.status || 500;
+    const errorData = err.response?.data || { error: err.message };
+    return res.status(status).json(errorData);
   }
 });
 
