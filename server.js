@@ -33,33 +33,12 @@ let localTimeline = [
 ];
 
 /**
- * Health check endpoint for uptime monitors
+ * Health check endpoint
  */
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'XitterBridge' });
 });
 
-/**
- * OAuth 1.0a Signature Generator
- */
-function getOAuthHeader(url, method, keys, extraParams = {}) {
-  const oauth = OAuth({
-    consumer: { key: keys.consumerKey, secret: keys.consumerSecret },
-    signature_method: 'HMAC-SHA1',
-    hash_function(base_string, key) {
-      return crypto.createHmac('sha1', key).update(base_string).digest('base64');
-    },
-  });
-
-  const request_data = { url, method, data: extraParams };
-  const token = { key: keys.accessToken, secret: keys.accessTokenSecret };
-
-  return oauth.toHeader(oauth.authorize(request_data, token));
-}
-
-/**
- * Strictly enforce Render Environment Variables for all keys
- */
 function getKeys(req) {
   return {
     consumerKey: process.env.X_CONSUMER_KEY,
@@ -92,7 +71,34 @@ app.all('/oauth/access_token', (req, res) => {
 });
 
 /**
- * 1. Verify Credentials Endpoint (GET)
+ * 1. Account Settings & Help Configuration (Fixes Compose Window Crash)
+ */
+app.get('/1.1/help/configuration.json', (req, res) => {
+  return res.status(200).json({
+    dm_text_character_limit: 10000,
+    max_media_per_upload: 1,
+    characters_reserved_per_media: 23,
+    photo_size_limit: 3145728,
+    photo_sizes: {
+      thumb: { w: 150, h: 150, resize: "crop" },
+      small: { w: 340, h: 480, resize: "fit" },
+      medium: { w: 600, h: 800, resize: "fit" },
+      large: { w: 1024, h: 2048, resize: "fit" }
+    }
+  });
+});
+
+app.get('/1.1/account/settings.json', (req, res) => {
+  return res.status(200).json({
+    screen_name: "daniels_doodles",
+    always_use_https: true,
+    geo_enabled: false,
+    protected: false
+  });
+});
+
+/**
+ * 2. Verify Credentials Endpoint (GET)
  */
 app.get('/1.1/account/verify_credentials.json', async (req, res) => {
   return res.status(200).json({
@@ -105,31 +111,24 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
 });
 
 /**
- * 2. Home Timeline Endpoint (GET)
- * Returns the local timeline array containing all posted tweets
+ * 3. Home Timeline Endpoint (GET)
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
-  console.log(`[XitterBridge] Serving timeline (${localTimeline.length} tweets)`);
   return res.status(200).json(localTimeline);
 });
 
 /**
- * 3. Media Upload Endpoint (POST)
+ * 4. Media Upload Endpoint (POST & GET)
  */
-app.post('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
+app.all('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
   return res.status(200).json({ media_id: 123456789, media_id_string: "123456789" });
 });
 
 /**
- * 4. Post Tweet Endpoint (POST)
- * Captures outgoing tweets from the phone and adds them directly to the local feed
+ * 5. Post Tweet Endpoint (POST)
  */
 app.post('/1.1/statuses/update.json', async (req, res) => {
-  const tweetText = req.body.status || req.query.status;
-
-  if (!tweetText) {
-    return res.status(400).json({ errors: [{ message: 'Missing status parameter' }] });
-  }
+  const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
 
   const newTweetId = Date.now();
   const newTweet = {
@@ -146,15 +145,12 @@ app.post('/1.1/statuses/update.json', async (req, res) => {
     }
   };
 
-  // Prepend new tweet to the top of the timeline
   localTimeline.unshift(newTweet);
-  console.log(`[XitterBridge] New tweet posted: "${tweetText}"`);
-
   return res.status(200).json(newTweet);
 });
 
 /**
- * 5. Universal Catch-All Handler for ALL Other v1.1 Endpoints
+ * 6. Universal Catch-All Handler for ALL Other v1.1 Endpoints
  */
 app.all('/1.1/*', async (req, res) => {
   const path = req.path;
