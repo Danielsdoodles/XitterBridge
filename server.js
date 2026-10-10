@@ -59,7 +59,89 @@ function getKeys(req) {
 }
 
 /**
- * 1. Media Upload Endpoint
+ * 1. Verify Credentials Endpoint (GET)
+ * Legacy: GET /1.1/account/verify_credentials.json
+ */
+app.get('/1.1/account/verify_credentials.json', async (req, res) => {
+  try {
+    const keys = getKeys(req);
+    const targetUrl = `${X_API_BASE}/2/users/me?user.fields=profile_image_url,name,username`;
+    const authHeaders = getOAuthHeader(targetUrl, 'GET', keys);
+
+    const xResponse = await axios.get(targetUrl, {
+      headers: { ...authHeaders },
+    });
+
+    const userData = xResponse.data.data;
+    const v11User = {
+      id: parseInt(userData.id, 10),
+      id_str: userData.id,
+      name: userData.name,
+      screen_name: userData.username,
+      profile_image_url_https: userData.profile_image_url || '',
+    };
+
+    return res.status(200).json(v11User);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const errorData = err.response?.data || { error: err.message };
+    return res.status(status).json(errorData);
+  }
+});
+
+/**
+ * 2. Home Timeline Endpoint (GET)
+ * Legacy: GET /1.1/statuses/home_timeline.json
+ */
+app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
+  try {
+    const keys = getKeys(req);
+    
+    // Get user ID first
+    const meUrl = `${X_API_BASE}/2/users/me`;
+    const meAuth = getOAuthHeader(meUrl, 'GET', keys);
+    const meRes = await axios.get(meUrl, { headers: { ...meAuth } });
+    const userId = meRes.data.data.id;
+
+    const targetUrl = `${X_API_BASE}/2/users/${userId}/timelines/home_timeline?tweet.fields=created_at,text,author_id&expansions=author_id&user.fields=name,username,profile_image_url`;
+    const authHeaders = getOAuthHeader(targetUrl, 'GET', keys);
+
+    const xResponse = await axios.get(targetUrl, {
+      headers: { ...authHeaders },
+    });
+
+    const tweets = xResponse.data.data || [];
+    const users = xResponse.data.includes?.users || [];
+    const userMap = {};
+    users.forEach(u => { userMap[u.id] = u; });
+
+    const v11Tweets = tweets.map(tweet => {
+      const author = userMap[tweet.author_id] || {};
+      return {
+        created_at: tweet.created_at || new Date().toUTCString(),
+        id: parseInt(tweet.id, 10),
+        id_str: tweet.id,
+        text: tweet.text,
+        user: {
+          id: parseInt(author.id || '0', 10),
+          id_str: author.id || '0',
+          name: author.name || 'User',
+          screen_name: author.username || 'user',
+          profile_image_url_https: author.profile_image_url || '',
+        }
+      };
+    });
+
+    return res.status(200).json(v11Tweets);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const errorData = err.response?.data || { error: err.message };
+    return res.status(status).json(errorData);
+  }
+});
+
+/**
+ * 3. Media Upload Endpoint (POST)
  * Legacy: POST /1.1/media/upload.json
  */
 app.post('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
@@ -97,7 +179,7 @@ app.post('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
 });
 
 /**
- * 2. Post Tweet Endpoint
+ * 4. Post Tweet Endpoint (POST)
  * Legacy: POST /1.1/statuses/update.json
  */
 app.post('/1.1/statuses/update.json', async (req, res) => {
