@@ -41,43 +41,57 @@ function getOAuthHeader(url, method, keys, extraParams = {}) {
 }
 
 /**
- * Extract or fall back to OAuth 1.0a Credentials
+ * Strictly enforce Render Environment Variables for all keys
  */
 function getKeys(req) {
-  const authHeader = req.headers.authorization || '';
-  const extractParam = (param) => {
-    const match = authHeader.match(new RegExp(`${param}="([^"]+)"`));
-    return match ? match[1] : null;
-  };
-
   return {
-    consumerKey: extractParam('oauth_consumer_key') || process.env.X_CONSUMER_KEY,
+    consumerKey: process.env.X_CONSUMER_KEY,
     consumerSecret: process.env.X_CONSUMER_SECRET,
-    accessToken: extractParam('oauth_token') || process.env.X_ACCESS_TOKEN,
+    accessToken: process.env.X_ACCESS_TOKEN,
     accessTokenSecret: process.env.X_ACCESS_TOKEN_SECRET,
   };
 }
 
 /**
- * OAuth Authentication Handshake Proxy
- * Handles /oauth/access_token, /oauth/request_token, etc.
+ * OAuth Authentication Handshake Proxy (Forced Render Keys)
  */
 app.all('/oauth/*', async (req, res) => {
   try {
     const targetUrl = `https://api.x.com${req.path}`;
+    const method = req.method;
+    const queryParams = req.query;
+    const bodyParams = req.body;
+
+    const keys = getKeys(req);
+    const tokenToUse = { key: keys.accessToken, secret: keys.accessTokenSecret };
+
+    const oauth = OAuth({
+      consumer: { key: keys.consumerKey, secret: keys.consumerSecret },
+      signature_method: 'HMAC-SHA1',
+      hash_function(base_string, key) {
+        return crypto.createHmac('sha1', key).update(base_string).digest('base64');
+      },
+    });
+
+    const request_data = { url: targetUrl, method, data: { ...queryParams, ...bodyParams } };
+    const authHeaders = oauth.toHeader(oauth.authorize(request_data, tokenToUse));
+
     const response = await axios({
-      method: req.method,
+      method: method,
       url: targetUrl,
-      data: req.body,
-      params: req.query,
+      data: bodyParams,
+      params: queryParams,
       headers: {
-        ...req.headers,
-        host: 'api.x.com'
+        ...authHeaders,
+        'Host': 'api.x.com',
+        'Content-Type': req.headers['content-type'] || 'application/x-www-form-urlencoded'
       }
     });
+
     return res.status(response.status).send(response.data);
   } catch (err) {
     const status = err.response?.status || 500;
+    console.error('OAuth proxy error:', err.response?.data || err.message);
     return res.status(status).send(err.response?.data || err.message);
   }
 });
