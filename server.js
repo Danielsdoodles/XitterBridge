@@ -12,10 +12,15 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Global Request Logger: Prints every incoming request so we can see what triggers the crash
+app.use((req, res, next) => {
+  console.log(`[XitterBridge Incoming] ${req.method} ${req.path}`);
+  next();
+});
+
 const X_API_BASE = 'https://api.x.com';
 const X_UPLOAD_BASE = 'https://upload.x.com';
 
-// In-memory storage for tweets posted during this session
 let localTimeline = [
   {
     created_at: new Date().toUTCString(),
@@ -32,9 +37,6 @@ let localTimeline = [
   }
 ];
 
-/**
- * Health check endpoint
- */
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', service: 'XitterBridge' });
 });
@@ -49,7 +51,7 @@ function getKeys(req) {
 }
 
 /**
- * Mock OAuth Authentication Handshake
+ * Mock OAuth Handshake
  */
 app.all('/oauth/request_token', (req, res) => {
   res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true');
@@ -71,7 +73,7 @@ app.all('/oauth/access_token', (req, res) => {
 });
 
 /**
- * 1. Account Settings & Help Configuration (Fixes Compose Window Crash)
+ * Configuration & Settings Endpoints
  */
 app.get('/1.1/help/configuration.json', (req, res) => {
   return res.status(200).json({
@@ -79,12 +81,6 @@ app.get('/1.1/help/configuration.json', (req, res) => {
     max_media_per_upload: 1,
     characters_reserved_per_media: 23,
     photo_size_limit: 3145728,
-    photo_sizes: {
-      thumb: { w: 150, h: 150, resize: "crop" },
-      small: { w: 340, h: 480, resize: "fit" },
-      medium: { w: 600, h: 800, resize: "fit" },
-      large: { w: 1024, h: 2048, resize: "fit" }
-    }
   });
 });
 
@@ -98,7 +94,31 @@ app.get('/1.1/account/settings.json', (req, res) => {
 });
 
 /**
- * 2. Verify Credentials Endpoint (GET)
+ * Rate Limit Status (Often checked before composing or refreshing)
+ */
+app.get('/1.1/application/rate_limit_status.json', (req, res) => {
+  return res.status(200).json({
+    rate_limit_context: { access_token: "mock" },
+    resources: {
+      statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180, reset: Date.now() + 900000 } },
+      users: { "/users/show/:id": { limit: 180, remaining: 180, reset: Date.now() + 900000 } }
+    }
+  });
+});
+
+/**
+ * User Suggestions / Autocomplete (Often triggered in compose boxes)
+ */
+app.get('/1.1/users/suggestions.json', (req, res) => {
+  return res.status(200).json([]);
+});
+
+app.get('/1.1/users/suggestions/:slug', (req, res) => {
+  return res.status(200).json({ name: "Suggestions", users: [] });
+});
+
+/**
+ * Verify Credentials
  */
 app.get('/1.1/account/verify_credentials.json', async (req, res) => {
   return res.status(200).json({
@@ -111,21 +131,21 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
 });
 
 /**
- * 3. Home Timeline Endpoint (GET)
+ * Home Timeline
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   return res.status(200).json(localTimeline);
 });
 
 /**
- * 4. Media Upload Endpoint (POST & GET)
+ * Media Upload
  */
 app.all('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
   return res.status(200).json({ media_id: 123456789, media_id_string: "123456789" });
 });
 
 /**
- * 5. Post Tweet Endpoint (POST)
+ * Post Tweet
  */
 app.post('/1.1/statuses/update.json', async (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
@@ -150,7 +170,7 @@ app.post('/1.1/statuses/update.json', async (req, res) => {
 });
 
 /**
- * 6. Universal Catch-All Handler for ALL Other v1.1 Endpoints
+ * Universal Catch-All Handler
  */
 app.all('/1.1/*', async (req, res) => {
   const path = req.path;
