@@ -59,6 +59,30 @@ function getKeys(req) {
 }
 
 /**
+ * OAuth Authentication Handshake Proxy
+ * Handles /oauth/access_token, /oauth/request_token, etc.
+ */
+app.all('/oauth/*', async (req, res) => {
+  try {
+    const targetUrl = `https://api.x.com${req.path}`;
+    const response = await axios({
+      method: req.method,
+      url: targetUrl,
+      data: req.body,
+      params: req.query,
+      headers: {
+        ...req.headers,
+        host: 'api.x.com'
+      }
+    });
+    return res.status(response.status).send(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    return res.status(status).send(err.response?.data || err.message);
+  }
+});
+
+/**
  * 1. Verify Credentials Endpoint (GET)
  * Legacy: GET /1.1/account/verify_credentials.json
  */
@@ -229,38 +253,21 @@ app.post('/1.1/statuses/update.json', async (req, res) => {
 });
 
 /**
- * 5. Universal Catch-All Handler for ALL Other v1.1 Documentation Endpoints
- * (Covers blocks, favorites, lists, followers, friends, search, direct messages, user timelines, etc.)
+ * 5. Universal Catch-All Handler for ALL Other v1.1 Endpoints
  */
 app.all('/1.1/*', async (req, res) => {
   const path = req.path;
-  console.log(`[XitterBridge Multi-Endpoint] Caught ${req.method} for ${path}`);
-
   try {
-    // Handle specific common interaction patterns gracefully
     if (path.includes('favorites/create')) {
-      return res.status(200).json({ favorited: true, text: "Favorited via bridge" });
+      return res.status(200).json({ favorited: true });
     }
     if (path.includes('favorites/destroy')) {
-      return res.status(200).json({ favorited: false, text: "Unfavorited via bridge" });
-    }
-    if (path.includes('blocks/create') || path.includes('mutes/users/create')) {
-      return res.status(200).json({ id: 1, name: "Blocked/Muted" });
-    }
-    if (path.includes('friendships/create')) {
-      return res.status(200).json({ following: true });
+      return res.status(200).json({ favorited: false });
     }
     if (path.includes('list') || path.includes('timeline') || path.includes('search') || path.includes('ids')) {
       return res.status(200).json([]);
     }
-
-    // Default universal success response for any remaining v1.1 API calls
-    return res.status(200).json({
-      status: 'bridged',
-      endpoint: path,
-      method: req.method,
-      note: 'Processed by XitterBridge universal v1.1 router'
-    });
+    return res.status(200).json({ status: 'bridged', endpoint: path });
   } catch (err) {
     return res.status(200).json({ error: 'Bridge fallback handled exception', details: err.message });
   }
