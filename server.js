@@ -53,47 +53,34 @@ function getKeys(req) {
 }
 
 /**
- * OAuth Authentication Handshake Proxy (Forced Render Keys)
+ * Mock OAuth Authentication Handshake
+ * Bypasses X's "Client not permitted" restriction by feeding the phone your Render tokens.
  */
-app.all('/oauth/*', async (req, res) => {
-  try {
-    const targetUrl = `https://api.x.com${req.path}`;
-    const method = req.method;
-    const queryParams = req.query;
-    const bodyParams = req.body;
+app.all('/oauth/request_token', (req, res) => {
+  console.log('[XitterBridge Auth] Intercepted request_token handshake');
+  res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true');
+});
 
-    const keys = getKeys(req);
-    const tokenToUse = { key: keys.accessToken, secret: keys.accessTokenSecret };
-
-    const oauth = OAuth({
-      consumer: { key: keys.consumerKey, secret: keys.consumerSecret },
-      signature_method: 'HMAC-SHA1',
-      hash_function(base_string, key) {
-        return crypto.createHmac('sha1', key).update(base_string).digest('base64');
-      },
-    });
-
-    const request_data = { url: targetUrl, method, data: { ...queryParams, ...bodyParams } };
-    const authHeaders = oauth.toHeader(oauth.authorize(request_data, tokenToUse));
-
-    const response = await axios({
-      method: method,
-      url: targetUrl,
-      data: bodyParams,
-      params: queryParams,
-      headers: {
-        ...authHeaders,
-        'Host': 'api.x.com',
-        'Content-Type': req.headers['content-type'] || 'application/x-www-form-urlencoded'
-      }
-    });
-
-    return res.status(response.status).send(response.data);
-  } catch (err) {
-    const status = err.response?.status || 500;
-    console.error('OAuth proxy error:', err.response?.data || err.message);
-    return res.status(status).send(err.response?.data || err.message);
+app.all('/oauth/authorize', (req, res) => {
+  console.log('[XitterBridge Auth] Intercepted authorize handshake');
+  const callback = req.query.oauth_callback || 'oob';
+  if (callback === 'oob') {
+    res.send('<html><body><h1>PIN: 123456</h1></body></html>');
+  } else {
+    res.redirect(`${callback}?oauth_token=${req.query.oauth_token || 'mock_req_token'}&oauth_verifier=mock_verifier`);
   }
+});
+
+app.all('/oauth/authenticate', (req, res) => {
+  console.log('[XitterBridge Auth] Intercepted authenticate handshake');
+  const callback = req.query.oauth_callback || 'oob';
+  res.redirect(`${callback}?oauth_token=${req.query.oauth_token || 'mock_req_token'}&oauth_verifier=mock_verifier`);
+});
+
+app.all('/oauth/access_token', (req, res) => {
+  console.log('[XitterBridge Auth] Intercepted access_token handshake -> Issuing Render tokens');
+  const keys = getKeys(req);
+  res.send(`oauth_token=${encodeURIComponent(keys.accessToken)}&oauth_token_secret=${encodeURIComponent(keys.accessTokenSecret)}&user_id=12345678&screen_name=Danielsdoodles`);
 });
 
 /**
