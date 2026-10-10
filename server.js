@@ -15,6 +15,23 @@ app.use(express.json());
 const X_API_BASE = 'https://api.x.com';
 const X_UPLOAD_BASE = 'https://upload.x.com';
 
+// In-memory storage for tweets posted during this session
+let localTimeline = [
+  {
+    created_at: new Date().toUTCString(),
+    id: 999999999,
+    id_str: "999999999",
+    text: "🎉 XitterBridge local feed is active! Any status you post below will appear here instantly.",
+    user: {
+      id: 12345,
+      id_str: "12345",
+      name: "Daniel's Doodles",
+      screen_name: "daniels_doodles",
+      profile_image_url_https: ""
+    }
+  }
+];
+
 /**
  * Health check endpoint for uptime monitors
  */
@@ -89,38 +106,11 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
 
 /**
  * 2. Home Timeline Endpoint (GET)
- * Serves a robust feed while API v2 credits are depleted
+ * Returns the local timeline array containing all posted tweets
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
-  console.log('[XitterBridge] Serving stable timeline feed');
-  return res.status(200).json([
-    {
-      created_at: new Date().toUTCString(),
-      id: 999999999,
-      id_str: "999999999",
-      text: "XitterBridge is online and running smoothly on your Lumia!",
-      user: {
-        id: 12345,
-        id_str: "12345",
-        name: "Daniel's Doodles",
-        screen_name: "daniels_doodles",
-        profile_image_url_https: ""
-      }
-    },
-    {
-      created_at: new Date(Date.now() - 7200000).toUTCString(),
-      id: 999999998,
-      id_str: "999999998",
-      text: "Windows Phone 8.1 Metro UI looking pristine with custom proxy routing.",
-      user: {
-        id: 12345,
-        id_str: "12345",
-        name: "Daniel's Doodles",
-        screen_name: "daniels_doodles",
-        profile_image_url_https: ""
-      }
-    }
-  ]);
+  console.log(`[XitterBridge] Serving timeline (${localTimeline.length} tweets)`);
+  return res.status(200).json(localTimeline);
 });
 
 /**
@@ -132,15 +122,35 @@ app.post('/1.1/media/upload.json', upload.single('media'), async (req, res) => {
 
 /**
  * 4. Post Tweet Endpoint (POST)
+ * Captures outgoing tweets from the phone and adds them directly to the local feed
  */
 app.post('/1.1/statuses/update.json', async (req, res) => {
-  const tweetText = req.body.status || req.query.status || "Posted via XitterBridge";
-  return res.status(200).json({
-    id_str: "987654321",
-    id: 987654321,
-    text: tweetText,
+  const tweetText = req.body.status || req.query.status;
+
+  if (!tweetText) {
+    return res.status(400).json({ errors: [{ message: 'Missing status parameter' }] });
+  }
+
+  const newTweetId = Date.now();
+  const newTweet = {
     created_at: new Date().toUTCString(),
-  });
+    id: newTweetId,
+    id_str: newTweetId.toString(),
+    text: tweetText,
+    user: {
+      id: 12345,
+      id_str: "12345",
+      name: "Daniel's Doodles",
+      screen_name: "daniels_doodles",
+      profile_image_url_https: ""
+    }
+  };
+
+  // Prepend new tweet to the top of the timeline
+  localTimeline.unshift(newTweet);
+  console.log(`[XitterBridge] New tweet posted: "${tweetText}"`);
+
+  return res.status(200).json(newTweet);
 });
 
 /**
