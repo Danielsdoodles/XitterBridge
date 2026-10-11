@@ -105,11 +105,15 @@ async function saveCachedTimelineToWorker(tweets) {
 }
 
 async function backgroundScrape() {
-  if (isScraping) return;
+  if (isScraping) {
+    console.log('[Puppeteer] Scrape already in progress, skipping...');
+    return;
+  }
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
+    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
     isScraping = false;
     return;
   }
@@ -118,7 +122,15 @@ async function backgroundScrape() {
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process',
+        '--no-first-run',
+        '--no-zygote'
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -127,12 +139,14 @@ async function backgroundScrape() {
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    
     await page.setCookie(
-      { name: 'auth_token', value: tokens.auth_token, domain: '.x.com', path: '/' },
-      { name: 'ct0', value: tokens.ct0, domain: '.x.com', path: '/' }
+      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
     let parsedTweets = [];
+
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/') && url.includes('HomeTimeline')) {
@@ -167,22 +181,32 @@ async function backgroundScrape() {
               });
             }
           }
-        } catch (e) {}
+        } catch (e) {
+          console.error('[Puppeteer JSON Parse Error]', e.message);
+        }
       }
     });
 
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    console.log('[Puppeteer] Navigating to x.com/home...');
+    await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 30000 });
+
+    console.log('[Puppeteer] Waiting 10s for GraphQL timeline data stream...');
+    await new Promise((resolve) => setTimeout(resolve, 10000));
+
     await browser.close();
 
     if (parsedTweets.length > 0) {
       await saveCachedTimelineToWorker(parsedTweets);
-      console.log(`[Puppeteer] Background scrape successful! Cached ${parsedTweets.length} tweets.`);
+      console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
+    } else {
+      console.log('[Puppeteer Warning] No tweets captured during the session.');
     }
   } catch (err) {
-    console.error('[Puppeteer Error]:', err.message);
+    console.error('[Puppeteer Exec Error]:', err.message);
     if (browser) await browser.close();
+  } finally {
+    isScraping = false;
   }
-  isScraping = false;
 }
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
@@ -208,13 +232,9 @@ app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).js
 app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
-// INSTANT TIMELINE ENDPOINT (Responds immediately with cache, scrapes in background)
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
-  
-  // Trigger background scrape for next time without blocking the phone
   backgroundScrape();
-
   return res.status(200).json([...localTimeline, ...cachedTweets]);
 });
 
