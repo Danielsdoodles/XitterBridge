@@ -44,7 +44,7 @@ const defaultUser = {
 let localTimeline = [];
 let isScraping = false;
 
-// Generate unique integer IDs per handle so Windows Phone won't alias authors to defaultUser
+// Generate unique deterministic user IDs per handle so Lumia won't map posts to defaultUser
 function generateUniqueUserId(screenName) {
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
@@ -175,7 +175,6 @@ async function backgroundScrape() {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
                 
-                // Deep search for live user metadata in GraphQL node
                 const userResults = 
                   tweetResult?.core?.user_results?.result || 
                   tweetResult?.tweet?.core?.user_results?.result;
@@ -194,6 +193,7 @@ async function backgroundScrape() {
                     id_str: legacy.id_str || (Date.now() + idx).toString(),
                     text: legacy.full_text || legacy.text || "",
                     truncated: false,
+                    // Top-level author fields explicitly set to match author
                     user_id: authorUserId,
                     user_id_str: authorUserIdStr,
                     user: {
@@ -259,7 +259,6 @@ async function backgroundScrape() {
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
-// Utility route to clear out poisoned cache data
 app.get('/clear-cache', async (req, res) => {
   await saveCachedTimelineToWorker([]);
   localTimeline = [];
@@ -286,7 +285,7 @@ app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200)
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
 
-// Dynamic User Endpoints so Lumia can lookup specific tweet authors
+// Dynamic User Endpoints: When Lumia requests user info, search cached tweets first
 app.get('/1.1/users/show.json', async (req, res) => {
   const screenName = req.query.screen_name;
   const userId = req.query.user_id;
