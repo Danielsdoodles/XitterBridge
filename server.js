@@ -42,103 +42,83 @@ const defaultUser = {
 };
 
 let localTimeline = [];
+let isScraping = false;
 
-/**
- * Helper function to save tokens into Cloudflare Worker KV storage via secure JSON payload
- */
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
-
-  if (!workerUrl || !secret) {
-    console.error('[Worker Sync Error] WORKER_URL or BRIDGE_SECRET missing in Render environment variables.');
-    return;
-  }
+  if (!workerUrl || !secret) return;
 
   try {
-    const response = await fetch(`${workerUrl}/update-tokens`, {
+    await fetch(`${workerUrl}/update-tokens`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Bridge-Secret': secret
-      },
-      body: JSON.stringify({
-        auth_token: authToken,
-        ct0: ct0Token
-      })
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
+      body: JSON.stringify({ auth_token: authToken, ct0: ct0Token })
     });
-
-    if (response.ok) {
-      console.log('[Worker Sync] Successfully updated tokens in Cloudflare Worker KV from native app login!');
-    } else {
-      console.error(`[Worker Sync Error] Failed to update tokens on Worker KV, HTTP status: ${response.status}`);
-    }
+    console.log('[Worker Sync] Tokens updated successfully.');
   } catch (err) {
-    console.error('[Worker Sync Error]:', err.message);
+    console.error('[Worker Sync Error]', err.message);
   }
 }
 
-/**
- * Helper function to fetch live session tokens from Cloudflare Worker KV
- */
 async function getTokensFromCloudflareWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
-
-  if (!workerUrl || !secret) {
-    console.log('[Worker Sync] WORKER_URL or BRIDGE_SECRET not configured, falling back to local env.');
-    return { 
-      auth_token: process.env.X_AUTH_TOKEN || '', 
-      ct0: process.env.X_CT0 || '' 
-    };
-  }
+  if (!workerUrl || !secret) return { auth_token: process.env.X_AUTH_TOKEN || '', ct0: process.env.X_CT0 || '' };
 
   try {
-    const response = await fetch(`${workerUrl}/get-tokens`, {
-      headers: { 'X-Bridge-Secret': secret }
-    });
-    
+    const response = await fetch(`${workerUrl}/get-tokens`, { headers: { 'X-Bridge-Secret': secret } });
     if (response.ok) {
       const data = await response.json();
-      console.log('[Worker Sync] Successfully fetched session tokens from Cloudflare Worker.');
       return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
-    } else {
-      console.error('[Worker Sync Error]: Failed with status', response.status);
     }
   } catch (err) {
-    console.error('[Worker Sync Error]:', err.message);
+    console.error('[Worker Sync Error]', err.message);
   }
-
   return { auth_token: '', ct0: '' };
 }
 
-/**
- * Headless Browser Timeline Scraping Engine
- */
-async function fetchLiveTimelineViaPuppeteer() {
-  const tokens = await getTokensFromCloudflareWorker();
-  const authToken = tokens.auth_token;
-  const ct0 = tokens.ct0;
+async function getCachedTimelineFromWorker() {
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!workerUrl || !secret) return [];
 
-  if (!authToken || !ct0) {
-    console.log('[Puppeteer] Skipping live fetch: No active session cookies found in Worker KV.');
-    return [];
+  try {
+    const response = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
+    if (response.ok) return await response.json();
+  } catch (e) {}
+  return [];
+}
+
+async function saveCachedTimelineToWorker(tweets) {
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!workerUrl || !secret || !tweets.length) return;
+
+  try {
+    await fetch(`${workerUrl}/update-timeline`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
+      body: JSON.stringify(tweets)
+    });
+  } catch (e) {}
+}
+
+async function backgroundScrape() {
+  if (isScraping) return;
+  isScraping = true;
+
+  const tokens = await getTokensFromCloudflareWorker();
+  if (!tokens.auth_token || !tokens.ct0) {
+    isScraping = false;
+    return;
   }
 
-  console.log('[Puppeteer] Launching headless browser instance for timeline...');
+  console.log('[Puppeteer] Starting background timeline scrape...');
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-      ],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -147,30 +127,24 @@ async function fetchLiveTimelineViaPuppeteer() {
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-
     await page.setCookie(
-      { name: 'auth_token', value: authToken, domain: '.x.com', path: '/' },
-      { name: 'ct0', value: ct0, domain: '.x.com', path: '/' }
+      { name: 'auth_token', value: tokens.auth_token, domain: '.x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0, domain: '.x.com', path: '/' }
     );
 
     let parsedTweets = [];
-
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('UserTweets') || url.includes('ProfileTimeline'))) {
+      if (url.includes('/graphql/') && url.includes('HomeTimeline')) {
         try {
           const json = await response.json();
-          const instructions = json?.data?.home?.home_timeline_urt?.instructions || 
-                               json?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
-
+          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
           for (const instr of instructions) {
             if (instr.type === 'TimelineAddEntries') {
-              const entries = instr.entries || [];
-              entries.forEach((entry, idx) => {
+              instr.entries?.forEach((entry, idx) => {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
                 const userLegacy = tweetResult?.core?.user_results?.result?.legacy;
-
                 if (legacy) {
                   parsedTweets.push({
                     created_at: legacy.created_at || new Date().toUTCString(),
@@ -199,33 +173,30 @@ async function fetchLiveTimelineViaPuppeteer() {
 
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
     await browser.close();
-    return parsedTweets;
+
+    if (parsedTweets.length > 0) {
+      await saveCachedTimelineToWorker(parsedTweets);
+      console.log(`[Puppeteer] Background scrape successful! Cached ${parsedTweets.length} tweets.`);
+    }
   } catch (err) {
     console.error('[Puppeteer Error]:', err.message);
     if (browser) await browser.close();
-    return [];
   }
+  isScraping = false;
 }
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
-
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
 app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 
-// Native xAuth Sign-In Handler
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
   const passwordInput = req.body.x_auth_password || req.query.x_auth_password || "";
 
-  console.log(`[XitterBridge] Native app login attempt received.`);
-
-  // Check if user passed tokens into username and password fields
   if (usernameInput.length > 20 && passwordInput.length > 20) {
-    console.log('[XitterBridge] Detected token injection via app login form! Saving to Cloudflare KV...');
     await saveTokensToWorker(usernameInput.trim(), passwordInput.trim());
   }
-
   return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=danieldoodl5802`);
 });
 
@@ -237,9 +208,14 @@ app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).js
 app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
+// INSTANT TIMELINE ENDPOINT (Responds immediately with cache, scrapes in background)
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
-  let liveTweets = await fetchLiveTimelineViaPuppeteer();
-  return res.status(200).json([...localTimeline, ...liveTweets]);
+  const cachedTweets = await getCachedTimelineFromWorker();
+  
+  // Trigger background scrape for next time without blocking the phone
+  backgroundScrape();
+
+  return res.status(200).json([...localTimeline, ...cachedTweets]);
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
@@ -282,9 +258,7 @@ app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
-app.all('/1.1/*', (req, res) => {
-  return res.status(200).json({});
-});
+app.all('/1.1/*', (req, res) => res.status(200).json({}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`XitterBridge listening on port ${PORT}`));
