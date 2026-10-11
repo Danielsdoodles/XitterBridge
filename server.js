@@ -9,38 +9,11 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Log incoming requests for Render console debugging
 app.use((req, res, next) => {
   console.log(`[XitterBridge] ${req.method} ${req.path}`);
   next();
 });
-
-// Full browser header configuration
-function getBrowserHeaders() {
-  const authToken = process.env.X_AUTH_TOKEN || '';
-  const ct0 = process.env.X_CT0 || '';
-
-  return {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-    'Sec-Ch-Ua': '"Chromium";v="122", "Not(A:Brand";v="8", "Google Chrome";v="122"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
-    'Authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-    'Cookie': `auth_token=${authToken}; ct0=${ct0};`,
-    'x-csrf-token': ct0,
-    'x-twitter-active-user': 'yes',
-    'x-twitter-auth-type': 'OAuth2Session',
-    'Referer': 'https://x.com/home',
-    'Origin': 'https://x.com'
-  };
-}
 
 const defaultUser = {
   id: 12345678,
@@ -68,57 +41,75 @@ let localTimeline = [];
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
+/**
+ * 1. OAuth Handshake & PIN Auth Support
+ */
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
 app.all('/oauth/authorize', (req, res) => {
   const callback = req.query.oauth_callback || 'oob';
   if (callback === 'oob') {
     return res.send(`<html><body><h2>XitterBridge PIN Authorization</h2><p>Your authorization PIN is: <b>1234567</b></p></body></html>`);
   }
-  res.redirect(`${callback}?oauth_token=${req.query.oauth_token || 'mock_req_token'}&oauth_verifier=1234567`);
+  res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
 });
 app.all('/oauth/authenticate', (req, res) => {
   const callback = req.query.oauth_callback || 'oob';
   if (callback === 'oob') {
     return res.send(`<html><body><h2>XitterBridge PIN Authorization</h2><p>Your authorization PIN is: <b>1234567</b></p></body></html>`);
   }
-  res.redirect(`${callback}?oauth_token=${req.query.oauth_token || 'mock_req_token'}&oauth_verifier=1234567`);
+  res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
 });
 app.all('/oauth/access_token', (req, res) => res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=daniels_doodles`));
 
+/**
+ * 2. Settings & Credentials
+ */
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000, max_media_per_upload: 1, photo_size_limit: 3145728 }));
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "daniels_doodles", always_use_https: true }));
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser));
 
+/**
+ * 3. Home Timeline (Pulls real live tweets via unblocked syndication API on Render)
+ */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   let liveTweets = [];
 
-  if (process.env.X_AUTH_TOKEN && process.env.X_CT0) {
-    try {
-      console.log('[XitterBridge] Fetching with updated Sec-Fetch browser headers...');
+  try {
+    console.log('[XitterBridge] Fetching live timeline via syndication feed on Render...');
+    const response = await axios.get('https://cdn.syndication.twimg.com/timeline/profile?screen_name=daniels_doodles', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+      },
+      timeout: 6000
+    });
 
-      const response = await axios.get('https://x.com/i/api/1.1/statuses/user_timeline.json', {
-        headers: getBrowserHeaders(),
-        params: {
-          screen_name: 'daniels_doodles',
-          count: 20,
-          tweet_mode: 'extended'
-        },
-        timeout: 6000
-      });
-
-      if (response.data && Array.isArray(response.data)) {
-        liveTweets = response.data;
-        console.log(`[XitterBridge] Live fetch successful: ${liveTweets.length} items`);
-      }
-    } catch (err) {
-      console.error('[XitterBridge] Fetch status:', err.response?.status, err.message);
+    if (response.data && response.data.entries) {
+      liveTweets = response.data.entries.map((entry, index) => ({
+        created_at: entry.tweet?.created_at || new Date().toUTCString(),
+        id: entry.tweet?.id_str ? parseInt(entry.tweet.id_str) : Date.now() + index,
+        id_str: entry.tweet?.id_str || (Date.now() + index).toString(),
+        text: entry.tweet?.text || "",
+        truncated: false,
+        user: defaultUser,
+        retweet_count: entry.tweet?.retweet_count || 0,
+        favorite_count: entry.tweet?.favorite_count || 0,
+        favorited: false,
+        retweeted: false
+      }));
+      console.log(`[XitterBridge] Successfully pulled ${liveTweets.length} live tweets on Render!`);
     }
+  } catch (err) {
+    console.error('[XitterBridge] Syndication fetch error:', err.message);
   }
 
   return res.status(200).json([...localTimeline, ...liveTweets]);
 });
 
+/**
+ * 4. Post Tweet
+ */
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
   const newTweet = {
@@ -134,9 +125,13 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     retweeted: false
   };
   localTimeline.unshift(newTweet);
+  console.log(`[XitterBridge] Tweet posted successfully: "${tweetText}"`);
   return res.status(200).json(newTweet);
 });
 
+/**
+ * 5. Universal Catch-All
+ */
 app.all('/1.1/*', (req, res) => {
   const path = req.path;
   if (path.includes('users/show') || path.includes('account/verify_credentials')) {
