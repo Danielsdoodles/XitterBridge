@@ -9,7 +9,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Log incoming paths
+// Log incoming paths to track requests
 app.use((req, res, next) => {
   console.log(`[XitterBridge] ${req.method} ${req.path}`);
   next();
@@ -29,14 +29,41 @@ function getWebHeaders() {
   };
 }
 
-// Fallback timeline if session cookies expire or get flagged
+// Compliant v1.1 User Object
+const defaultUser = {
+  id: 12345678,
+  id_str: "12345678",
+  name: "Daniel's Doodles",
+  screen_name: "daniels_doodles",
+  location: "",
+  description: "Windows Phone preservation project",
+  url: null,
+  protected: false,
+  followers_count: 10,
+  friends_count: 10,
+  listed_count: 0,
+  created_at: "Wed Oct 10 00:00:00 +0000 2026",
+  favourites_count: 0,
+  statuses_count: 1,
+  profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+  profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+  default_profile: true,
+  default_profile_image: true
+};
+
+// Fallback timeline
 let localTimeline = [
   {
     created_at: new Date().toUTCString(),
     id: 999999999,
     id_str: "999999999",
-    text: "🎉 XitterBridge local feed active!",
-    user: { id: 12345, id_str: "12345", name: "Daniel's Doodles", screen_name: "daniels_doodles", profile_image_url_https: "" }
+    text: "🎉 XitterBridge session active!",
+    truncated: false,
+    user: defaultUser,
+    retweet_count: 0,
+    favorite_count: 0,
+    favorited: false,
+    retweeted: false
   }
 ];
 
@@ -51,11 +78,21 @@ app.all('/oauth/authenticate', (req, res) => res.redirect(`${req.query.oauth_cal
 app.all('/oauth/access_token', (req, res) => res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=daniels_doodles`));
 
 /**
- * Settings & Config
+ * Settings & Configuration
  */
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000, max_media_per_upload: 1, photo_size_limit: 3145728 }));
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "daniels_doodles", always_use_https: true }));
-app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json({ id: 12345678, id_str: "12345678", name: "Daniel's Doodles", screen_name: "daniels_doodles" }));
+
+/**
+ * Verify Credentials & User Lookup (Must return User Object, NOT Array)
+ */
+app.get('/1.1/account/verify_credentials.json', (req, res) => {
+  return res.status(200).json(defaultUser);
+});
+
+app.get('/1.1/users/show.json', (req, res) => {
+  return res.status(200).json(defaultUser);
+});
 
 /**
  * Home Timeline (Fetches live user posts via web cookie session)
@@ -83,7 +120,6 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
     console.error('[XitterBridge] Web fetch failed:', err.response?.status, err.response?.data || err.message);
   }
 
-  // Fallback to local timeline if live fetch fails
   return res.status(200).json(localTimeline);
 });
 
@@ -97,16 +133,29 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     id: Date.now(),
     id_str: Date.now().toString(),
     text: tweetText,
-    user: { id: 12345678, id_str: "12345678", name: "Daniel's Doodles", screen_name: "daniels_doodles" }
+    truncated: false,
+    user: defaultUser,
+    retweet_count: 0,
+    favorite_count: 0,
+    favorited: false,
+    retweeted: false
   };
   localTimeline.unshift(newTweet);
   return res.status(200).json(newTweet);
 });
 
 /**
- * Universal Catch-All
+ * Smart Universal Catch-All
  */
-app.all('/1.1/*', (req, res) => res.status(200).json([]));
+app.all('/1.1/*', (req, res) => {
+  const path = req.path;
+  if (path.includes('users/show') || path.includes('account/verify_credentials')) {
+    return res.status(200).json(defaultUser);
+  }
+  if (path.includes('favorites/create')) return res.status(200).json({ favorited: true });
+  if (path.includes('favorites/destroy')) return res.status(200).json({ favorited: false });
+  return res.status(200).json([]);
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`XitterBridge listening on port ${PORT}`));
