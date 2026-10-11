@@ -180,7 +180,7 @@ async function backgroundScrape() {
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 30000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     console.log('[Puppeteer] Waiting 10s for GraphQL timeline data stream...');
     await new Promise((resolve) => setTimeout(resolve, 10000));
