@@ -158,7 +158,13 @@ async function backgroundScrape() {
               instr.entries?.forEach((entry, idx) => {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-                const userLegacy = tweetResult?.core?.user_results?.result?.legacy;
+                
+                // Enhanced multi-path extraction for user profile data
+                const userLegacy = 
+                  tweetResult?.core?.user_results?.result?.legacy || 
+                  tweetResult?.tweet?.core?.user_results?.result?.legacy || 
+                  {};
+
                 if (legacy) {
                   parsedTweets.push({
                     created_at: legacy.created_at || new Date().toUTCString(),
@@ -168,9 +174,9 @@ async function backgroundScrape() {
                     truncated: false,
                     user: {
                       ...defaultUser,
-                      name: userLegacy?.name || defaultUser.name,
-                      screen_name: userLegacy?.screen_name || defaultUser.screen_name,
-                      profile_image_url_https: userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https
+                      name: userLegacy.name || defaultUser.name,
+                      screen_name: userLegacy.screen_name || defaultUser.screen_name,
+                      profile_image_url_https: userLegacy.profile_image_url_https || defaultUser.profile_image_url_https
                     },
                     retweet_count: legacy.retweet_count || 0,
                     favorite_count: legacy.favorite_count || 0,
@@ -197,7 +203,7 @@ async function backgroundScrape() {
       await saveCachedTimelineToWorker(parsedTweets);
       console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
     } else {
-      console.log('[Puppeteer Warning] Connected, but 0 tweets captured. Tokens may need re-authorizing or X is challenging.');
+      console.log('[Puppeteer Warning] Connected, but 0 tweets captured.');
     }
   });
 
