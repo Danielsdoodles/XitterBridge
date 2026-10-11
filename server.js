@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
+const chromium = require('@sparticuz/chromium').default || require('@sparticuz/chromium');
 require('dotenv').config();
 
 const app = express();
