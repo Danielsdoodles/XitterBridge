@@ -156,13 +156,15 @@ async function backgroundScrape() {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
                 
-                // Extract exact author details directly from GraphQL response with no hardcoded fallbacks
                 const userLegacy = 
                   tweetResult?.core?.user_results?.result?.legacy || 
                   tweetResult?.tweet?.core?.user_results?.result?.legacy || 
                   {};
 
                 if (legacy) {
+                  // Diagnostic debug log to check what author handle is being extracted
+                  console.log('[Parsed Tweet Author]:', userLegacy.screen_name || 'NOT FOUND', 'for tweet:', legacy.full_text?.substring(0, 20));
+
                   parsedTweets.push({
                     created_at: legacy.created_at || new Date().toUTCString(),
                     id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
