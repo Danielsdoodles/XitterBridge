@@ -39,16 +39,114 @@ const defaultUser = {
 
 let localTimeline = [];
 
+// Dynamic session cookies harvested via automated login (or fallback to environment variables)
+let dynamicAuthToken = process.env.X_AUTH_TOKEN || '';
+let dynamicCt0 = process.env.X_CT0 || '';
+
 /**
- * Headless Browser Scraping Engine
- * Executes X's browser scripts to generate dynamic headers and intercept live tweets
+ * Automated Puppeteer Login Handler
+ * Takes credentials from the app login screen, logs into X, and extracts fresh cookies.
+ */
+async function performPuppeteerLogin(username, password) {
+  console.log(`[Puppeteer Login] Attempting automated login for account: ${username}...`);
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-dev-tools'
+      ]
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
+
+    // Go to X login flow
+    await page.goto('https://x.com/i/flow/login', { waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Type username
+    await page.waitForSelector('input[autocomplete="username"]', { timeout: 10000 });
+    await page.type('input[autocomplete="username"]', username, { delay: 40 });
+
+    // Click Next button
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
+      if (nextBtn) nextBtn.click();
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Handle potential username/phone verification checkpoint if triggered by X
+    try {
+      const checkpointInput = await page.$('input[data-testid="ocfEnterTextTextInput"]');
+      if (checkpointInput) {
+        await checkpointInput.type(username, { delay: 40 });
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
+          if (nextBtn) nextBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    } catch (e) {}
+
+    // Type password
+    await page.waitForSelector('input[name="password"]', { timeout: 10000 });
+    await page.type('input[name="password"]', password, { delay: 40 });
+
+    // Click Log In button
+    await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
+      if (loginBtn) loginBtn.click();
+    });
+
+    // Wait for redirect to home page
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+
+    // Extract cookies from session
+    const cookies = await page.cookies();
+    const authCookie = cookies.find(c => c.name === 'auth_token');
+    const ct0Cookie = cookies.find(c => c.name === 'ct0');
+
+    if (authCookie && ct0Cookie) {
+      dynamicAuthToken = authCookie.value;
+      dynamicCt0 = ct0Cookie.value;
+      console.log('[Puppeteer Login] Success! Harvested fresh auth_token and ct0 cookies.');
+      await browser.close();
+      return true;
+    }
+
+    await browser.close();
+    console.log('[Puppeteer Login] Failed to locate session cookies after login navigation.');
+    return false;
+
+  } catch (err) {
+    console.error('[Puppeteer Login Error]:', err.message);
+    if (browser) await browser.close();
+    return false;
+  }
+}
+
+/**
+ * Headless Browser Timeline Scraping Engine
  */
 async function fetchLiveTimelineViaPuppeteer() {
-  const authToken = process.env.X_AUTH_TOKEN;
-  const ct0 = process.env.X_CT0;
+  const authToken = dynamicAuthToken || process.env.X_AUTH_TOKEN;
+  const ct0 = dynamicCt0 || process.env.X_CT0;
 
   if (!authToken || !ct0) {
-    console.log('[Puppeteer] Skipping live fetch: Missing X_AUTH_TOKEN or X_CT0 in environment variables.');
+    console.log('[Puppeteer] Skipping live fetch: No active session cookies available yet. Please log in through the app.');
     return [];
   }
 
@@ -67,25 +165,13 @@ async function fetchLiveTimelineViaPuppeteer() {
         '--single-process',
         '--disable-gpu',
         '--disable-software-rasterizer',
-        '--disable-dev-tools',
-        '--no-default-browser-check',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--remote-debugging-port=0'
+        '--disable-dev-tools'
       ]
     });
 
     const page = await browser.newPage();
-
-    // Set User-Agent to match modern Edge/Chrome on Windows
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
-    // Inject active session cookies into browser context
     await page.setCookie(
       { name: 'auth_token', value: authToken, domain: '.x.com', path: '/' },
       { name: 'ct0', value: ct0, domain: '.x.com', path: '/' }
@@ -93,7 +179,6 @@ async function fetchLiveTimelineViaPuppeteer() {
 
     let parsedTweets = [];
 
-    // Intercept GraphQL network responses
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('UserTweets') || url.includes('ProfileTimeline'))) {
@@ -134,13 +219,10 @@ async function fetchLiveTimelineViaPuppeteer() {
               });
             }
           }
-        } catch (e) {
-          // Non-JSON response channel ignore
-        }
+        } catch (e) {}
       }
     });
 
-    // Navigate to X home page and wait for GraphQL calls to resolve
     console.log('[Puppeteer] Navigating to https://x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 25000 });
     
@@ -158,9 +240,10 @@ async function fetchLiveTimelineViaPuppeteer() {
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 /**
- * 1. OAuth Handshake & PIN Auth Support
+ * 1. OAuth Handshake & Real xAuth Login Interceptor
  */
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
+
 app.all('/oauth/authorize', (req, res) => {
   const callback = req.query.oauth_callback || 'oob';
   if (callback === 'oob') {
@@ -168,6 +251,7 @@ app.all('/oauth/authorize', (req, res) => {
   }
   res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
 });
+
 app.all('/oauth/authenticate', (req, res) => {
   const callback = req.query.oauth_callback || 'oob';
   if (callback === 'oob') {
@@ -175,7 +259,24 @@ app.all('/oauth/authenticate', (req, res) => {
   }
   res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
 });
-app.all('/oauth/access_token', (req, res) => res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=danieldoodl5802`));
+
+// Intercept login credentials sent from the Windows Phone app via xAuth
+app.all('/oauth/access_token', async (req, res) => {
+  const username = req.body.x_auth_username || req.query.x_auth_username;
+  const password = req.body.x_auth_password || req.query.x_auth_password;
+
+  if (username && password) {
+    console.log(`[XitterBridge] App login request received for: ${username}`);
+    const loginSuccess = await performPuppeteerLogin(username, password);
+    if (loginSuccess) {
+      return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=${username}`);
+    } else {
+      return res.status(401).json({ error: "Automated browser login failed. Check credentials." });
+    }
+  }
+
+  return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=danieldoodl5802`);
+});
 
 /**
  * 2. Settings & Configuration
@@ -192,7 +293,7 @@ app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser))
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
 /**
- * 4. Home Timeline (Puppeteer Live Fetch + Local Session Posts)
+ * 4. Home Timeline
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   let liveTweets = await fetchLiveTimelineViaPuppeteer();
