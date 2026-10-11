@@ -68,59 +68,6 @@ async function getTokensFromCloudflareWorker() {
   return { auth_token: '', ct0: '' };
 }
 
-// Dynamically fetch your actual account details from live session cookies
-async function fetchActualUserAccount() {
-  if (userProfileCache) return userProfileCache;
-
-  const tokens = await getTokensFromCloudflareWorker();
-  if (!tokens.auth_token || !tokens.ct0) return null;
-
-  try {
-    const cleanAuthToken = tokens.auth_token.trim();
-    const cleanCt0 = tokens.ct0.trim();
-
-    const response = await fetch('https://x.com/i/api/1.1/account/verify_credentials.json', {
-      headers: {
-        'authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-        'x-csrf-token': cleanCt0,
-        'cookie': `auth_token=${cleanAuthToken}; ct0=${cleanCt0}`,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      }
-    });
-
-    if (response.ok) {
-      const realAccount = await response.json();
-      userProfileCache = {
-        id: realAccount.id || generateUniqueUserId(realAccount.screen_name),
-        id_str: realAccount.id_str || (realAccount.id ? realAccount.id.toString() : generateUniqueUserId(realAccount.screen_name).toString()),
-        name: realAccount.name,
-        screen_name: realAccount.screen_name,
-        location: realAccount.location || "",
-        description: realAccount.description || "",
-        url: realAccount.url || null,
-        protected: realAccount.protected || false,
-        followers_count: realAccount.followers_count || 0,
-        friends_count: realAccount.friends_count || 0,
-        listed_count: realAccount.listed_count || 0,
-        created_at: realAccount.created_at || new Date().toUTCString(),
-        favourites_count: realAccount.favourites_count || 0,
-        statuses_count: realAccount.statuses_count || 0,
-        profile_image_url: realAccount.profile_image_url ? realAccount.profile_image_url.replace('https://', 'http://') : "",
-        profile_image_url_https: realAccount.profile_image_url_https || realAccount.profile_image_url || "",
-        profile_banner_url: realAccount.profile_banner_url || "",
-        default_profile: realAccount.default_profile || false,
-        default_profile_image: realAccount.default_profile_image || false
-      };
-      console.log(`[Account Auth] Successfully retrieved live account: @${userProfileCache.screen_name}`);
-      return userProfileCache;
-    }
-  } catch (err) {
-    console.error('[Account Auth Error]', err.message);
-  }
-
-  return null;
-}
-
 async function getCachedTimelineFromWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -145,6 +92,89 @@ async function saveCachedTimelineToWorker(tweets) {
       body: JSON.stringify(tweets)
     });
   } catch (e) {}
+}
+
+// Fetch your actual profile dynamically via Puppeteer so X returns true account data
+async function fetchActualUserAccount() {
+  if (userProfileCache) return userProfileCache;
+
+  const tokens = await getTokensFromCloudflareWorker();
+  if (!tokens.auth_token || !tokens.ct0) return null;
+
+  console.log('[Account Profile] Fetching real account details from X...');
+  let browser;
+
+  try {
+    browser = await puppeteer.launch({
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process'
+      ],
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    
+    await page.setCookie(
+      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+    );
+
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('Account') || url.includes('UserBy'))) {
+        try {
+          const json = await response.json();
+          const userObj = json?.data?.viewer?.user_results?.result || json?.data?.user?.result;
+          const legacy = userObj?.legacy;
+
+          if (legacy && legacy.screen_name) {
+            userProfileCache = {
+              id: userObj.rest_id ? parseInt(userObj.rest_id) : generateUniqueUserId(legacy.screen_name),
+              id_str: userObj.rest_id || generateUniqueUserId(legacy.screen_name).toString(),
+              name: legacy.name,
+              screen_name: legacy.screen_name,
+              location: legacy.location || "",
+              description: legacy.description || "",
+              url: legacy.url || null,
+              protected: legacy.protected || false,
+              followers_count: legacy.followers_count || 0,
+              friends_count: legacy.friends_count || 0,
+              listed_count: legacy.listed_count || 0,
+              created_at: legacy.created_at || new Date().toUTCString(),
+              favourites_count: legacy.favourites_count || 0,
+              statuses_count: legacy.statuses_count || 0,
+              profile_image_url: legacy.profile_image_url_https ? legacy.profile_image_url_https.replace('https://', 'http://') : "",
+              profile_image_url_https: legacy.profile_image_url_https || "",
+              profile_banner_url: legacy.profile_banner_url || "",
+              default_profile: legacy.default_profile || false,
+              default_profile_image: legacy.default_profile_image || false
+            };
+            console.log(`[Account Auth] Captured live account profile: @${userProfileCache.screen_name}`);
+          }
+        } catch (e) {}
+      }
+    });
+
+    await page.goto('https://x.com/settings/account', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await browser.close();
+
+    if (userProfileCache) return userProfileCache;
+  } catch (err) {
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+  }
+
+  return null;
 }
 
 async function backgroundScrape() {
@@ -210,7 +240,7 @@ async function backgroundScrape() {
                   tweetResult?.tweet?.core?.user_results?.result;
                 const userLegacy = userResults?.legacy;
 
-                if (legacy && userLegacy) {
+                if (legacy && userLegacy && userLegacy.screen_name) {
                   const authorScreenName = userLegacy.screen_name;
                   const authorName = userLegacy.name || authorScreenName;
                   const authorUserId = userResults?.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
@@ -307,7 +337,7 @@ app.all('/oauth/access_token', async (req, res) => {
 
   const account = await fetchActualUserAccount();
   const screenName = account ? account.screen_name : "user";
-  const userId = account ? account.id_str : "12345678";
+  const userId = account ? account.id_str : "99999999";
 
   return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=${userId}&screen_name=${screenName}`);
 });
