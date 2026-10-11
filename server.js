@@ -1,6 +1,12 @@
 const express = require('express');
 const multer = require('multer');
+const { addExtra } = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = addExtra(require('puppeteer-core'));
+const chromium = require('@sparticuz/chromium').default || require('@sparticuz/chromium');
 require('dotenv').config();
+
+puppeteer.use(StealthPlugin());
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -34,6 +40,8 @@ const authenticatedAccount = {
   default_profile: true,
   default_profile_image: true
 };
+
+let isScraping = false;
 
 function generateUniqueUserId(screenName) {
   let hash = 0;
@@ -99,94 +107,156 @@ async function saveCachedTimelineToWorker(tweets) {
   } catch (e) {}
 }
 
-async function fetchTimelineDirectly() {
+async function backgroundScrape() {
+  if (isScraping) {
+    console.log('[Puppeteer] Scrape in progress, skipping...');
+    return [];
+  }
+  isScraping = true;
+
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[API Error] Missing auth_token or ct0!');
+    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
+    isScraping = false;
     return [];
   }
 
-  console.log('[API Fetch] Requesting home timeline directly via v1.1 REST API...');
+  console.log('[Puppeteer] Launching browser instance...');
+  let browser;
+  let parsedTweets = [];
 
-  const cleanAuthToken = tokens.auth_token.trim();
-  const cleanCt0 = tokens.ct0.trim();
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('Scrape operation timed out after 30s')), 30000)
+  );
 
-  // Primary v1.1 REST home timeline endpoint with Web Client Bearer Token
-  const targetUrl = 'https://api.x.com/1.1/statuses/home_timeline.json?count=20&tweet_mode=extended';
+  const scrapeTask = (async () => {
+    browser = await puppeteer.launch({
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--no-zygote',
+        '--single-process'
+      ],
+      defaultViewport: { width: 1280, height: 800 },
+      executablePath: await chromium.executablePath(),
+      headless: 'new',
+      ignoreHTTPSErrors: true,
+    });
 
-  try {
-    const response = await fetch(targetUrl, {
-      method: 'GET',
-      headers: {
-        'authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-        'x-csrf-token': cleanCt0,
-        'cookie': `auth_token=${cleanAuthToken}; ct0=${cleanCt0}`,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'accept': '*/*',
-        'referer': 'https://x.com/home'
+    const page = await browser.newPage();
+    await page.setCacheEnabled(false);
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+
+    const cleanAuthToken = tokens.auth_token.trim();
+    const cleanCt0 = tokens.ct0.trim();
+
+    await page.setCookie(
+      { name: 'auth_token', value: cleanAuthToken, domain: '.x.com', path: '/' },
+      { name: 'ct0', value: cleanCt0, domain: '.x.com', path: '/' },
+      { name: 'auth_token', value: cleanAuthToken, domain: '.twitter.com', path: '/' },
+      { name: 'ct0', value: cleanCt0, domain: '.twitter.com', path: '/' }
+    );
+
+    // Dynamic GraphQL Stream Interception
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('/graphql/')) {
+        try {
+          const json = await response.json();
+          JSON.stringify(json, (key, value) => {
+            if (key === 'tweet_results' && value?.result) {
+              const tweetResult = value.result;
+              const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+              
+              const userResults = 
+                tweetResult?.core?.user_results?.result || 
+                tweetResult?.tweet?.core?.user_results?.result;
+              const userLegacy = userResults?.legacy;
+
+              if (legacy && userLegacy && userLegacy.screen_name) {
+                const authorScreenName = userLegacy.screen_name;
+                const authorName = userLegacy.name || authorScreenName;
+                const authorId = userResults.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
+                const authorIdStr = userResults.rest_id || authorId.toString();
+                const authorAvatar = userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+
+                parsedTweets.push({
+                  created_at: legacy.created_at || new Date().toUTCString(),
+                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
+                  id_str: legacy.id_str || Date.now().toString(),
+                  text: legacy.full_text || legacy.text || "",
+                  truncated: false,
+                  source: legacy.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
+                  user_id: authorId,
+                  user_id_str: authorIdStr,
+                  screen_name: authorScreenName,
+                  name: authorName,
+                  user: {
+                    id: authorId,
+                    id_str: authorIdStr,
+                    name: authorName,
+                    screen_name: authorScreenName,
+                    location: userLegacy.location || "",
+                    description: userLegacy.description || "",
+                    url: userLegacy.url || null,
+                    protected: userLegacy.protected || false,
+                    followers_count: userLegacy.followers_count || 0,
+                    friends_count: userLegacy.friends_count || 0,
+                    listed_count: userLegacy.listed_count || 0,
+                    created_at: userLegacy.created_at || "Wed Oct 10 00:00:00 +0000 2020",
+                    favourites_count: userLegacy.favourites_count || 0,
+                    statuses_count: userLegacy.statuses_count || 0,
+                    profile_image_url: authorAvatar.replace('https://', 'http://'),
+                    profile_image_url_https: authorAvatar,
+                    default_profile: userLegacy.default_profile || false,
+                    default_profile_image: userLegacy.default_profile_image || false
+                  },
+                  retweet_count: legacy.retweet_count || 0,
+                  favorite_count: legacy.favorite_count || 0,
+                  favorited: legacy.favorited || false,
+                  retweeted: legacy.retweeted || false
+                });
+              }
+            }
+            return value;
+          });
+        } catch (e) {}
       }
     });
 
-    console.log(`[API Response] HTTP ${response.status} ${response.statusText}`);
+    console.log('[Puppeteer] Navigating to x.com/home...');
+    try {
+      await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 15000 });
+    } catch (e) {}
 
-    if (response.ok) {
-      const rawTweets = await response.json();
-      if (Array.isArray(rawTweets) && rawTweets.length > 0) {
-        const parsedTweets = rawTweets.map(tweet => {
-          const authorScreenName = tweet.user?.screen_name || "unknown";
-          const authorName = tweet.user?.name || authorScreenName;
-          const authorId = tweet.user?.id || generateUniqueUserId(authorScreenName);
-          const authorIdStr = tweet.user?.id_str || authorId.toString();
-          const authorAvatar = tweet.user?.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+    // Allow page script execution to emit GraphQL responses
+    await new Promise((resolve) => setTimeout(resolve, 8000));
+    await browser.close();
 
-          return {
-            created_at: tweet.created_at || new Date().toUTCString(),
-            id: tweet.id || Date.now(),
-            id_str: tweet.id_str || Date.now().toString(),
-            text: tweet.full_text || tweet.text || "",
-            truncated: false,
-            source: tweet.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
-            user_id: authorId,
-            user_id_str: authorIdStr,
-            screen_name: authorScreenName,
-            name: authorName,
-            user: {
-              id: authorId,
-              id_str: authorIdStr,
-              name: authorName,
-              screen_name: authorScreenName,
-              location: tweet.user?.location || "",
-              description: tweet.user?.description || "",
-              url: tweet.user?.url || null,
-              protected: tweet.user?.protected || false,
-              followers_count: tweet.user?.followers_count || 0,
-              friends_count: tweet.user?.friends_count || 0,
-              listed_count: tweet.user?.listed_count || 0,
-              created_at: tweet.user?.created_at || "Wed Oct 10 00:00:00 +0000 2020",
-              favourites_count: tweet.user?.favourites_count || 0,
-              statuses_count: tweet.user?.statuses_count || 0,
-              profile_image_url: authorAvatar.replace('https://', 'http://'),
-              profile_image_url_https: authorAvatar,
-              default_profile: tweet.user?.default_profile || false,
-              default_profile_image: tweet.user?.default_profile_image || false
-            },
-            retweet_count: tweet.retweet_count || 0,
-            favorite_count: tweet.favorite_count || 0,
-            favorited: tweet.favorited || false,
-            retweeted: tweet.retweeted || false
-          };
-        });
-
-        const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
-        await saveCachedTimelineToWorker(uniqueTweets);
-        console.log(`[API Fetch] Success! Fetched and cached ${uniqueTweets.length} live tweets.`);
-        return uniqueTweets;
-      }
+    if (parsedTweets.length > 0) {
+      const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
+      await saveCachedTimelineToWorker(uniqueTweets);
+      console.log(`[Puppeteer] Scrape complete! Saved ${uniqueTweets.length} live author tweets to KV.`);
+      return uniqueTweets;
+    } else {
+      console.log('[Puppeteer Warning] 0 tweets parsed from GraphQL stream.');
+      return [];
     }
+  });
+
+  try {
+    return await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
-    console.error('[API Fetch Exception]:', err.message);
+    console.error('[Puppeteer Error]:', err.message);
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+    return [];
+  } finally {
+    isScraping = false;
   }
-  return [];
 }
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
@@ -197,8 +267,8 @@ app.get('/clear-cache', async (req, res) => {
 });
 
 app.get('/refresh-now', async (req, res) => {
-  console.log('[Direct Refresh] Triggering API fetch...');
-  const newTweets = await fetchTimelineDirectly();
+  console.log('[Direct Refresh] Triggering synchronous Puppeteer scrape...');
+  const newTweets = await backgroundScrape();
   return res.json({ success: true, count: newTweets.length, tweets: newTweets });
 });
 
@@ -246,7 +316,7 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
-  fetchTimelineDirectly();
+  backgroundScrape();
   return res.status(200).json(cachedTweets);
 });
 
