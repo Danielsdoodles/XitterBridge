@@ -45,7 +45,7 @@ let dynamicAuthToken = '';
 let dynamicCt0 = '';
 
 /**
- * Automated Puppeteer Login Handler with Robust Element Fallbacks
+ * Automated Puppeteer Login Handler using Classic Login URL & Broad Selectors
  */
 async function performPuppeteerLogin(username, password) {
   console.log(`[Puppeteer Login] Launching cloud browser to authenticate user: ${username}`);
@@ -71,13 +71,15 @@ async function performPuppeteerLogin(username, password) {
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
-    await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Use the classic login page which is less prone to multi-step UI blocks
+    await page.goto('https://twitter.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     // Try multiple fallback selectors for the username field
     let usernameSelector = null;
     const candidateSelectors = [
-      'input[autocomplete="username"]',
       'input[name="text"]',
+      'input[autocomplete="username"]',
+      'input[name="session[username_or_email]"]',
       'input[data-testid="ocfEnterTextTextInput"]'
     ];
 
@@ -93,34 +95,33 @@ async function performPuppeteerLogin(username, password) {
       throw new Error("Could not locate username input field using any known selector.");
     }
 
-    await page.type(usernameSelector, username, { delay: 50 });
+    await page.type(usernameSelector, username, { delay: 60 });
 
-    // Click Next
+    // Click Next / Submit username if it's a multi-step flow
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente') || b.innerText.includes('Siguient'));
+      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente') || b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
       if (nextBtn) nextBtn.click();
     });
 
     await new Promise(r => setTimeout(r, 4000));
 
-    // Handle optional phone/username verification checkpoint
-    try {
-      const checkpoint = await page.$('input[data-testid="ocfEnterTextTextInput"]');
-      if (checkpoint) {
-        await checkpoint.type(username, { delay: 50 });
-        await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button'));
-          const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
-          if (nextBtn) nextBtn.click();
-        });
-        await new Promise(r => setTimeout(r, 4000));
-      }
-    } catch (e) {}
-
     // Enter password
-    await page.waitForSelector('input[name="password"]', { timeout: 15000 });
-    await page.type('input[name="password"]', password, { delay: 50 });
+    let passwordSelector = null;
+    const passSelectors = ['input[name="password"]', 'input[name="session[password]"]'];
+    for (const pSel of passSelectors) {
+      try {
+        await page.waitForSelector(pSel, { timeout: 10000 });
+        passwordSelector = pSel;
+        break;
+      } catch (e) {}
+    }
+
+    if (!passwordSelector) {
+      throw new Error("Could not locate password input field.");
+    }
+
+    await page.type(passwordSelector, password, { delay: 60 });
 
     // Click Login
     await page.evaluate(() => {
