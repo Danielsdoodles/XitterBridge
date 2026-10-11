@@ -55,10 +55,7 @@ async function saveTokensToWorker(authToken, ct0Token) {
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
       body: JSON.stringify({ auth_token: authToken, ct0: ct0Token })
     });
-    console.log('[Worker Sync] Tokens updated successfully.');
-  } catch (err) {
-    console.error('[Worker Sync Error]', err.message);
-  }
+  } catch (err) {}
 }
 
 async function getTokensFromCloudflareWorker() {
@@ -72,9 +69,7 @@ async function getTokensFromCloudflareWorker() {
       const data = await response.json();
       return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
     }
-  } catch (err) {
-    console.error('[Worker Sync Error]', err.message);
-  }
+  } catch (err) {}
   return { auth_token: '', ct0: '' };
 }
 
@@ -106,21 +101,19 @@ async function saveCachedTimelineToWorker(tweets) {
 
 async function backgroundScrape() {
   if (isScraping) {
-    console.log('[Puppeteer] Scrape already in progress, skipping...');
+    console.log('[Puppeteer] Scrape in progress, skipping...');
     return;
   }
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
     isScraping = false;
     return;
   }
 
-  console.log('[Puppeteer] Starting background timeline scrape...');
+  console.log('[Puppeteer] Starting FRESH background timeline scrape...');
   let browser;
-  
   const timeoutPromise = new Promise((_, reject) => 
     setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
   );
@@ -135,6 +128,7 @@ async function backgroundScrape() {
     });
 
     const page = await browser.newPage();
+    await page.setCacheEnabled(false); // Force fresh network requests
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
     await page.setCookie(
@@ -163,10 +157,10 @@ async function backgroundScrape() {
                   text: legacy.full_text || legacy.text || "",
                   truncated: false,
                   user: {
-                    id: userLegacy.id_str ? parseInt(userLegacy.id_str) : 12345678,
-                    id_str: userLegacy.id_str || "12345678",
-                    name: userLegacy.name || "Unknown",
-                    screen_name: userLegacy.screen_name || "unknown",
+                    id: userLegacy.id_str ? parseInt(userLegacy.id_str) : 999999,
+                    id_str: userLegacy.id_str || "999999",
+                    name: userLegacy.name || "User",
+                    screen_name: userLegacy.screen_name,
                     profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
                     profile_image_url: userLegacy.profile_image_url_https || "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
                   },
@@ -186,24 +180,25 @@ async function backgroundScrape() {
     console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    console.log('[Puppeteer] Waiting for timeline feed stream...');
-    await new Promise((resolve) => setTimeout(resolve, 8000));
+    // Scroll down slightly to trigger infinite-scroll stream load
+    console.log('[Puppeteer] Triggering feed scroll...');
+    await page.evaluate(() => window.scrollBy(0, 500));
+    await new Promise((resolve) => setTimeout(resolve, 6000));
 
     await browser.close();
 
     if (parsedTweets.length > 0) {
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Success! Cached ${uniqueTweets.length} unique tweets to Worker KV.`);
+      console.log(`[Puppeteer] Success! Updated KV cache with ${uniqueTweets.length} fresh tweets.`);
     } else {
-      console.log('[Puppeteer Warning] Connected, but 0 tweets captured.');
+      console.log('[Puppeteer Warning] 0 tweets captured.');
     }
   });
 
   try {
     await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
-    console.error('[Puppeteer Exec Error]:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
@@ -213,6 +208,13 @@ async function backgroundScrape() {
 }
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+
+app.get('/clear-cache', async (req, res) => {
+  await saveCachedTimelineToWorker([]);
+  localTimeline = [];
+  return res.send('Cache cleared successfully!');
+});
+
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
 app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
@@ -238,21 +240,7 @@ app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUse
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
-
-  // Normalize tweets to ensure each item explicitly retains its true parsed user properties
-  const normalizedTweets = [...localTimeline, ...cachedTweets].map(tweet => ({
-    ...tweet,
-    user: {
-      id: tweet.user?.id || 12345678,
-      id_str: tweet.user?.id_str || "12345678",
-      name: tweet.user?.name || "Unknown",
-      screen_name: tweet.user?.screen_name || "unknown",
-      profile_image_url_https: tweet.user?.profile_image_url_https || defaultUser.profile_image_url_https,
-      profile_image_url: tweet.user?.profile_image_url || defaultUser.profile_image_url
-    }
-  }));
-
-  return res.status(200).json(normalizedTweets);
+  return res.status(200).json([...localTimeline, ...cachedTweets]);
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
