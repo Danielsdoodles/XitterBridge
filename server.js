@@ -71,10 +71,11 @@ async function performPuppeteerLogin(username, password) {
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
-    await page.goto('https://x.com/i/flow/login', { waitUntil: 'networkidle2', timeout: 30000 });
+    // Increased timeout and changed wait condition for heavy SPA loading
+    await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     // Enter username
-    await page.waitForSelector('input[autocomplete="username"]', { timeout: 10000 });
+    await page.waitForSelector('input[autocomplete="username"]', { timeout: 15000 });
     await page.type('input[autocomplete="username"]', username, { delay: 50 });
 
     // Click Next
@@ -84,7 +85,7 @@ async function performPuppeteerLogin(username, password) {
       if (nextBtn) nextBtn.click();
     });
 
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 4000));
 
     // Handle optional phone/username verification checkpoint
     try {
@@ -96,12 +97,12 @@ async function performPuppeteerLogin(username, password) {
           const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
           if (nextBtn) nextBtn.click();
         });
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 4000));
       }
     } catch (e) {}
 
     // Enter password
-    await page.waitForSelector('input[name="password"]', { timeout: 10000 });
+    await page.waitForSelector('input[name="password"]', { timeout: 15000 });
     await page.type('input[name="password"]', password, { delay: 50 });
 
     // Click Login
@@ -111,7 +112,7 @@ async function performPuppeteerLogin(username, password) {
       if (loginBtn) loginBtn.click();
     });
 
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
 
     const cookies = await page.cookies();
     const authCookie = cookies.find(c => c.name === 'auth_token');
@@ -220,7 +221,7 @@ async function fetchLiveTimelineViaPuppeteer() {
       }
     });
 
-    await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 25000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 45000 });
     await browser.close();
     return parsedTweets;
   } catch (err) {
