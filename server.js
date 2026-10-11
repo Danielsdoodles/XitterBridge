@@ -15,6 +15,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// Build headers for X browser session impersonation
 function getWebHeaders() {
   const authToken = process.env.X_AUTH_TOKEN || '';
   const ct0 = process.env.X_CT0 || '';
@@ -25,11 +26,13 @@ function getWebHeaders() {
     'x-csrf-token': ct0,
     'x-twitter-active-user': 'yes',
     'x-twitter-auth-type': 'OAuth2Session',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
   };
 }
 
-// Compliant v1.1 User Object with _normal naming and banner support
+// Compliant v1.1 User Object with Jay's suggested _normal image & banner support
 const defaultUser = {
   id: 12345678,
   id_str: "12345678",
@@ -57,7 +60,7 @@ let localTimeline = [];
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 /**
- * 1. OAuth & Authentication Handshake
+ * 1. OAuth Handshake
  */
 app.all('/oauth/request_token', (req, res) => {
   res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true');
@@ -84,52 +87,51 @@ app.all('/oauth/access_token', (req, res) => {
 });
 
 /**
- * 2. Account Settings & Configuration
+ * 2. Settings & Credentials
  */
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000, max_media_per_upload: 1, photo_size_limit: 3145728 }));
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "daniels_doodles", always_use_https: true }));
-app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
-
-/**
- * 3. User Profiles & Credentials
- */
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser));
-app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
 /**
- * 4. Timelines (Home, Mentions, User Posts, Status Detail)
+ * 3. Home Timeline (Pulling live tweets via X cookie session)
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   let liveTweets = [];
-  try {
-    if (process.env.X_AUTH_TOKEN && process.env.X_CT0) {
-      const liveResponse = await axios.get('https://x.com/i/api/1.1/statuses/user_timeline.json', {
+
+  if (process.env.X_AUTH_TOKEN && process.env.X_CT0) {
+    try {
+      console.log('[XitterBridge] Requesting live feed using browser session cookies...');
+
+      // Fetch user's timeline via X internal Web API
+      const response = await axios.get('https://x.com/i/api/1.1/statuses/user_timeline.json', {
         headers: getWebHeaders(),
-        params: { screen_name: 'daniels_doodles', count: 20, tweet_mode: 'extended' },
-        timeout: 5000
+        params: {
+          screen_name: 'daniels_doodles',
+          count: 20,
+          tweet_mode: 'extended'
+        },
+        timeout: 6000
       });
-      if (liveResponse.data && Array.isArray(liveResponse.data)) {
-        liveTweets = liveResponse.data;
+
+      if (response.data && Array.isArray(response.data)) {
+        liveTweets = response.data;
+        console.log(`[XitterBridge] Successfully pulled ${liveTweets.length} live tweets from X!`);
       }
+    } catch (err) {
+      console.error('[XitterBridge] Live cookie fetch error:', err.response?.status, err.message);
     }
-  } catch (err) {
-    console.log('[XitterBridge] Timeline fetch note:', err.message);
+  } else {
+    console.log('[XitterBridge] Missing X_AUTH_TOKEN or X_CT0 environment variables.');
   }
+
+  // Combine live web tweets with any tweets posted from the phone during this session
   return res.status(200).json([...localTimeline, ...liveTweets]);
 });
 
-app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
-app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || {
-  id: 999999999,
-  id_str: "999999999",
-  text: "Sample status detail",
-  user: defaultUser
-}));
-
 /**
- * 5. Tweet Engagement & Posting
+ * 4. Post Tweet
  */
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
@@ -149,32 +151,8 @@ app.post('/1.1/statuses/update.json', (req, res) => {
   return res.status(200).json(newTweet);
 });
 
-app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favorited: true }));
-app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
-app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
-
 /**
- * 6. Search & Trends
- */
-app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
-app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
-
-/**
- * 7. Friends & Followers Lists
- */
-app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0, next_cursor_str: "0" }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0, next_cursor_str: "0" }));
-app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
-app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
-
-/**
- * 8. Direct Messages (DMs)
- */
-app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
-app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
-
-/**
- * 9. Universal Catch-All Handler for Any Remaining Requests
+ * 5. Catch-All for all other endpoints
  */
 app.all('/1.1/*', (req, res) => {
   const path = req.path;
@@ -183,8 +161,7 @@ app.all('/1.1/*', (req, res) => {
   }
   if (path.includes('favorites/create')) return res.status(200).json({ favorited: true });
   if (path.includes('favorites/destroy')) return res.status(200).json({ favorited: false });
-  if (path.includes('list') || path.includes('timeline') || path.includes('search')) return res.status(200).json([]);
-  return res.status(200).json({});
+  return res.status(200).json([]);
 });
 
 const PORT = process.env.PORT || 3000;
