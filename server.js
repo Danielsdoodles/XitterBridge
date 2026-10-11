@@ -108,24 +108,30 @@ async function saveCachedTimelineToWorker(tweets) {
 }
 
 async function backgroundScrape() {
-  if (isScraping) return;
+  if (isScraping) {
+    console.log('[Puppeteer] Scrape already in progress...');
+    return [];
+  }
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
+    console.log('[Puppeteer Error] Missing auth_token or ct0!');
     isScraping = false;
-    return;
+    return [];
   }
 
   console.log('[Puppeteer] Starting timeline scrape...');
   let browser;
+  let parsedTweets = [];
+
   const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
+    setTimeout(() => reject(new Error('Scrape operation timed out after 30s')), 30000)
   );
 
   const scrapeTask = (async () => {
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -141,26 +147,16 @@ async function backgroundScrape() {
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
-    let parsedTweets = [];
-
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/')) {
         try {
           const json = await response.json();
-
-          // Target GraphQL instructions directly
-          const instructions = 
-            json?.data?.home?.home_timeline_urt?.instructions || 
-            json?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
-
-          for (const instr of instructions) {
-            const entries = instr.entries || (instr.entry ? [instr.entry] : []);
-            for (const entry of entries) {
-              const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-              if (!tweetResult) continue;
-
+          JSON.stringify(json, (key, value) => {
+            if (key === 'tweet_results' && value?.result) {
+              const tweetResult = value.result;
               const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+              
               const userResults = 
                 tweetResult?.core?.user_results?.result || 
                 tweetResult?.tweet?.core?.user_results?.result;
@@ -211,35 +207,39 @@ async function backgroundScrape() {
                 });
               }
             }
-          }
+            return value;
+          });
         } catch (e) {}
       }
     });
 
-    console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    console.log('[Puppeteer] Fast loading x.com/home...');
+    try {
+      await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 12000 });
+    } catch (e) {}
 
-    console.log('[Puppeteer] Triggering feed scroll...');
-    await page.evaluate(() => window.scrollBy(0, 500));
-    await new Promise((resolve) => setTimeout(resolve, 6000));
-
+    await new Promise((resolve) => setTimeout(resolve, 8000));
     await browser.close();
 
     if (parsedTweets.length > 0) {
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Scrape success! Saved ${uniqueTweets.length} live author tweets to KV.`);
+      console.log(`[Puppeteer] Scrape complete! Saved ${uniqueTweets.length} live author tweets to KV.`);
+      return uniqueTweets;
     } else {
-      console.log('[Puppeteer] Warning: 0 tweets parsed. Check auth_token/ct0 cookies.');
+      console.log('[Puppeteer Warning] 0 tweets parsed.');
+      return [];
     }
   });
 
   try {
-    await Promise.race([scrapeTask, timeoutPromise]);
+    return await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
+    console.error('[Puppeteer Error]:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
+    return [];
   } finally {
     isScraping = false;
   }
@@ -250,6 +250,13 @@ app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 app.get('/clear-cache', async (req, res) => {
   await saveCachedTimelineToWorker([]);
   return res.send('KV Cache wiped successfully!');
+});
+
+// Synchronous scrape trigger that waits until Puppeteer finishes before responding
+app.get('/refresh-now', async (req, res) => {
+  console.log('[Direct Refresh] Triggering synchronous scrape...');
+  const newTweets = await backgroundScrape();
+  return res.json({ success: true, count: newTweets.length, tweets: newTweets });
 });
 
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
@@ -297,8 +304,6 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
-  // ONLY return cached tweets parsed from live X GraphQL responses.
-  // Never inject local account or fallbacks!
   return res.status(200).json(cachedTweets);
 });
 
