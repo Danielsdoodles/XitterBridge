@@ -128,7 +128,7 @@ async function backgroundScrape() {
     });
 
     const page = await browser.newPage();
-    await page.setCacheEnabled(false); // Force fresh network requests
+    await page.setCacheEnabled(false);
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
     await page.setCookie(
@@ -147,22 +147,50 @@ async function backgroundScrape() {
             if (key === 'tweet_results' && value?.result) {
               const tweetResult = value.result;
               const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-              const userLegacy = tweetResult?.core?.user_results?.result?.legacy || tweetResult?.tweet?.core?.user_results?.result?.legacy;
+              
+              // Search all possible GraphQL paths for author metadata
+              const userLegacy = 
+                tweetResult?.core?.user_results?.result?.legacy || 
+                tweetResult?.tweet?.core?.user_results?.result?.legacy ||
+                tweetResult?.user_results?.result?.legacy;
 
               if (legacy && userLegacy && userLegacy.screen_name) {
+                const authorId = userLegacy.id_str || (Math.floor(Math.random() * 89999999) + 10000000).toString();
+                const authorName = userLegacy.name || userLegacy.screen_name;
+                const authorScreenName = userLegacy.screen_name;
+                const authorAvatar = userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+
                 parsedTweets.push({
                   created_at: legacy.created_at || new Date().toUTCString(),
                   id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
                   id_str: legacy.id_str || Date.now().toString(),
                   text: legacy.full_text || legacy.text || "",
                   truncated: false,
+                  source: legacy.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
+                  in_reply_to_status_id: legacy.in_reply_to_status_id || null,
+                  in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                  in_reply_to_user_id: legacy.in_reply_to_user_id || null,
+                  in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                  in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
                   user: {
-                    id: userLegacy.id_str ? parseInt(userLegacy.id_str) : 999999,
-                    id_str: userLegacy.id_str || "999999",
-                    name: userLegacy.name || "User",
-                    screen_name: userLegacy.screen_name,
-                    profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-                    profile_image_url: userLegacy.profile_image_url_https || "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
+                    id: parseInt(authorId),
+                    id_str: authorId,
+                    name: authorName,
+                    screen_name: authorScreenName,
+                    location: userLegacy.location || "",
+                    description: userLegacy.description || "",
+                    url: userLegacy.url || null,
+                    protected: userLegacy.protected || false,
+                    followers_count: userLegacy.followers_count || 0,
+                    friends_count: userLegacy.friends_count || 0,
+                    listed_count: userLegacy.listed_count || 0,
+                    created_at: userLegacy.created_at || "Wed Oct 10 00:00:00 +0000 2020",
+                    favourites_count: userLegacy.favourites_count || 0,
+                    statuses_count: userLegacy.statuses_count || 0,
+                    profile_image_url: authorAvatar.replace('https://', 'http://'),
+                    profile_image_url_https: authorAvatar,
+                    default_profile: userLegacy.default_profile || false,
+                    default_profile_image: userLegacy.default_profile_image || false
                   },
                   retweet_count: legacy.retweet_count || 0,
                   favorite_count: legacy.favorite_count || 0,
@@ -180,7 +208,6 @@ async function backgroundScrape() {
     console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    // Scroll down slightly to trigger infinite-scroll stream load
     console.log('[Puppeteer] Triggering feed scroll...');
     await page.evaluate(() => window.scrollBy(0, 500));
     await new Promise((resolve) => setTimeout(resolve, 6000));
@@ -190,7 +217,7 @@ async function backgroundScrape() {
     if (parsedTweets.length > 0) {
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Success! Updated KV cache with ${uniqueTweets.length} fresh tweets.`);
+      console.log(`[Puppeteer] Success! Updated KV cache with ${uniqueTweets.length} fresh multi-author tweets.`);
     } else {
       console.log('[Puppeteer Warning] 0 tweets captured.');
     }
