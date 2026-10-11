@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const puppeteer = require('puppeteer');
 require('dotenv').config();
 
 const app = express();
@@ -8,7 +9,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Log incoming requests for Render debugging
+// Console logging for Render dashboard
 app.use((req, res, next) => {
   console.log(`[XitterBridge] ${req.method} ${req.path}`);
   next();
@@ -36,21 +37,112 @@ const defaultUser = {
   default_profile_image: true
 };
 
-// Active session timeline storage for posts made from your Lumia
-let localTimeline = [
-  {
-    created_at: new Date().toUTCString(),
-    id: Date.now(),
-    id_str: Date.now().toString(),
-    text: "🚀 XitterBridge is successfully connected to Render! Post updates right from your Windows Phone.",
-    truncated: false,
-    user: defaultUser,
-    retweet_count: 5,
-    favorite_count: 12,
-    favorited: true,
-    retweeted: false
+let localTimeline = [];
+
+/**
+ * Headless Browser Scraping Engine
+ * Executes X's browser scripts to generate dynamic headers and intercept live tweets
+ */
+async function fetchLiveTimelineViaPuppeteer() {
+  const authToken = process.env.X_AUTH_TOKEN;
+  const ct0 = process.env.X_CT0;
+
+  if (!authToken || !ct0) {
+    console.log('[Puppeteer] Skipping live fetch: Missing X_AUTH_TOKEN or X_CT0 in environment variables.');
+    return [];
   }
-];
+
+  console.log('[Puppeteer] Launching headless browser instance on Render...');
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
+    });
+
+    const page = await browser.newPage();
+
+    // Set User-Agent to match modern Edge/Chrome on Windows
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
+
+    // Inject active session cookies into browser context
+    await page.setCookie(
+      { name: 'auth_token', value: authToken, domain: '.x.com', path: '/' },
+      { name: 'ct0', value: ct0, domain: '.x.com', path: '/' }
+    );
+
+    let parsedTweets = [];
+
+    // Intercept GraphQL network responses
+    page.on('response', async (response) => {
+      const url = response.url();
+      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('UserTweets') || url.includes('ProfileTimeline'))) {
+        try {
+          const json = await response.json();
+          console.log('[Puppeteer] Successfully intercepted X GraphQL timeline payload!');
+          
+          const instructions = json?.data?.home?.home_timeline_urt?.instructions || 
+                               json?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
+
+          for (const instr of instructions) {
+            if (instr.type === 'TimelineAddEntries') {
+              const entries = instr.entries || [];
+              entries.forEach((entry, idx) => {
+                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+                const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+                const userLegacy = tweetResult?.core?.user_results?.result?.legacy;
+
+                if (legacy) {
+                  parsedTweets.push({
+                    created_at: legacy.created_at || new Date().toUTCString(),
+                    id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
+                    id_str: legacy.id_str || (Date.now() + idx).toString(),
+                    text: legacy.full_text || legacy.text || "",
+                    truncated: false,
+                    user: {
+                      ...defaultUser,
+                      name: userLegacy?.name || defaultUser.name,
+                      screen_name: userLegacy?.screen_name || defaultUser.screen_name,
+                      profile_image_url_https: userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https
+                    },
+                    retweet_count: legacy.retweet_count || 0,
+                    favorite_count: legacy.favorite_count || 0,
+                    favorited: legacy.favorited || false,
+                    retweeted: legacy.retweeted || false
+                  });
+                }
+              });
+            }
+          }
+        } catch (e) {
+          // Non-JSON response channel ignore
+        }
+      }
+    });
+
+    // Navigate to X home page and wait for GraphQL calls to resolve
+    console.log('[Puppeteer] Navigating to https://x.com/home...');
+    await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 25000 });
+    
+    await browser.close();
+    console.log(`[Puppeteer] Finished execution. Extracted ${parsedTweets.length} live tweets!`);
+    return parsedTweets;
+
+  } catch (err) {
+    console.error('[Puppeteer] Execution note:', err.message);
+    if (browser) await browser.close();
+    return [];
+  }
+}
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
@@ -89,9 +181,13 @@ app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser))
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
 /**
- * 4. Timelines
+ * 4. Home Timeline (Puppeteer Live Fetch + Local Session Posts)
  */
-app.get('/1.1/statuses/home_timeline.json', (req, res) => res.status(200).json(localTimeline));
+app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
+  let liveTweets = await fetchLiveTimelineViaPuppeteer();
+  return res.status(200).json([...localTimeline, ...liveTweets]);
+});
+
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || defaultUser));
@@ -114,7 +210,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     retweeted: false
   };
   localTimeline.unshift(newTweet);
-  console.log(`[XitterBridge] Tweet posted successfully from phone: "${tweetText}"`);
+  console.log(`[XitterBridge] Tweet posted successfully: "${tweetText}"`);
   return res.status(200).json(newTweet);
 });
 
@@ -126,7 +222,7 @@ app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
  * 6. Search & Trends
  */
 app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
-app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }, { name: "#Lumia", query: "%23Lumia" }] }]));
+app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 /**
  * 7. Friends & Followers Lists
