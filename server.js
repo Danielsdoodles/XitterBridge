@@ -149,7 +149,6 @@ async function backgroundScrape() {
       if (url.includes('/graphql/')) {
         try {
           const json = await response.json();
-          // Universal payload crawler: walks through JSON to find all tweets and their authors
           JSON.stringify(json, (key, value) => {
             if (key === 'tweet_results' && value?.result) {
               const tweetResult = value.result;
@@ -157,7 +156,6 @@ async function backgroundScrape() {
               const userLegacy = tweetResult?.core?.user_results?.result?.legacy || tweetResult?.tweet?.core?.user_results?.result?.legacy;
 
               if (legacy && userLegacy && userLegacy.screen_name) {
-                console.log('[Extracted Author]:', userLegacy.screen_name, '->', legacy.full_text?.substring(0, 20));
                 parsedTweets.push({
                   created_at: legacy.created_at || new Date().toUTCString(),
                   id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
@@ -169,7 +167,8 @@ async function backgroundScrape() {
                     id_str: userLegacy.id_str || "12345678",
                     name: userLegacy.name || "Unknown",
                     screen_name: userLegacy.screen_name || "unknown",
-                    profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
+                    profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+                    profile_image_url: userLegacy.profile_image_url_https || "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
                   },
                   retweet_count: legacy.retweet_count || 0,
                   favorite_count: legacy.favorite_count || 0,
@@ -193,7 +192,6 @@ async function backgroundScrape() {
     await browser.close();
 
     if (parsedTweets.length > 0) {
-      // Deduplicate tweets by id_str
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
       console.log(`[Puppeteer] Success! Cached ${uniqueTweets.length} unique tweets to Worker KV.`);
@@ -240,7 +238,21 @@ app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUse
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
-  return res.status(200).json([...localTimeline, ...cachedTweets]);
+
+  // Normalize tweets to ensure each item explicitly retains its true parsed user properties
+  const normalizedTweets = [...localTimeline, ...cachedTweets].map(tweet => ({
+    ...tweet,
+    user: {
+      id: tweet.user?.id || 12345678,
+      id_str: tweet.user?.id_str || "12345678",
+      name: tweet.user?.name || "Unknown",
+      screen_name: tweet.user?.screen_name || "unknown",
+      profile_image_url_https: tweet.user?.profile_image_url_https || defaultUser.profile_image_url_https,
+      profile_image_url: tweet.user?.profile_image_url || defaultUser.profile_image_url
+    }
+  }));
+
+  return res.status(200).json(normalizedTweets);
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
