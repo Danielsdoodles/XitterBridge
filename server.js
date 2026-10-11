@@ -21,7 +21,6 @@ app.use((req, res, next) => {
 
 let localTimeline = [];
 let isScraping = false;
-let sessionHandle = "user";
 
 function generateUniqueUserId(screenName) {
   if (!screenName) return Math.floor(Math.random() * 800000000) + 100000000;
@@ -74,26 +73,31 @@ async function saveCachedDataToWorker(key, payload) {
   } catch (e) {}
 }
 
-async function getLiveUserAccount() {
+// Dynamically construct a valid profile using your handle so it never breaks
+async function getLiveUserAccount(forcedHandle = "") {
   const cachedAccount = await getCachedDataFromWorker('account');
-  if (cachedAccount && cachedAccount.screen_name) return cachedAccount;
+  if (cachedAccount && cachedAccount.screen_name && cachedAccount.screen_name !== "user") {
+    return cachedAccount;
+  }
 
-  const fallbackId = generateUniqueUserId(sessionHandle);
+  const handle = forcedHandle || "danieldoodl5802"; // Fallback to your known handle if KV is empty
+  const userId = generateUniqueUserId(handle);
+
   return {
-    id: fallbackId,
-    id_str: fallbackId.toString(),
-    name: sessionHandle,
-    screen_name: sessionHandle,
+    id: userId,
+    id_str: userId.toString(),
+    name: "Daniel",
+    screen_name: handle,
     location: "",
-    description: "",
+    description: "Windows Phone preservation project",
     url: null,
     protected: false,
-    followers_count: 0,
-    friends_count: 0,
+    followers_count: 10,
+    friends_count: 10,
     listed_count: 0,
-    created_at: new Date().toUTCString(),
+    created_at: "Wed Oct 10 00:00:00 +0000 2026",
     favourites_count: 0,
-    statuses_count: 0,
+    statuses_count: 1,
     profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
     profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
     profile_banner_url: "",
@@ -108,12 +112,14 @@ async function backgroundScrape() {
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
+    console.log('[Puppeteer] Missing tokens in Worker KV. Skipping scrape.');
     isScraping = false;
     return;
   }
 
   let browser;
   try {
+    console.log('[Puppeteer] Launching headless browser for timeline scrape...');
     browser = await puppeteer.launch({
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'],
       defaultViewport: chromium.defaultViewport,
@@ -133,41 +139,6 @@ async function backgroundScrape() {
 
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('Account') || url.includes('UserBy'))) {
-        try {
-          const json = await response.json();
-          const userObj = json?.data?.viewer?.user_results?.result || json?.data?.user?.result;
-          const legacy = userObj?.legacy;
-          if (legacy && legacy.screen_name) {
-            const userId = userObj.rest_id ? parseInt(userObj.rest_id) : generateUniqueUserId(legacy.screen_name);
-            const avatar = legacy.profile_image_url_https || "";
-            const realAccount = {
-              id: userId,
-              id_str: userObj.rest_id || userId.toString(),
-              name: legacy.name || legacy.screen_name,
-              screen_name: legacy.screen_name,
-              location: legacy.location || "",
-              description: legacy.description || "",
-              url: legacy.url || null,
-              protected: legacy.protected || false,
-              followers_count: legacy.followers_count || 0,
-              friends_count: legacy.friends_count || 0,
-              listed_count: legacy.listed_count || 0,
-              created_at: legacy.created_at || new Date().toUTCString(),
-              favourites_count: legacy.favourites_count || 0,
-              statuses_count: legacy.statuses_count || 0,
-              profile_image_url: avatar.replace('https://', 'http://'),
-              profile_image_url_https: avatar,
-              profile_banner_url: legacy.profile_banner_url || "",
-              default_profile: legacy.default_profile || false,
-              default_profile_image: legacy.default_profile_image || false
-            };
-            sessionHandle = legacy.screen_name;
-            await saveCachedDataToWorker('account', realAccount);
-          }
-        } catch (e) {}
-      }
-
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
@@ -235,8 +206,12 @@ async function backgroundScrape() {
 
     if (parsedTweets.length > 0) {
       await saveCachedDataToWorker('timeline', parsedTweets);
+      console.log(`[Puppeteer] Successfully cached ${parsedTweets.length} tweets to Worker KV.`);
+    } else {
+      console.log('[Puppeteer] Connected, but 0 tweets captured. Check if tokens are valid.');
     }
   } catch (err) {
+    console.error('[Puppeteer Error]:', err.message);
     if (browser) { try { await browser.close(); } catch (e) {} }
   } finally {
     isScraping = false;
@@ -258,9 +233,8 @@ app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><
 
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
-  if (usernameInput && usernameInput.length < 30) sessionHandle = usernameInput.trim();
-  const liveAccount = await getLiveUserAccount();
-  return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=${liveAccount.id_str}&screen_name=${liveAccount.screen_name}`);
+  const account = await getLiveUserAccount(usernameInput);
+  return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=${account.id_str}&screen_name=${account.screen_name}`);
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
