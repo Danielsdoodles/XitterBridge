@@ -108,40 +108,54 @@ async function saveCachedTimelineToWorker(tweets) {
 }
 
 async function backgroundScrape() {
-  if (isScraping) return [];
+  if (isScraping) {
+    console.log('[Puppeteer] Scrape in progress, skipping...');
+    return [];
+  }
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
   console.log('[Puppeteer Token Check] auth_token length:', tokens.auth_token?.length, '| ct0 length:', tokens.ct0?.length);
 
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
+    console.log('[Puppeteer Error] Missing auth_token or ct0!');
     isScraping = false;
     return [];
   }
 
-  console.log('[Puppeteer] Launching browser instance...');
   let browser;
   let parsedTweets = [];
 
   const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Scrape timed out after 30s')), 30000)
+    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
   );
 
   const scrapeTask = (async () => {
+    console.log('[Puppeteer] Executing Chrome launch with low-RAM Render flags...');
+    
+    // Critical launch flags to prevent hanging on Render's free tier
     browser = await puppeteer.launch({
-      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox'],
-      defaultViewport: chromium.defaultViewport,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ],
+      defaultViewport: { width: 1280, height: 800 },
       executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
+      headless: true,
       ignoreHTTPSErrors: true,
     });
 
+    console.log('[Puppeteer] Chrome launched successfully! Opening page...');
     const page = await browser.newPage();
     await page.setCacheEnabled(false);
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
-    // Set authentication cookies for x.com AND twitter.com
     const cleanAuthToken = tokens.auth_token.trim();
     const cleanCt0 = tokens.ct0.trim();
 
@@ -155,7 +169,7 @@ async function backgroundScrape() {
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/')) {
-        console.log('[Puppeteer Intercepted GraphQL]:', url.split('?')[0]);
+        console.log('[GraphQL Intercepted]:', url.split('?')[0]);
         try {
           const json = await response.json();
           JSON.stringify(json, (key, value) => {
@@ -221,16 +235,15 @@ async function backgroundScrape() {
 
     console.log('[Puppeteer] Navigating to x.com/home...');
     try {
-      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 12000 });
     } catch (e) {
-      console.log('[Puppeteer Navigation Note]:', e.message);
+      console.log('[Puppeteer Nav Note]:', e.message);
     }
 
     const currentUrl = page.url();
     const pageTitle = await page.title();
-    console.log(`[Puppeteer Page Check] URL: ${currentUrl} | Title: "${pageTitle}"`);
+    console.log(`[Puppeteer Page] URL: ${currentUrl} | Title: "${pageTitle}"`);
 
-    // Force DOM scroll to ensure timeline stream triggers
     await page.evaluate(() => window.scrollBy(0, 800));
     await new Promise((resolve) => setTimeout(resolve, 6000));
 
@@ -242,7 +255,7 @@ async function backgroundScrape() {
       console.log(`[Puppeteer] SUCCESS! Saved ${uniqueTweets.length} live author tweets to KV.`);
       return uniqueTweets;
     } else {
-      console.log('[Puppeteer Warning] 0 tweets parsed from page stream.');
+      console.log('[Puppeteer Warning] 0 tweets parsed from stream.');
       return [];
     }
   });
@@ -250,7 +263,7 @@ async function backgroundScrape() {
   try {
     return await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
-    console.error('[Puppeteer Error]:', err.message);
+    console.error('[Puppeteer Launch/Execution Error]:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
