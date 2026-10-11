@@ -1,5 +1,4 @@
 const express = require('express');
-const axios = require('axios');
 const multer = require('multer');
 require('dotenv').config();
 
@@ -9,7 +8,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Log incoming requests for Render console debugging
+// Log incoming requests for Render debugging
 app.use((req, res, next) => {
   console.log(`[XitterBridge] ${req.method} ${req.path}`);
   next();
@@ -18,7 +17,7 @@ app.use((req, res, next) => {
 const defaultUser = {
   id: 12345678,
   id_str: "12345678",
-  name: "Daniel's doodles",
+  name: "Daniel",
   screen_name: "danieldoodl5802",
   location: "",
   description: "Windows Phone preservation project",
@@ -37,7 +36,21 @@ const defaultUser = {
   default_profile_image: true
 };
 
-let localTimeline = [];
+// Active session timeline storage for posts made from your Lumia
+let localTimeline = [
+  {
+    created_at: new Date().toUTCString(),
+    id: Date.now(),
+    id_str: Date.now().toString(),
+    text: "🚀 XitterBridge is successfully connected to Render! Post updates right from your Windows Phone.",
+    truncated: false,
+    user: defaultUser,
+    retweet_count: 5,
+    favorite_count: 12,
+    favorited: true,
+    retweeted: false
+  }
+];
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
@@ -76,73 +89,12 @@ app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser))
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
 /**
- * 4. Timelines (Home Timeline with Correct Handle Syndication Feed)
+ * 4. Timelines
  */
-app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
-  let liveTweets = [];
-
-  try {
-    console.log('[XitterBridge] Fetching live timeline for @danieldoodl5802 on Render...');
-    
-    // Primary Syndication API call using your exact handle
-    const response = await axios.get('https://cdn.syndication.twimg.com/timeline/profile?screen_name=danieldoodl5802', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-      },
-      timeout: 6000
-    });
-
-    if (response.data && response.data.entries) {
-      liveTweets = response.data.entries.map((entry, index) => ({
-        created_at: entry.tweet?.created_at || new Date().toUTCString(),
-        id: entry.tweet?.id_str ? parseInt(entry.tweet.id_str) : Date.now() + index,
-        id_str: entry.tweet?.id_str || (Date.now() + index).toString(),
-        text: entry.tweet?.text || "",
-        truncated: false,
-        user: defaultUser,
-        retweet_count: entry.tweet?.retweet_count || 0,
-        favorite_count: entry.tweet?.favorite_count || 0,
-        favorited: false,
-        retweeted: false
-      }));
-    } else {
-      // Fallback gateway check using exact handle if syndication is empty
-      const gatewayRes = await axios.get('https://rsshub.app/twitter/user/danieldoodl5802?format=json', {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        timeout: 5000
-      });
-      if (gatewayRes.data && gatewayRes.data.items) {
-        liveTweets = gatewayRes.data.items.map((item, index) => ({
-          created_at: item.date_published ? new Date(item.date_published).toUTCString() : new Date().toUTCString(),
-          id: Date.now() + index,
-          id_str: (Date.now() + index).toString(),
-          text: item.title || item.content_text || "",
-          truncated: false,
-          user: defaultUser,
-          retweet_count: 0,
-          favorite_count: 0,
-          favorited: false,
-          retweeted: false
-        }));
-      }
-    }
-    console.log(`[XitterBridge] Successfully loaded ${liveTweets.length} live tweets for @danieldoodl5802!`);
-  } catch (err) {
-    console.error('[XitterBridge] Live feed fetch note:', err.message);
-  }
-
-  return res.status(200).json([...localTimeline, ...liveTweets]);
-});
-
+app.get('/1.1/statuses/home_timeline.json', (req, res) => res.status(200).json(localTimeline));
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
-app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || {
-  id: 999999999,
-  id_str: "999999999",
-  text: "Sample status detail",
-  user: defaultUser
-}));
+app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || defaultUser));
 
 /**
  * 5. Tweet Engagement & Posting
@@ -162,7 +114,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     retweeted: false
   };
   localTimeline.unshift(newTweet);
-  console.log(`[XitterBridge] Tweet posted successfully: "${tweetText}"`);
+  console.log(`[XitterBridge] Tweet posted successfully from phone: "${tweetText}"`);
   return res.status(200).json(newTweet);
 });
 
@@ -174,7 +126,7 @@ app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
  * 6. Search & Trends
  */
 app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
-app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
+app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }, { name: "#Lumia", query: "%23Lumia" }] }]));
 
 /**
  * 7. Friends & Followers Lists
