@@ -39,16 +39,16 @@ const defaultUser = {
 
 let localTimeline = [];
 
-// Dynamic session cookies harvested via automated login (or fallback to environment variables)
-let dynamicAuthToken = process.env.X_AUTH_TOKEN || '';
-let dynamicCt0 = process.env.X_CT0 || '';
+// Dynamic runtime storage for harvested cookies
+let dynamicAuthToken = '';
+let dynamicCt0 = '';
 
 /**
  * Automated Puppeteer Login Handler
- * Takes credentials from the app login screen, logs into X, and extracts fresh cookies.
+ * Inputs app credentials into X's web login flow and extracts active cookies.
  */
 async function performPuppeteerLogin(username, password) {
-  console.log(`[Puppeteer Login] Attempting automated login for account: ${username}...`);
+  console.log(`[Puppeteer Login] Launching browser to authenticate user: ${username}`);
   let browser;
   try {
     browser = await puppeteer.launch({
@@ -68,16 +68,24 @@ async function performPuppeteerLogin(username, password) {
     });
 
     const page = await browser.newPage();
+
+    // Stealth overrides to mask automation flags on Render
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.navigator.chrome = { runtime: {} };
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    });
+
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
-    // Go to X login flow
     await page.goto('https://x.com/i/flow/login', { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // Type username
+    // Enter username
     await page.waitForSelector('input[autocomplete="username"]', { timeout: 10000 });
-    await page.type('input[autocomplete="username"]', username, { delay: 40 });
+    await page.type('input[autocomplete="username"]', username, { delay: 50 });
 
-    // Click Next button
+    // Click Next
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
       const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
@@ -86,11 +94,11 @@ async function performPuppeteerLogin(username, password) {
 
     await new Promise(r => setTimeout(r, 3000));
 
-    // Handle potential username/phone verification checkpoint if triggered by X
+    // Handle optional phone/username verification checkpoint
     try {
-      const checkpointInput = await page.$('input[data-testid="ocfEnterTextTextInput"]');
-      if (checkpointInput) {
-        await checkpointInput.type(username, { delay: 40 });
+      const checkpoint = await page.$('input[data-testid="ocfEnterTextTextInput"]');
+      if (checkpoint) {
+        await checkpoint.type(username, { delay: 50 });
         await page.evaluate(() => {
           const buttons = Array.from(document.querySelectorAll('button'));
           const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
@@ -100,37 +108,34 @@ async function performPuppeteerLogin(username, password) {
       }
     } catch (e) {}
 
-    // Type password
+    // Enter password
     await page.waitForSelector('input[name="password"]', { timeout: 10000 });
-    await page.type('input[name="password"]', password, { delay: 40 });
+    await page.type('input[name="password"]', password, { delay: 50 });
 
-    // Click Log In button
+    // Click Login
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
       const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
       if (loginBtn) loginBtn.click();
     });
 
-    // Wait for redirect to home page
     await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
 
-    // Extract cookies from session
     const cookies = await page.cookies();
     const authCookie = cookies.find(c => c.name === 'auth_token');
     const ct0Cookie = cookies.find(c => c.name === 'ct0');
 
+    await browser.close();
+
     if (authCookie && ct0Cookie) {
       dynamicAuthToken = authCookie.value;
       dynamicCt0 = ct0Cookie.value;
-      console.log('[Puppeteer Login] Success! Harvested fresh auth_token and ct0 cookies.');
-      await browser.close();
+      console.log('[Puppeteer Login] Successfully harvested session cookies.');
       return true;
     }
 
-    await browser.close();
-    console.log('[Puppeteer Login] Failed to locate session cookies after login navigation.');
+    console.log('[Puppeteer Login] Failed to extract session cookies.');
     return false;
-
   } catch (err) {
     console.error('[Puppeteer Login Error]:', err.message);
     if (browser) await browser.close();
@@ -146,11 +151,11 @@ async function fetchLiveTimelineViaPuppeteer() {
   const ct0 = dynamicCt0 || process.env.X_CT0;
 
   if (!authToken || !ct0) {
-    console.log('[Puppeteer] Skipping live fetch: No active session cookies available yet. Please log in through the app.');
+    console.log('[Puppeteer] Skipping live fetch: No active session cookies available.');
     return [];
   }
 
-  console.log('[Puppeteer] Launching headless browser instance on Render...');
+  console.log('[Puppeteer] Launching headless browser instance for timeline...');
   let browser;
   try {
     browser = await puppeteer.launch({
@@ -170,6 +175,14 @@ async function fetchLiveTimelineViaPuppeteer() {
     });
 
     const page = await browser.newPage();
+    
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.navigator.chrome = { runtime: {} };
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    });
+
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
     await page.setCookie(
@@ -223,15 +236,11 @@ async function fetchLiveTimelineViaPuppeteer() {
       }
     });
 
-    console.log('[Puppeteer] Navigating to https://x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 25000 });
-    
     await browser.close();
-    console.log(`[Puppeteer] Finished execution. Extracted ${parsedTweets.length} live tweets!`);
     return parsedTweets;
-
   } catch (err) {
-    console.error('[Puppeteer] Execution note:', err.message);
+    console.error('[Puppeteer Error]:', err.message);
     if (browser) await browser.close();
     return [];
   }
@@ -240,38 +249,24 @@ async function fetchLiveTimelineViaPuppeteer() {
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 /**
- * 1. OAuth Handshake & Real xAuth Login Interceptor
+ * 1. OAuth Handshake & Credentials Interceptor
  */
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
+app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
+app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 
-app.all('/oauth/authorize', (req, res) => {
-  const callback = req.query.oauth_callback || 'oob';
-  if (callback === 'oob') {
-    return res.send(`<html><body><h2>XitterBridge PIN Authorization</h2><p>Your authorization PIN is: <b>1234567</b></p></body></html>`);
-  }
-  res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
-});
-
-app.all('/oauth/authenticate', (req, res) => {
-  const callback = req.query.oauth_callback || 'oob';
-  if (callback === 'oob') {
-    return res.send(`<html><body><h2>XitterBridge PIN Authorization</h2><p>Your authorization PIN is: <b>1234567</b></p></body></html>`);
-  }
-  res.redirect(`${callback}?oauth_token=mock_req_token&oauth_verifier=1234567`);
-});
-
-// Intercept login credentials sent from the Windows Phone app via xAuth
+// Intercepts app login credentials, runs Puppeteer login, and returns access tokens upon success
 app.all('/oauth/access_token', async (req, res) => {
   const username = req.body.x_auth_username || req.query.x_auth_username;
   const password = req.body.x_auth_password || req.query.x_auth_password;
 
   if (username && password) {
-    console.log(`[XitterBridge] App login request received for: ${username}`);
-    const loginSuccess = await performPuppeteerLogin(username, password);
-    if (loginSuccess) {
+    console.log(`[XitterBridge] Processing app login for: ${username}`);
+    const success = await performPuppeteerLogin(username, password);
+    if (success) {
       return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=${username}`);
     } else {
-      return res.status(401).json({ error: "Automated browser login failed. Check credentials." });
+      return res.status(401).json({ error: "Automated browser login failed." });
     }
   }
 
@@ -281,8 +276,8 @@ app.all('/oauth/access_token', async (req, res) => {
 /**
  * 2. Settings & Configuration
  */
-app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000, max_media_per_upload: 1, photo_size_limit: 3145728 }));
-app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802", always_use_https: true }));
+app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
+app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
 /**
@@ -293,7 +288,7 @@ app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser))
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
 /**
- * 4. Home Timeline
+ * 4. Home Timeline Feed
  */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   let liveTweets = await fetchLiveTimelineViaPuppeteer();
@@ -322,7 +317,6 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     retweeted: false
   };
   localTimeline.unshift(newTweet);
-  console.log(`[XitterBridge] Tweet posted successfully: "${tweetText}"`);
   return res.status(200).json(newTweet);
 });
 
@@ -339,8 +333,8 @@ app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: 
 /**
  * 7. Friends & Followers Lists
  */
-app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0, next_cursor_str: "0" }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0, next_cursor_str: "0" }));
+app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
+app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
@@ -357,13 +351,6 @@ app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
  * 9. Universal Catch-All Handler
  */
 app.all('/1.1/*', (req, res) => {
-  const path = req.path;
-  if (path.includes('users/show') || path.includes('account/verify_credentials')) {
-    return res.status(200).json(defaultUser);
-  }
-  if (path.includes('favorites/create')) return res.status(200).json({ favorited: true });
-  if (path.includes('favorites/destroy')) return res.status(200).json({ favorited: false });
-  if (path.includes('list') || path.includes('timeline') || path.includes('search')) return res.status(200).json([]);
   return res.status(200).json({});
 });
 
