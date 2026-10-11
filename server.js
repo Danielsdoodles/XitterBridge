@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 require('dotenv').config();
 
 const app = express();
@@ -44,36 +45,18 @@ let dynamicAuthToken = '';
 let dynamicCt0 = '';
 
 /**
- * Automated Puppeteer Login Handler
- * Inputs app credentials into X's web login flow and extracts active cookies.
+ * Automated Puppeteer Login Handler using Sparticuz Chromium for Render
  */
 async function performPuppeteerLogin(username, password) {
-  console.log(`[Puppeteer Login] Launching browser to authenticate user: ${username}`);
+  console.log(`[Puppeteer Login] Launching cloud browser to authenticate user: ${username}`);
   let browser;
   try {
     browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-dev-tools',
-        '--no-default-browser-check',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--remote-debugging-port=0'
-      ]
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
@@ -168,28 +151,11 @@ async function fetchLiveTimelineViaPuppeteer() {
   let browser;
   try {
     browser = await puppeteer.launch({
-      headless: "new",
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-dev-tools',
-        '--no-default-browser-check',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-extensions',
-        '--disable-sync',
-        '--disable-translate',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--remote-debugging-port=0'
-      ]
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
