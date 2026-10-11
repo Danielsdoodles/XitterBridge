@@ -44,29 +44,37 @@ const defaultUser = {
 let localTimeline = [];
 
 /**
- * Helper function to save tokens into Cloudflare Worker KV storage
+ * Helper function to save tokens into Cloudflare Worker KV storage via secure JSON payload
  */
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
-  if (!workerUrl) return;
+  const secret = process.env.BRIDGE_SECRET;
+
+  if (!workerUrl || !secret) {
+    console.error('[Worker Sync Error] WORKER_URL or BRIDGE_SECRET missing in Render environment variables.');
+    return;
+  }
 
   try {
-    const formData = new URLSearchParams();
-    formData.append('auth_token', authToken);
-    formData.append('ct0', ct0Token);
-
-    const response = await fetch(workerUrl, {
+    const response = await fetch(`${workerUrl}/update-tokens`, {
       method: 'POST',
-      body: formData
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Bridge-Secret': secret
+      },
+      body: JSON.stringify({
+        auth_token: authToken,
+        ct0: ct0Token
+      })
     });
 
     if (response.ok) {
       console.log('[Worker Sync] Successfully updated tokens in Cloudflare Worker KV from native app login!');
     } else {
-      console.error('[Worker Sync Error] Failed to update tokens on Worker KV:', response.status);
+      console.error(`[Worker Sync Error] Failed to update tokens on Worker KV, HTTP status: ${response.status}`);
     }
   } catch (err) {
-    console.error('[Worker Sync Error]', err.message);
+    console.error('[Worker Sync Error]:', err.message);
   }
 }
 
@@ -121,7 +129,16 @@ async function fetchLiveTimelineViaPuppeteer() {
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
