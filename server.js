@@ -63,7 +63,16 @@ async function performPuppeteerLogin(username, password) {
         '--single-process',
         '--disable-gpu',
         '--disable-software-rasterizer',
-        '--disable-dev-tools'
+        '--disable-dev-tools',
+        '--no-default-browser-check',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--remote-debugging-port=0'
       ]
     });
 
@@ -170,7 +179,16 @@ async function fetchLiveTimelineViaPuppeteer() {
         '--single-process',
         '--disable-gpu',
         '--disable-software-rasterizer',
-        '--disable-dev-tools'
+        '--disable-dev-tools',
+        '--no-default-browser-check',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-extensions',
+        '--disable-sync',
+        '--disable-translate',
+        '--metrics-recording-only',
+        '--mute-audio',
+        '--remote-debugging-port=0'
       ]
     });
 
