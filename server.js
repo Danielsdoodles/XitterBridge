@@ -6,7 +6,6 @@ const puppeteer = addExtra(require('puppeteer-core'));
 const chromium = require('@sparticuz/chromium').default || require('@sparticuz/chromium');
 require('dotenv').config();
 
-// Apply stealth plugin to mask automation signatures
 puppeteer.use(StealthPlugin());
 
 const app = express();
@@ -47,21 +46,14 @@ let dynamicAuthToken = '';
 let dynamicCt0 = '';
 
 /**
- * Advanced Stealth Puppeteer Login Handler
+ * Automated Login via Lightweight Mobile Twitter Layout
  */
 async function performPuppeteerLogin(username, password) {
-  console.log(`[Puppeteer Login] Launching stealth browser for: ${username}`);
+  console.log(`[Puppeteer Login] Launching stealth mobile browser for: ${username}`);
   let browser;
   try {
-    const launchArgs = [...chromium.args];
-    
-    // Add proxy argument if you set a residential proxy in Render environment variables
-    if (process.env.PROXY_SERVER) {
-      launchArgs.push(`--proxy-server=${process.env.PROXY_SERVER}`);
-    }
-
     browser = await puppeteer.launch({
-      args: launchArgs,
+      args: chromium.args,
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -70,78 +62,34 @@ async function performPuppeteerLogin(username, password) {
 
     const page = await browser.newPage();
 
-    // Human-like viewport and headers
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 375, height: 812, isMobile: true });
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1');
 
-    // Go to X login page with generous timeout
-    await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Use mobile site login to avoid heavy SPA bot-walls
+    await page.goto('https://mobile.twitter.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await new Promise(r => setTimeout(r, 2000 + Math.random() * 1500));
 
-    // Human-like random delay before interacting
-    await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
+    // Wait for mobile form inputs
+    const usernameSelector = 'input[name="session[username_or_email]"]';
+    const passwordSelector = 'input[name="session[password]"]';
 
-    // Locate username field with fallbacks
-    let usernameSelector = null;
-    const candidateSelectors = [
-      'input[autocomplete="username"]',
-      'input[name="text"]',
-      'input[data-testid="ocfEnterTextTextInput"]'
-    ];
-
-    for (const selector of candidateSelectors) {
-      try {
-        await page.waitForSelector(selector, { timeout: 10000 });
-        usernameSelector = selector;
-        break;
-      } catch (e) {}
-    }
-
-    if (!usernameSelector) {
-      throw new Error("Bot detection wall triggered: Username field not rendered.");
-    }
-
-    // Type username with human-like typing delays (randomized per keystroke)
-    await page.type(usernameSelector, username, { delay: 80 + Math.random() * 60 });
+    await page.waitForSelector(usernameSelector, { timeout: 15000 });
+    await page.type(usernameSelector, username, { delay: 70 + Math.random() * 40 });
     await new Promise(r => setTimeout(r, 1000));
 
-    // Click Next button
-    await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
-      if (nextBtn) nextBtn.click();
-    });
-
-    await new Promise(r => setTimeout(r, 4000));
-
-    // Handle optional verification checkpoint if X asks for email/phone confirmation
-    try {
-      const checkpoint = await page.$('input[data-testid="ocfEnterTextTextInput"]');
-      if (checkpoint) {
-        await checkpoint.type(username, { delay: 90 });
-        await page.evaluate(() => {
-          const buttons = Array.from(document.querySelectorAll('button'));
-          const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
-          if (nextBtn) nextBtn.click();
-        });
-        await new Promise(r => setTimeout(r, 4000));
-      }
-    } catch (e) {}
-
-    // Enter password with human-like typing
-    await page.waitForSelector('input[name="password"]', { timeout: 15000 });
-    await page.type('input[name="password"]', password, { delay: 70 + Math.random() * 50 });
+    await page.waitForSelector(passwordSelector, { timeout: 15000 });
+    await page.type(passwordSelector, password, { delay: 70 + Math.random() * 40 });
     await new Promise(r => setTimeout(r, 1000));
 
-    // Click Login button
+    // Submit login form
     await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
-      if (loginBtn) loginBtn.click();
+      const submitBtn = document.querySelector('div[data-testid="LoginForm_Login_Button"]') || 
+                        Array.from(document.querySelectorAll('button, div[role="button"]')).find(el => el.innerText.includes('Log in') || el.innerText.includes('Iniciar sesión'));
+      if (submitBtn) submitBtn.click();
     });
 
     await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Harvest cookies upon successful authentication
     const cookies = await page.cookies();
     const authCookie = cookies.find(c => c.name === 'auth_token');
     const ct0Cookie = cookies.find(c => c.name === 'ct0');
@@ -151,11 +99,11 @@ async function performPuppeteerLogin(username, password) {
     if (authCookie && ct0Cookie) {
       dynamicAuthToken = authCookie.value;
       dynamicCt0 = ct0Cookie.value;
-      console.log('[Puppeteer Login] Successfully bypassed bot checks and harvested cookies.');
+      console.log('[Puppeteer Login] Successfully harvested session cookies via mobile login.');
       return true;
     }
 
-    console.log('[Puppeteer Login] Failed to extract cookies (Likely trapped by CAPTCHA).');
+    console.log('[Puppeteer Login] Failed to extract session cookies.');
     return false;
   } catch (err) {
     console.error('[Puppeteer Login Error]:', err.message);
@@ -176,7 +124,7 @@ async function fetchLiveTimelineViaPuppeteer() {
     return [];
   }
 
-  console.log('[Puppeteer] Launching stealth browser instance for timeline...');
+  console.log('[Puppeteer] Launching headless browser instance for timeline...');
   let browser;
   try {
     browser = await puppeteer.launch({
@@ -265,7 +213,7 @@ app.all('/oauth/access_token', async (req, res) => {
     if (success) {
       return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=${username}`);
     } else {
-      return res.status(401).json({ error: "Automated browser login failed or blocked by CAPTCHA." });
+      return res.status(401).json({ error: "Automated mobile browser login failed." });
     }
   }
 
