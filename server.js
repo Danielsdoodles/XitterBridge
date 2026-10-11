@@ -19,7 +19,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Primary authenticated account profile ONLY for auth / verify_credentials endpoints
 const authenticatedAccount = {
   id: 12345678,
   id_str: "12345678",
@@ -44,14 +43,13 @@ const authenticatedAccount = {
 
 let isScraping = false;
 
-// Generate a deterministic unique numeric ID based strictly on the author's handle
 function generateUniqueUserId(screenName) {
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
     hash = (hash << 5) - hash + screenName.charCodeAt(i);
     hash |= 0;
   }
-  return Math.abs(hash) + 10000000;
+  return Math.abs(hash) + 800000000;
 }
 
 async function saveTokensToWorker(authToken, ct0Token) {
@@ -119,7 +117,7 @@ async function backgroundScrape() {
     return;
   }
 
-  console.log('[Puppeteer] Starting FRESH background timeline scrape...');
+  console.log('[Puppeteer] Starting timeline scrape...');
   let browser;
   const timeoutPromise = new Promise((_, reject) => 
     setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
@@ -150,25 +148,29 @@ async function backgroundScrape() {
       if (url.includes('/graphql/')) {
         try {
           const json = await response.json();
-          JSON.stringify(json, (key, value) => {
-            if (key === 'tweet_results' && value?.result) {
-              const tweetResult = value.result;
-              const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-              
-              // Multi-path search for live user details
-              const userLegacy = 
-                tweetResult?.core?.user_results?.result?.legacy || 
-                tweetResult?.tweet?.core?.user_results?.result?.legacy ||
-                tweetResult?.user_results?.result?.legacy;
 
-              // STRICT REQUIREMENT: Only push if genuine live author details exist
-              if (legacy && userLegacy && userLegacy.screen_name && userLegacy.name) {
+          // Target GraphQL instructions directly
+          const instructions = 
+            json?.data?.home?.home_timeline_urt?.instructions || 
+            json?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
+
+          for (const instr of instructions) {
+            const entries = instr.entries || (instr.entry ? [instr.entry] : []);
+            for (const entry of entries) {
+              const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+              if (!tweetResult) continue;
+
+              const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+              const userResults = 
+                tweetResult?.core?.user_results?.result || 
+                tweetResult?.tweet?.core?.user_results?.result;
+              const userLegacy = userResults?.legacy;
+
+              if (legacy && userLegacy && userLegacy.screen_name) {
                 const authorScreenName = userLegacy.screen_name;
-                const authorName = userLegacy.name;
-                
-                // Derive exact unique IDs from the author's real profile
-                const realUserId = userLegacy.id_str ? parseInt(userLegacy.id_str) : generateUniqueUserId(authorScreenName);
-                const realUserIdStr = userLegacy.id_str || realUserId.toString();
+                const authorName = userLegacy.name || authorScreenName;
+                const authorId = userResults.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
+                const authorIdStr = userResults.rest_id || authorId.toString();
                 const authorAvatar = userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
 
                 parsedTweets.push({
@@ -178,11 +180,13 @@ async function backgroundScrape() {
                   text: legacy.full_text || legacy.text || "",
                   truncated: false,
                   source: legacy.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
-                  user_id: realUserId,
-                  user_id_str: realUserIdStr,
+                  user_id: authorId,
+                  user_id_str: authorIdStr,
+                  screen_name: authorScreenName,
+                  name: authorName,
                   user: {
-                    id: realUserId,
-                    id_str: realUserIdStr,
+                    id: authorId,
+                    id_str: authorIdStr,
                     name: authorName,
                     screen_name: authorScreenName,
                     location: userLegacy.location || "",
@@ -207,8 +211,7 @@ async function backgroundScrape() {
                 });
               }
             }
-            return value;
-          });
+          }
         } catch (e) {}
       }
     });
@@ -225,7 +228,9 @@ async function backgroundScrape() {
     if (parsedTweets.length > 0) {
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Success! Updated KV cache with ${uniqueTweets.length} live author tweets.`);
+      console.log(`[Puppeteer] Scrape success! Saved ${uniqueTweets.length} live author tweets to KV.`);
+    } else {
+      console.log('[Puppeteer] Warning: 0 tweets parsed. Check auth_token/ct0 cookies.');
     }
   });
 
@@ -266,12 +271,34 @@ app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ scree
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(authenticatedAccount));
-app.get('/1.1/users/show.json', (req, res) => res.status(200).json(authenticatedAccount));
-app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([authenticatedAccount]));
+
+app.get('/1.1/users/show.json', async (req, res) => {
+  const screenName = req.query.screen_name;
+  const userId = req.query.user_id;
+  const cachedTweets = await getCachedTimelineFromWorker();
+  
+  const matchedTweet = cachedTweets.find(t => 
+    (screenName && t.user?.screen_name?.toLowerCase() === screenName.toLowerCase()) ||
+    (userId && t.user?.id_str === userId.toString())
+  );
+
+  if (matchedTweet && matchedTweet.user) {
+    return res.status(200).json(matchedTweet.user);
+  }
+  return res.status(200).json(authenticatedAccount);
+});
+
+app.get('/1.1/users/lookup.json', async (req, res) => {
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const users = cachedTweets.map(t => t.user).filter(Boolean);
+  return res.status(200).json(users.length > 0 ? users : [authenticatedAccount]);
+});
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
+  // ONLY return cached tweets parsed from live X GraphQL responses.
+  // Never inject local account or fallbacks!
   return res.status(200).json(cachedTweets);
 });
 
