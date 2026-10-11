@@ -108,25 +108,24 @@ async function saveCachedTimelineToWorker(tweets) {
 }
 
 async function backgroundScrape() {
-  if (isScraping) {
-    console.log('[Puppeteer] Scrape already in progress...');
-    return [];
-  }
+  if (isScraping) return [];
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
+  console.log('[Puppeteer Token Check] auth_token length:', tokens.auth_token?.length, '| ct0 length:', tokens.ct0?.length);
+
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0!');
+    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
     isScraping = false;
     return [];
   }
 
-  console.log('[Puppeteer] Starting timeline scrape...');
+  console.log('[Puppeteer] Launching browser instance...');
   let browser;
   let parsedTweets = [];
 
   const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Scrape operation timed out after 30s')), 30000)
+    setTimeout(() => reject(new Error('Scrape timed out after 30s')), 30000)
   );
 
   const scrapeTask = (async () => {
@@ -142,14 +141,21 @@ async function backgroundScrape() {
     await page.setCacheEnabled(false);
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     
+    // Set authentication cookies for x.com AND twitter.com
+    const cleanAuthToken = tokens.auth_token.trim();
+    const cleanCt0 = tokens.ct0.trim();
+
     await page.setCookie(
-      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
-      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+      { name: 'auth_token', value: cleanAuthToken, domain: '.x.com', path: '/' },
+      { name: 'ct0', value: cleanCt0, domain: '.x.com', path: '/' },
+      { name: 'auth_token', value: cleanAuthToken, domain: '.twitter.com', path: '/' },
+      { name: 'ct0', value: cleanCt0, domain: '.twitter.com', path: '/' }
     );
 
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/')) {
+        console.log('[Puppeteer Intercepted GraphQL]:', url.split('?')[0]);
         try {
           const json = await response.json();
           JSON.stringify(json, (key, value) => {
@@ -213,21 +219,30 @@ async function backgroundScrape() {
       }
     });
 
-    console.log('[Puppeteer] Fast loading x.com/home...');
+    console.log('[Puppeteer] Navigating to x.com/home...');
     try {
-      await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 12000 });
-    } catch (e) {}
+      await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } catch (e) {
+      console.log('[Puppeteer Navigation Note]:', e.message);
+    }
 
-    await new Promise((resolve) => setTimeout(resolve, 8000));
+    const currentUrl = page.url();
+    const pageTitle = await page.title();
+    console.log(`[Puppeteer Page Check] URL: ${currentUrl} | Title: "${pageTitle}"`);
+
+    // Force DOM scroll to ensure timeline stream triggers
+    await page.evaluate(() => window.scrollBy(0, 800));
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+
     await browser.close();
 
     if (parsedTweets.length > 0) {
       const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
       await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Scrape complete! Saved ${uniqueTweets.length} live author tweets to KV.`);
+      console.log(`[Puppeteer] SUCCESS! Saved ${uniqueTweets.length} live author tweets to KV.`);
       return uniqueTweets;
     } else {
-      console.log('[Puppeteer Warning] 0 tweets parsed.');
+      console.log('[Puppeteer Warning] 0 tweets parsed from page stream.');
       return [];
     }
   });
@@ -252,7 +267,6 @@ app.get('/clear-cache', async (req, res) => {
   return res.send('KV Cache wiped successfully!');
 });
 
-// Synchronous scrape trigger that waits until Puppeteer finishes before responding
 app.get('/refresh-now', async (req, res) => {
   console.log('[Direct Refresh] Triggering synchronous scrape...');
   const newTweets = await backgroundScrape();
