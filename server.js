@@ -52,6 +52,7 @@ async function performPuppeteerLogin(username, password) {
   let browser;
   try {
     browser = await puppeteer.launch({
+      executablePath: '/usr/bin/chromium',
       headless: "new",
       args: [
         '--no-sandbox',
@@ -168,6 +169,7 @@ async function fetchLiveTimelineViaPuppeteer() {
   let browser;
   try {
     browser = await puppeteer.launch({
+      executablePath: '/usr/bin/chromium',
       headless: "new",
       args: [
         '--no-sandbox',
