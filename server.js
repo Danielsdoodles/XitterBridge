@@ -146,47 +146,40 @@ async function backgroundScrape() {
 
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
+      if (url.includes('/graphql/')) {
         try {
           const json = await response.json();
-          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
-          for (const instr of instructions) {
-            if (instr.type === 'TimelineAddEntries') {
-              instr.entries?.forEach((entry, idx) => {
-                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-                const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-                
-                const userLegacy = 
-                  tweetResult?.core?.user_results?.result?.legacy || 
-                  tweetResult?.tweet?.core?.user_results?.result?.legacy || 
-                  {};
+          // Universal payload crawler: walks through JSON to find all tweets and their authors
+          JSON.stringify(json, (key, value) => {
+            if (key === 'tweet_results' && value?.result) {
+              const tweetResult = value.result;
+              const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+              const userLegacy = tweetResult?.core?.user_results?.result?.legacy || tweetResult?.tweet?.core?.user_results?.result?.legacy;
 
-                if (legacy) {
-                  // Diagnostic debug log to check what author handle is being extracted
-                  console.log('[Parsed Tweet Author]:', userLegacy.screen_name || 'NOT FOUND', 'for tweet:', legacy.full_text?.substring(0, 20));
-
-                  parsedTweets.push({
-                    created_at: legacy.created_at || new Date().toUTCString(),
-                    id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
-                    id_str: legacy.id_str || (Date.now() + idx).toString(),
-                    text: legacy.full_text || legacy.text || "",
-                    truncated: false,
-                    user: {
-                      id: userLegacy.id_str ? parseInt(userLegacy.id_str) : 12345678,
-                      id_str: userLegacy.id_str || "12345678",
-                      name: userLegacy.name || "Unknown",
-                      screen_name: userLegacy.screen_name || "unknown",
-                      profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
-                    },
-                    retweet_count: legacy.retweet_count || 0,
-                    favorite_count: legacy.favorite_count || 0,
-                    favorited: legacy.favorited || false,
-                    retweeted: legacy.retweeted || false
-                  });
-                }
-              });
+              if (legacy && userLegacy && userLegacy.screen_name) {
+                console.log('[Extracted Author]:', userLegacy.screen_name, '->', legacy.full_text?.substring(0, 20));
+                parsedTweets.push({
+                  created_at: legacy.created_at || new Date().toUTCString(),
+                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
+                  id_str: legacy.id_str || Date.now().toString(),
+                  text: legacy.full_text || legacy.text || "",
+                  truncated: false,
+                  user: {
+                    id: userLegacy.id_str ? parseInt(userLegacy.id_str) : 12345678,
+                    id_str: userLegacy.id_str || "12345678",
+                    name: userLegacy.name || "Unknown",
+                    screen_name: userLegacy.screen_name || "unknown",
+                    profile_image_url_https: userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
+                  },
+                  retweet_count: legacy.retweet_count || 0,
+                  favorite_count: legacy.favorite_count || 0,
+                  favorited: legacy.favorited || false,
+                  retweeted: legacy.retweeted || false
+                });
+              }
             }
-          }
+            return value;
+          });
         } catch (e) {}
       }
     });
@@ -200,8 +193,10 @@ async function backgroundScrape() {
     await browser.close();
 
     if (parsedTweets.length > 0) {
-      await saveCachedTimelineToWorker(parsedTweets);
-      console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
+      // Deduplicate tweets by id_str
+      const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
+      await saveCachedTimelineToWorker(uniqueTweets);
+      console.log(`[Puppeteer] Success! Cached ${uniqueTweets.length} unique tweets to Worker KV.`);
     } else {
       console.log('[Puppeteer Warning] Connected, but 0 tweets captured.');
     }
