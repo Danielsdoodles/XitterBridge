@@ -19,7 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const authenticatedAccount = {
+const defaultUser = {
   id: 12345678,
   id_str: "12345678",
   name: "Daniel",
@@ -41,8 +41,10 @@ const authenticatedAccount = {
   default_profile_image: true
 };
 
+let localTimeline = [];
 let isScraping = false;
 
+// Generate unique integer IDs per handle so Windows Phone won't alias authors to defaultUser
 function generateUniqueUserId(screenName) {
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
@@ -63,7 +65,10 @@ async function saveTokensToWorker(authToken, ct0Token) {
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
       body: JSON.stringify({ auth_token: authToken, ct0: ct0Token })
     });
-  } catch (err) {}
+    console.log('[Worker Sync] Tokens updated successfully.');
+  } catch (err) {
+    console.error('[Worker Sync Error]', err.message);
+  }
 }
 
 async function getTokensFromCloudflareWorker() {
@@ -77,7 +82,9 @@ async function getTokensFromCloudflareWorker() {
       const data = await response.json();
       return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error('[Worker Sync Error]', err.message);
+  }
   return { auth_token: '', ct0: '' };
 }
 
@@ -109,8 +116,8 @@ async function saveCachedTimelineToWorker(tweets) {
 
 async function backgroundScrape() {
   if (isScraping) {
-    console.log('[Puppeteer] Scrape in progress, skipping...');
-    return [];
+    console.log('[Puppeteer] Scrape already in progress, skipping...');
+    return;
   }
   isScraping = true;
 
@@ -118,15 +125,14 @@ async function backgroundScrape() {
   if (!tokens.auth_token || !tokens.ct0) {
     console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
     isScraping = false;
-    return [];
+    return;
   }
 
-  console.log('[Puppeteer] Launching browser instance...');
+  console.log('[Puppeteer] Starting background timeline scrape...');
   let browser;
-  let parsedTweets = [];
-
+  
   const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Scrape operation timed out after 30s')), 30000)
+    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
   );
 
   const scrapeTask = (async () => {
@@ -136,124 +142,116 @@ async function backgroundScrape() {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--no-zygote',
         '--single-process'
       ],
-      defaultViewport: { width: 1280, height: 800 },
+      defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
-      headless: 'new',
+      headless: chromium.headless,
       ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
-    await page.setCacheEnabled(false);
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-
-    const cleanAuthToken = tokens.auth_token.trim();
-    const cleanCt0 = tokens.ct0.trim();
-
+    
     await page.setCookie(
-      { name: 'auth_token', value: cleanAuthToken, domain: '.x.com', path: '/' },
-      { name: 'ct0', value: cleanCt0, domain: '.x.com', path: '/' },
-      { name: 'auth_token', value: cleanAuthToken, domain: '.twitter.com', path: '/' },
-      { name: 'ct0', value: cleanCt0, domain: '.twitter.com', path: '/' }
+      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
-    // Dynamic GraphQL Stream Interception
+    let parsedTweets = [];
+
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/')) {
+        console.log('[Puppeteer Network]', url.split('?')[0]);
+      }
+      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
-          JSON.stringify(json, (key, value) => {
-            if (key === 'tweet_results' && value?.result) {
-              const tweetResult = value.result;
-              const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-              
-              const userResults = 
-                tweetResult?.core?.user_results?.result || 
-                tweetResult?.tweet?.core?.user_results?.result;
-              const userLegacy = userResults?.legacy;
+          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
+          for (const instr of instructions) {
+            if (instr.type === 'TimelineAddEntries') {
+              instr.entries?.forEach((entry, idx) => {
+                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+                const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
+                
+                // Deep search for live user metadata in GraphQL node
+                const userResults = 
+                  tweetResult?.core?.user_results?.result || 
+                  tweetResult?.tweet?.core?.user_results?.result;
+                const userLegacy = userResults?.legacy;
 
-              if (legacy && userLegacy && userLegacy.screen_name) {
-                const authorScreenName = userLegacy.screen_name;
-                const authorName = userLegacy.name || authorScreenName;
-                const authorId = userResults.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
-                const authorIdStr = userResults.rest_id || authorId.toString();
-                const authorAvatar = userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+                if (legacy) {
+                  const authorScreenName = userLegacy?.screen_name || "unknown";
+                  const authorName = userLegacy?.name || authorScreenName;
+                  const authorUserId = userResults?.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
+                  const authorUserIdStr = userResults?.rest_id || authorUserId.toString();
+                  const authorAvatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
 
-                parsedTweets.push({
-                  created_at: legacy.created_at || new Date().toUTCString(),
-                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
-                  id_str: legacy.id_str || Date.now().toString(),
-                  text: legacy.full_text || legacy.text || "",
-                  truncated: false,
-                  source: legacy.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
-                  user_id: authorId,
-                  user_id_str: authorIdStr,
-                  screen_name: authorScreenName,
-                  name: authorName,
-                  user: {
-                    id: authorId,
-                    id_str: authorIdStr,
-                    name: authorName,
-                    screen_name: authorScreenName,
-                    location: userLegacy.location || "",
-                    description: userLegacy.description || "",
-                    url: userLegacy.url || null,
-                    protected: userLegacy.protected || false,
-                    followers_count: userLegacy.followers_count || 0,
-                    friends_count: userLegacy.friends_count || 0,
-                    listed_count: userLegacy.listed_count || 0,
-                    created_at: userLegacy.created_at || "Wed Oct 10 00:00:00 +0000 2020",
-                    favourites_count: userLegacy.favourites_count || 0,
-                    statuses_count: userLegacy.statuses_count || 0,
-                    profile_image_url: authorAvatar.replace('https://', 'http://'),
-                    profile_image_url_https: authorAvatar,
-                    default_profile: userLegacy.default_profile || false,
-                    default_profile_image: userLegacy.default_profile_image || false
-                  },
-                  retweet_count: legacy.retweet_count || 0,
-                  favorite_count: legacy.favorite_count || 0,
-                  favorited: legacy.favorited || false,
-                  retweeted: legacy.retweeted || false
-                });
-              }
+                  parsedTweets.push({
+                    created_at: legacy.created_at || new Date().toUTCString(),
+                    id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
+                    id_str: legacy.id_str || (Date.now() + idx).toString(),
+                    text: legacy.full_text || legacy.text || "",
+                    truncated: false,
+                    user_id: authorUserId,
+                    user_id_str: authorUserIdStr,
+                    user: {
+                      id: authorUserId,
+                      id_str: authorUserIdStr,
+                      name: authorName,
+                      screen_name: authorScreenName,
+                      location: userLegacy?.location || "",
+                      description: userLegacy?.description || "",
+                      url: userLegacy?.url || null,
+                      protected: userLegacy?.protected || false,
+                      followers_count: userLegacy?.followers_count || 0,
+                      friends_count: userLegacy?.friends_count || 0,
+                      listed_count: userLegacy?.listed_count || 0,
+                      created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
+                      favourites_count: userLegacy?.favourites_count || 0,
+                      statuses_count: userLegacy?.statuses_count || 0,
+                      profile_image_url: authorAvatar.replace('https://', 'http://'),
+                      profile_image_url_https: authorAvatar,
+                      default_profile: userLegacy?.default_profile || false,
+                      default_profile_image: userLegacy?.default_profile_image || false
+                    },
+                    retweet_count: legacy.retweet_count || 0,
+                    favorite_count: legacy.favorite_count || 0,
+                    favorited: legacy.favorited || false,
+                    retweeted: legacy.retweeted || false
+                  });
+                }
+              });
             }
-            return value;
-          });
+          }
         } catch (e) {}
       }
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    try {
-      await page.goto('https://x.com/home', { waitUntil: 'commit', timeout: 15000 });
-    } catch (e) {}
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    // Allow page script execution to emit GraphQL responses
+    console.log('[Puppeteer] Waiting for timeline feed stream...');
     await new Promise((resolve) => setTimeout(resolve, 8000));
+
     await browser.close();
 
     if (parsedTweets.length > 0) {
-      const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
-      await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[Puppeteer] Scrape complete! Saved ${uniqueTweets.length} live author tweets to KV.`);
-      return uniqueTweets;
+      await saveCachedTimelineToWorker(parsedTweets);
+      console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
     } else {
-      console.log('[Puppeteer Warning] 0 tweets parsed from GraphQL stream.');
-      return [];
+      console.log('[Puppeteer Warning] Connected, but 0 tweets captured. Tokens may need re-authorizing or X is challenging.');
     }
   });
 
   try {
-    return await Promise.race([scrapeTask, timeoutPromise]);
+    await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
-    console.error('[Puppeteer Error]:', err.message);
+    console.error('[Puppeteer Exec Error]:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
-    return [];
   } finally {
     isScraping = false;
   }
@@ -261,15 +259,11 @@ async function backgroundScrape() {
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
+// Utility route to clear out poisoned cache data
 app.get('/clear-cache', async (req, res) => {
   await saveCachedTimelineToWorker([]);
-  return res.send('KV Cache wiped successfully!');
-});
-
-app.get('/refresh-now', async (req, res) => {
-  console.log('[Direct Refresh] Triggering synchronous Puppeteer scrape...');
-  const newTweets = await backgroundScrape();
-  return res.json({ success: true, count: newTweets.length, tweets: newTweets });
+  localTimeline = [];
+  return res.send('KV Cache cleared successfully!');
 });
 
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
@@ -290,8 +284,9 @@ app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
-app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(authenticatedAccount));
+app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
 
+// Dynamic User Endpoints so Lumia can lookup specific tweet authors
 app.get('/1.1/users/show.json', async (req, res) => {
   const screenName = req.query.screen_name;
   const userId = req.query.user_id;
@@ -305,26 +300,43 @@ app.get('/1.1/users/show.json', async (req, res) => {
   if (matchedTweet && matchedTweet.user) {
     return res.status(200).json(matchedTweet.user);
   }
-  return res.status(200).json(authenticatedAccount);
+  return res.status(200).json(defaultUser);
 });
 
 app.get('/1.1/users/lookup.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   const users = cachedTweets.map(t => t.user).filter(Boolean);
-  return res.status(200).json(users.length > 0 ? users : [authenticatedAccount]);
+  return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
-  return res.status(200).json(cachedTweets);
+  return res.status(200).json([...localTimeline, ...cachedTweets]);
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(authenticatedAccount));
+app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
+app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || defaultUser));
 
-app.post('/1.1/statuses/update.json', (req, res) => res.status(200).json({ success: true }));
+app.post('/1.1/statuses/update.json', (req, res) => {
+  const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
+  const newTweet = {
+    created_at: new Date().toUTCString(),
+    id: Date.now(),
+    id_str: Date.now().toString(),
+    text: tweetText,
+    truncated: false,
+    user: defaultUser,
+    retweet_count: 0,
+    favorite_count: 0,
+    favorited: false,
+    retweeted: false
+  };
+  localTimeline.unshift(newTweet);
+  return res.status(200).json(newTweet);
+});
+
 app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favorited: true }));
 app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
 app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
@@ -332,8 +344,8 @@ app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [authenticatedAccount], next_cursor: 0 }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [authenticatedAccount], next_cursor: 0 }));
+app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
+app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
