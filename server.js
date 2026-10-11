@@ -1,8 +1,13 @@
 const express = require('express');
 const multer = require('multer');
-const puppeteer = require('puppeteer-core');
+const { addExtra } = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const puppeteer = addExtra(require('puppeteer-core'));
 const chromium = require('@sparticuz/chromium').default || require('@sparticuz/chromium');
 require('dotenv').config();
+
+// Apply stealth plugin to mask automation signatures
+puppeteer.use(StealthPlugin());
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -10,7 +15,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Console logging for Render dashboard
 app.use((req, res, next) => {
   console.log(`[XitterBridge] ${req.method} ${req.path}`);
   next();
@@ -39,20 +43,25 @@ const defaultUser = {
 };
 
 let localTimeline = [];
-
-// Dynamic runtime storage for harvested cookies
 let dynamicAuthToken = '';
 let dynamicCt0 = '';
 
 /**
- * Automated Puppeteer Login Handler using Classic Login URL & Broad Selectors
+ * Advanced Stealth Puppeteer Login Handler
  */
 async function performPuppeteerLogin(username, password) {
-  console.log(`[Puppeteer Login] Launching cloud browser to authenticate user: ${username}`);
+  console.log(`[Puppeteer Login] Launching stealth browser for: ${username}`);
   let browser;
   try {
+    const launchArgs = [...chromium.args];
+    
+    // Add proxy argument if you set a residential proxy in Render environment variables
+    if (process.env.PROXY_SERVER) {
+      launchArgs.push(`--proxy-server=${process.env.PROXY_SERVER}`);
+    }
+
     browser = await puppeteer.launch({
-      args: chromium.args,
+      args: launchArgs,
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -61,77 +70,78 @@ async function performPuppeteerLogin(username, password) {
 
     const page = await browser.newPage();
 
-    // Stealth overrides to mask automation flags on Render
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.navigator.chrome = { runtime: {} };
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    });
+    // Human-like viewport and headers
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
+    // Go to X login page with generous timeout
+    await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Use the classic login page which is less prone to multi-step UI blocks
-    await page.goto('https://twitter.com/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Human-like random delay before interacting
+    await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
 
-    // Try multiple fallback selectors for the username field
+    // Locate username field with fallbacks
     let usernameSelector = null;
     const candidateSelectors = [
-      'input[name="text"]',
       'input[autocomplete="username"]',
-      'input[name="session[username_or_email]"]',
+      'input[name="text"]',
       'input[data-testid="ocfEnterTextTextInput"]'
     ];
 
     for (const selector of candidateSelectors) {
       try {
-        await page.waitForSelector(selector, { timeout: 8000 });
+        await page.waitForSelector(selector, { timeout: 10000 });
         usernameSelector = selector;
         break;
       } catch (e) {}
     }
 
     if (!usernameSelector) {
-      throw new Error("Could not locate username input field using any known selector.");
+      throw new Error("Bot detection wall triggered: Username field not rendered.");
     }
 
-    await page.type(usernameSelector, username, { delay: 60 });
+    // Type username with human-like typing delays (randomized per keystroke)
+    await page.type(usernameSelector, username, { delay: 80 + Math.random() * 60 });
+    await new Promise(r => setTimeout(r, 1000));
 
-    // Click Next / Submit username if it's a multi-step flow
+    // Click Next button
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente') || b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
+      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
       if (nextBtn) nextBtn.click();
     });
 
     await new Promise(r => setTimeout(r, 4000));
 
-    // Enter password
-    let passwordSelector = null;
-    const passSelectors = ['input[name="password"]', 'input[name="session[password]"]'];
-    for (const pSel of passSelectors) {
-      try {
-        await page.waitForSelector(pSel, { timeout: 10000 });
-        passwordSelector = pSel;
-        break;
-      } catch (e) {}
-    }
+    // Handle optional verification checkpoint if X asks for email/phone confirmation
+    try {
+      const checkpoint = await page.$('input[data-testid="ocfEnterTextTextInput"]');
+      if (checkpoint) {
+        await checkpoint.type(username, { delay: 90 });
+        await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
+          if (nextBtn) nextBtn.click();
+        });
+        await new Promise(r => setTimeout(r, 4000));
+      }
+    } catch (e) {}
 
-    if (!passwordSelector) {
-      throw new Error("Could not locate password input field.");
-    }
+    // Enter password with human-like typing
+    await page.waitForSelector('input[name="password"]', { timeout: 15000 });
+    await page.type('input[name="password"]', password, { delay: 70 + Math.random() * 50 });
+    await new Promise(r => setTimeout(r, 1000));
 
-    await page.type(passwordSelector, password, { delay: 60 });
-
-    // Click Login
+    // Click Login button
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión') || b.innerText.includes('Iniciar sesion'));
+      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
       if (loginBtn) loginBtn.click();
     });
 
     await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
 
+    // Harvest cookies upon successful authentication
     const cookies = await page.cookies();
     const authCookie = cookies.find(c => c.name === 'auth_token');
     const ct0Cookie = cookies.find(c => c.name === 'ct0');
@@ -141,11 +151,11 @@ async function performPuppeteerLogin(username, password) {
     if (authCookie && ct0Cookie) {
       dynamicAuthToken = authCookie.value;
       dynamicCt0 = ct0Cookie.value;
-      console.log('[Puppeteer Login] Successfully harvested session cookies.');
+      console.log('[Puppeteer Login] Successfully bypassed bot checks and harvested cookies.');
       return true;
     }
 
-    console.log('[Puppeteer Login] Failed to extract session cookies.');
+    console.log('[Puppeteer Login] Failed to extract cookies (Likely trapped by CAPTCHA).');
     return false;
   } catch (err) {
     console.error('[Puppeteer Login Error]:', err.message);
@@ -166,7 +176,7 @@ async function fetchLiveTimelineViaPuppeteer() {
     return [];
   }
 
-  console.log('[Puppeteer] Launching headless browser instance for timeline...');
+  console.log('[Puppeteer] Launching stealth browser instance for timeline...');
   let browser;
   try {
     browser = await puppeteer.launch({
@@ -178,15 +188,7 @@ async function fetchLiveTimelineViaPuppeteer() {
     });
 
     const page = await browser.newPage();
-    
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.navigator.chrome = { runtime: {} };
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    });
-
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
     await page.setCookie(
       { name: 'auth_token', value: authToken, domain: '.x.com', path: '/' },
@@ -200,8 +202,6 @@ async function fetchLiveTimelineViaPuppeteer() {
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('UserTweets') || url.includes('ProfileTimeline'))) {
         try {
           const json = await response.json();
-          console.log('[Puppeteer] Successfully intercepted X GraphQL timeline payload!');
-          
           const instructions = json?.data?.home?.home_timeline_urt?.instructions || 
                                json?.data?.user?.result?.timeline_v2?.timeline?.instructions || [];
 
@@ -251,14 +251,10 @@ async function fetchLiveTimelineViaPuppeteer() {
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
-/**
- * 1. OAuth Handshake & Credentials Interceptor
- */
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
 app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 
-// Intercepts app login credentials, runs Puppeteer login, and returns access tokens upon success
 app.all('/oauth/access_token', async (req, res) => {
   const username = req.body.x_auth_username || req.query.x_auth_username;
   const password = req.body.x_auth_password || req.query.x_auth_password;
@@ -269,30 +265,21 @@ app.all('/oauth/access_token', async (req, res) => {
     if (success) {
       return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=${username}`);
     } else {
-      return res.status(401).json({ error: "Automated browser login failed." });
+      return res.status(401).json({ error: "Automated browser login failed or blocked by CAPTCHA." });
     }
   }
 
   return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=danieldoodl5802`);
 });
 
-/**
- * 2. Settings & Configuration
- */
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
-/**
- * 3. User Profiles & Credentials
- */
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/show.json', (req, res) => res.status(200).json(defaultUser));
 app.get('/1.1/users/lookup.json', (req, res) => res.status(200).json([defaultUser]));
 
-/**
- * 4. Home Timeline Feed
- */
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   let liveTweets = await fetchLiveTimelineViaPuppeteer();
   return res.status(200).json([...localTimeline, ...liveTweets]);
@@ -302,9 +289,6 @@ app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).js
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || defaultUser));
 
-/**
- * 5. Tweet Engagement & Posting
- */
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
   const newTweet = {
@@ -327,32 +311,20 @@ app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favo
 app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
 app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 
-/**
- * 6. Search & Trends
- */
 app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-/**
- * 7. Friends & Followers Lists
- */
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-/**
- * 8. Direct Messages & Activity
- */
 app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
 app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
-/**
- * 9. Universal Catch-All Handler
- */
 app.all('/1.1/*', (req, res) => {
   return res.status(200).json({});
 });
