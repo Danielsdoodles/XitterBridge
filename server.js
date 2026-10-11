@@ -44,6 +44,33 @@ const defaultUser = {
 let localTimeline = [];
 
 /**
+ * Helper function to save tokens into Cloudflare Worker KV storage
+ */
+async function saveTokensToWorker(authToken, ct0Token) {
+  const workerUrl = process.env.WORKER_URL;
+  if (!workerUrl) return;
+
+  try {
+    const formData = new URLSearchParams();
+    formData.append('auth_token', authToken);
+    formData.append('ct0', ct0Token);
+
+    const response = await fetch(workerUrl, {
+      method: 'POST',
+      body: formData
+    });
+
+    if (response.ok) {
+      console.log('[Worker Sync] Successfully updated tokens in Cloudflare Worker KV from native app login!');
+    } else {
+      console.error('[Worker Sync Error] Failed to update tokens on Worker KV:', response.status);
+    }
+  } catch (err) {
+    console.error('[Worker Sync Error]', err.message);
+  }
+}
+
+/**
  * Helper function to fetch live session tokens from Cloudflare Worker KV
  */
 async function getTokensFromCloudflareWorker() {
@@ -169,10 +196,20 @@ app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_tok
 app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 
+// Native xAuth Sign-In Handler
 app.all('/oauth/access_token', async (req, res) => {
-  const username = req.body.x_auth_username || req.query.x_auth_username || "danieldoodl5802";
-  console.log(`[XitterBridge] Processing app sign-in for: ${username}`);
-  return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=${username}`);
+  const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
+  const passwordInput = req.body.x_auth_password || req.query.x_auth_password || "";
+
+  console.log(`[XitterBridge] Native app login attempt received.`);
+
+  // Check if user passed tokens into username and password fields
+  if (usernameInput.length > 20 && passwordInput.length > 20) {
+    console.log('[XitterBridge] Detected token injection via app login form! Saving to Cloudflare KV...');
+    await saveTokensToWorker(usernameInput.trim(), passwordInput.trim());
+  }
+
+  return res.send(`oauth_token=mock_access_token&oauth_token_secret=mock_access_secret&user_id=12345678&screen_name=danieldoodl5802`);
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
