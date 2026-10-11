@@ -120,7 +120,12 @@ async function backgroundScrape() {
 
   console.log('[Puppeteer] Starting background timeline scrape...');
   let browser;
-  try {
+  
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
+  );
+
+  const scrapeTask = (async () => {
     browser = await puppeteer.launch({
       args: chromium.args,
       defaultViewport: chromium.defaultViewport,
@@ -141,7 +146,10 @@ async function backgroundScrape() {
 
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/') && url.includes('HomeTimeline')) {
+      if (url.includes('/graphql/')) {
+        console.log('[Puppeteer Network]', url.split('?')[0]);
+      }
+      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
           const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
@@ -173,17 +181,15 @@ async function backgroundScrape() {
               });
             }
           }
-        } catch (e) {
-          console.error('[Puppeteer JSON Parse Error]', e.message);
-        }
+        } catch (e) {}
       }
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    console.log('[Puppeteer] Waiting 10s for GraphQL timeline data stream...');
-    await new Promise((resolve) => setTimeout(resolve, 10000));
+    console.log('[Puppeteer] Waiting for timeline feed stream...');
+    await new Promise((resolve) => setTimeout(resolve, 8000));
 
     await browser.close();
 
@@ -191,11 +197,17 @@ async function backgroundScrape() {
       await saveCachedTimelineToWorker(parsedTweets);
       console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
     } else {
-      console.log('[Puppeteer Warning] No tweets captured during the session.');
+      console.log('[Puppeteer Warning] Connected, but 0 tweets captured. Tokens may need re-authorizing or X is challenging.');
     }
+  });
+
+  try {
+    await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
     console.error('[Puppeteer Exec Error]:', err.message);
-    if (browser) await browser.close();
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
   } finally {
     isScraping = false;
   }
