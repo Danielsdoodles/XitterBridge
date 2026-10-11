@@ -99,7 +99,6 @@ async function saveCachedTimelineToWorker(tweets) {
   } catch (e) {}
 }
 
-// Direct HTTP API Fetch (No Puppeteer/Chromium overhead = No Render OOM crashes)
 async function fetchTimelineDirectly() {
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
@@ -107,92 +106,46 @@ async function fetchTimelineDirectly() {
     return [];
   }
 
-  console.log('[API Fetch] Requesting home timeline directly from X GraphQL...');
-  
-  // X's public HomeTimeline GraphQL query ID and features payload
-  const queryId = "7jT5ab_KAUI8qxhO_xUB_Q"; 
-  const variables = encodeURIComponent(JSON.stringify({
-    count: 20,
-    includePromotedContent: false,
-    latestControlAvailable: true,
-    requestContext: "launch",
-    withCommunityNotes: true
-  }));
-  const features = encodeURIComponent(JSON.stringify({
-    rph_chat_enabled: true,
-    profile_label_improvements_pcf_label_in_post_enabled: true,
-    responsive_web_graphql_exclude_directive_enabled: true,
-    verified_phone_label_enabled: false,
-    creator_subscriptions_tweet_preview_api_enabled: true,
-    responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-    communities_web_enable_tweet_community_result_fetch: true,
-    c9s_tweet_anatomy_moderator_badge_enabled: true,
-    articles_preview_enabled: true,
-    responsive_web_edit_tweet_api_enabled: true,
-    graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-    view_counts_everywhere_api_enabled: true,
-    longform_notetweets_consumption_enabled: true,
-    responsive_web_twitter_article_tweet_consumption_enabled: true,
-    tweet_awards_web_tipping_enabled: false,
-    freedom_of_speech_not_reach_fetch_enabled: true,
-    standardized_nudges_misinfo: true,
-    tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-    rweb_video_timestamps_enabled: true,
-    longform_notetweets_rich_text_read_enabled: true,
-    longform_notetweets_inline_media_enabled: true,
-    responsive_web_enhance_cards_enabled: true
-  }));
+  console.log('[API Fetch] Requesting home timeline directly via v1.1 REST API...');
 
-  const url = `https://x.com/i/api/graphql/${queryId}/HomeTimeline?variables=${variables}&features=${features}`;
+  const cleanAuthToken = tokens.auth_token.trim();
+  const cleanCt0 = tokens.ct0.trim();
+
+  // Primary v1.1 REST home timeline endpoint with Web Client Bearer Token
+  const targetUrl = 'https://api.x.com/1.1/statuses/home_timeline.json?count=20&tweet_mode=extended';
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(targetUrl, {
       method: 'GET',
       headers: {
         'authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
-        'x-csrf-token': tokens.ct0.trim(),
-        'cookie': `auth_token=${tokens.auth_token.trim()}; ct0=${tokens.ct0.trim()}`,
+        'x-csrf-token': cleanCt0,
+        'cookie': `auth_token=${cleanAuthToken}; ct0=${cleanCt0}`,
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'accept': '*/*',
-        'accept-language': 'en-US,en;q=0.9',
         'referer': 'https://x.com/home'
       }
     });
 
-    if (!response.ok) {
-      console.log('[API Fetch Error] Status:', response.status, response.statusText);
-      return [];
-    }
+    console.log(`[API Response] HTTP ${response.status} ${response.statusText}`);
 
-    const json = await response.json();
-    let parsedTweets = [];
+    if (response.ok) {
+      const rawTweets = await response.json();
+      if (Array.isArray(rawTweets) && rawTweets.length > 0) {
+        const parsedTweets = rawTweets.map(tweet => {
+          const authorScreenName = tweet.user?.screen_name || "unknown";
+          const authorName = tweet.user?.name || authorScreenName;
+          const authorId = tweet.user?.id || generateUniqueUserId(authorScreenName);
+          const authorIdStr = tweet.user?.id_str || authorId.toString();
+          const authorAvatar = tweet.user?.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
 
-    // Parse instructions
-    const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
-    for (const instr of instructions) {
-      const entries = instr.entries || [];
-      for (const entry of entries) {
-        const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-        if (!tweetResult) continue;
-
-        const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-        const userResults = tweetResult?.core?.user_results?.result || tweetResult?.tweet?.core?.user_results?.result;
-        const userLegacy = userResults?.legacy;
-
-        if (legacy && userLegacy && userLegacy.screen_name) {
-          const authorScreenName = userLegacy.screen_name;
-          const authorName = userLegacy.name || authorScreenName;
-          const authorId = userResults.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
-          const authorIdStr = userResults.rest_id || authorId.toString();
-          const authorAvatar = userLegacy.profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
-
-          parsedTweets.push({
-            created_at: legacy.created_at || new Date().toUTCString(),
-            id: legacy.id_str ? parseInt(legacy.id_str) : Date.now(),
-            id_str: legacy.id_str || Date.now().toString(),
-            text: legacy.full_text || legacy.text || "",
+          return {
+            created_at: tweet.created_at || new Date().toUTCString(),
+            id: tweet.id || Date.now(),
+            id_str: tweet.id_str || Date.now().toString(),
+            text: tweet.full_text || tweet.text || "",
             truncated: false,
-            source: legacy.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
+            source: tweet.source || "<a href=\"http://twitter.com\" rel=\"nofollow\">Twitter Web Client</a>",
             user_id: authorId,
             user_id_str: authorIdStr,
             screen_name: authorScreenName,
@@ -202,35 +155,33 @@ async function fetchTimelineDirectly() {
               id_str: authorIdStr,
               name: authorName,
               screen_name: authorScreenName,
-              location: userLegacy.location || "",
-              description: userLegacy.description || "",
-              url: userLegacy.url || null,
-              protected: userLegacy.protected || false,
-              followers_count: userLegacy.followers_count || 0,
-              friends_count: userLegacy.friends_count || 0,
-              listed_count: userLegacy.listed_count || 0,
-              created_at: userLegacy.created_at || "Wed Oct 10 00:00:00 +0000 2020",
-              favourites_count: userLegacy.favourites_count || 0,
-              statuses_count: userLegacy.statuses_count || 0,
+              location: tweet.user?.location || "",
+              description: tweet.user?.description || "",
+              url: tweet.user?.url || null,
+              protected: tweet.user?.protected || false,
+              followers_count: tweet.user?.followers_count || 0,
+              friends_count: tweet.user?.friends_count || 0,
+              listed_count: tweet.user?.listed_count || 0,
+              created_at: tweet.user?.created_at || "Wed Oct 10 00:00:00 +0000 2020",
+              favourites_count: tweet.user?.favourites_count || 0,
+              statuses_count: tweet.user?.statuses_count || 0,
               profile_image_url: authorAvatar.replace('https://', 'http://'),
               profile_image_url_https: authorAvatar,
-              default_profile: userLegacy.default_profile || false,
-              default_profile_image: userLegacy.default_profile_image || false
+              default_profile: tweet.user?.default_profile || false,
+              default_profile_image: tweet.user?.default_profile_image || false
             },
-            retweet_count: legacy.retweet_count || 0,
-            favorite_count: legacy.favorite_count || 0,
-            favorited: legacy.favorited || false,
-            retweeted: legacy.retweeted || false
-          });
-        }
-      }
-    }
+            retweet_count: tweet.retweet_count || 0,
+            favorite_count: tweet.favorite_count || 0,
+            favorited: tweet.favorited || false,
+            retweeted: tweet.retweeted || false
+          };
+        });
 
-    if (parsedTweets.length > 0) {
-      const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
-      await saveCachedTimelineToWorker(uniqueTweets);
-      console.log(`[API Fetch] Success! Fetched and cached ${uniqueTweets.length} live tweets.`);
-      return uniqueTweets;
+        const uniqueTweets = Array.from(new Map(parsedTweets.map(t => [t.id_str, t])).values());
+        await saveCachedTimelineToWorker(uniqueTweets);
+        console.log(`[API Fetch] Success! Fetched and cached ${uniqueTweets.length} live tweets.`);
+        return uniqueTweets;
+      }
     }
   } catch (err) {
     console.error('[API Fetch Exception]:', err.message);
@@ -295,7 +246,7 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
-  fetchTimelineDirectly(); // Trigger background sync
+  fetchTimelineDirectly();
   return res.status(200).json(cachedTweets);
 });
 
