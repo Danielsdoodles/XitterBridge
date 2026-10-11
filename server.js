@@ -45,7 +45,7 @@ let dynamicAuthToken = '';
 let dynamicCt0 = '';
 
 /**
- * Automated Puppeteer Login Handler using Sparticuz Chromium for Render
+ * Automated Puppeteer Login Handler with Robust Element Fallbacks
  */
 async function performPuppeteerLogin(username, password) {
   console.log(`[Puppeteer Login] Launching cloud browser to authenticate user: ${username}`);
@@ -71,17 +71,34 @@ async function performPuppeteerLogin(username, password) {
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0');
 
-    // Increased timeout and changed wait condition for heavy SPA loading
     await page.goto('https://x.com/i/flow/login', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // Enter username
-    await page.waitForSelector('input[autocomplete="username"]', { timeout: 15000 });
-    await page.type('input[autocomplete="username"]', username, { delay: 50 });
+    // Try multiple fallback selectors for the username field
+    let usernameSelector = null;
+    const candidateSelectors = [
+      'input[autocomplete="username"]',
+      'input[name="text"]',
+      'input[data-testid="ocfEnterTextTextInput"]'
+    ];
+
+    for (const selector of candidateSelectors) {
+      try {
+        await page.waitForSelector(selector, { timeout: 8000 });
+        usernameSelector = selector;
+        break;
+      } catch (e) {}
+    }
+
+    if (!usernameSelector) {
+      throw new Error("Could not locate username input field using any known selector.");
+    }
+
+    await page.type(usernameSelector, username, { delay: 50 });
 
     // Click Next
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente'));
+      const nextBtn = buttons.find(b => b.innerText.includes('Next') || b.innerText.includes('Siguiente') || b.innerText.includes('Siguient'));
       if (nextBtn) nextBtn.click();
     });
 
@@ -108,7 +125,7 @@ async function performPuppeteerLogin(username, password) {
     // Click Login
     await page.evaluate(() => {
       const buttons = Array.from(document.querySelectorAll('button'));
-      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión'));
+      const loginBtn = buttons.find(b => b.innerText.includes('Log in') || b.innerText.includes('Iniciar sesión') || b.innerText.includes('Iniciar sesion'));
       if (loginBtn) loginBtn.click();
     });
 
