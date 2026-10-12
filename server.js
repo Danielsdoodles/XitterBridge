@@ -705,21 +705,43 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: Explicit handlers for conversation threads requested by Windows Phone
+// CRITICAL FIX: Windows Phone Legacy Conversation Schema Fix
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  // Find parent tweet and any replies linked to it
+  // Find parent tweet and any child replies
   const parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
 
-  const conversationList = [];
-  if (parentTweet) conversationList.push(sanitizeTweet(parentTweet));
-  replies.forEach(r => conversationList.push(sanitizeTweet(r)));
+  const cleanParent = parentTweet ? sanitizeTweet(parentTweet) : null;
+  const cleanReplies = replies.map(r => sanitizeTweet(r));
 
-  return res.status(200).json(conversationList.length > 0 ? conversationList : (parentTweet ? [sanitizeTweet(parentTweet)] : []));
+  // Legacy Windows Phone expects both standard array and wrapped instruction objects
+  return res.status(200).json({
+    instructions: [
+      {
+        addEntries: {
+          entries: cleanReplies.map(reply => ({
+            entryId: `tweet-${reply.id_str}`,
+            sortIndex: reply.id_str,
+            content: {
+              item: {
+                content: {
+                  tweet: reply
+                }
+              }
+            }
+          }))
+        }
+      }
+    ],
+    ancestors: cleanParent ? [cleanParent] : [],
+    descendants: cleanReplies,
+    conversation: cleanReplies,
+    statuses: cleanParent ? [cleanParent, ...cleanReplies] : cleanReplies
+  });
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -842,7 +864,7 @@ app.all('*', (req, res) => {
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
-  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup') || path.includes('/conversation')) {
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup')) {
     return res.status(200).json([]);
   }
   return res.status(200).json({});
