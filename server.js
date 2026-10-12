@@ -14,8 +14,15 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Detailed Request Logger
+// CRITICAL FIX: Global Rate Limit & Access Headers required by Windows Phone client state machine
 app.use((req, res, next) => {
+  const nowSec = Math.floor(Date.now() / 1000);
+  res.setHeader('X-Rate-Limit-Limit', '180');
+  res.setHeader('X-Rate-Limit-Remaining', '175');
+  res.setHeader('X-Rate-Limit-Reset', String(nowSec + 900));
+  res.setHeader('X-Access-Level', 'read-write');
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  
   console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
   if (Object.keys(req.query).length > 0) {
     console.log(`  Query Params:`, JSON.stringify(req.query));
@@ -228,7 +235,6 @@ function sanitizeTweet(t) {
   };
 }
 
-// Bulletproof ID Matcher for lookups and threads
 function findTweetById(allTweets, idInput) {
   if (!idInput) return null;
   const cleanId = String(idInput).replace('.json', '').trim();
@@ -675,7 +681,6 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// BULLETPROOF CONVERSATION THREAD ENDPOINT
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id;
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -802,7 +807,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// ROBUST SEARCH ENDPOINT WITH DECODED QUERY & EXPLICIT PAGINATION TERMINATION
+// FULLY FIXED SEARCH ENDPOINT WITH PROPER METADATA FIELDS TO STOP RETRY LOOPS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
@@ -822,10 +827,14 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
-      count: finalStatuses.length,
+      max_id: 999999999999999999,
+      max_id_str: "999999999999999999",
       query: query,
+      count: finalStatuses.length,
+      since_id: 0,
+      since_id_str: "0",
       refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`,
-      next_results: null // Terminates search looping
+      next_results: null
     }
   });
 });
@@ -865,7 +874,6 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-// Corrected schemas for DMs and Activity to prevent C# deserialization crashes
 app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
 app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json({ direct_messages: [] }));
@@ -884,7 +892,6 @@ app.all('*', (req, res) => {
   return res.status(200).json({});
 });
 
-// Global Error Handler Middleware
 app.use((err, req, res, next) => {
   console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
   console.error(err.stack || err);
