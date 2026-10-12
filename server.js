@@ -29,12 +29,12 @@ const defaultUser = {
   url: null,
   protected: false,
   verified: false,
-  followers_count: 10,
-  friends_count: 10,
-  listed_count: 0,
+  followers_count: 150,
+  friends_count: 150,
+  listed_count: 5,
   created_at: "Wed Oct 10 00:00:00 +0000 2026",
-  favourites_count: 0,
-  statuses_count: 1,
+  favourites_count: 42,
+  statuses_count: 10,
   profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
@@ -47,7 +47,7 @@ let isScraping = false;
 let lastScrapeTime = 0;
 
 function generateUniqueUserId(screenName) {
-  if (!screenName) return Math.floor(Math.random() * 800000000) + 100000000;
+  if (!screenName || screenName === 'twitter_user') return Math.floor(Math.random() * 800000000) + 100000000;
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
     hash = (hash << 5) - hash + screenName.charCodeAt(i);
@@ -199,10 +199,10 @@ async function backgroundScrape() {
                 }
               }
 
-              if (!userLegacy || !userLegacy.screen_name) {
+              if (!userLegacy || !userLegacy.screen_name || userLegacy.screen_name === 'twitter_user') {
                 function findUser(n) {
                   if (!n || typeof n !== 'object') return null;
-                  if (n.screen_name && n.name && (n.followers_count !== undefined || n.profile_image_url_https)) return n;
+                  if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https)) return n;
                   for (const k of Object.keys(n)) {
                     if (typeof n[k] === 'object' && n[k] !== null) {
                       const res = findUser(n[k]);
@@ -211,11 +211,11 @@ async function backgroundScrape() {
                   }
                   return null;
                 }
-                userLegacy = findUser(obj);
+                userLegacy = findUser(obj) || userLegacy;
               }
 
-              const screenName = userLegacy?.screen_name || 'twitter_user';
-              const name = userLegacy?.name || screenName;
+              const screenName = (userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user') ? userLegacy.screen_name : 'danieldoodl5802';
+              const name = (userLegacy?.name && userLegacy.name !== 'twitter_user') ? userLegacy.name : screenName;
               const avatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
               const userIdStr = restId || userId.toString();
@@ -223,35 +223,6 @@ async function backgroundScrape() {
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
-              // Comprehensive Video, GIF, and Media Extractor
-              const videoResult = obj.card?.legacy?.binding_values || 
-                                  obj.video_info || 
-                                  obj.tweet_results?.result?.video_info ||
-                                  obj.media_Details;
-
-              let mediaType = 'photo';
-              let variants = legacy.extended_entities?.media?.[0]?.video_info?.variants || videoResult?.variants;
-
-              if (!variants && obj.card?.binding_values) {
-                for (const bv of obj.card.binding_values) {
-                  if (bv.key === 'variants' || bv.key === 'video_info_variants') {
-                    variants = bv.value?.value || bv.value?.string_value;
-                  }
-                }
-              }
-
-              if (variants && typeof variants === 'string') {
-                try { variants = JSON.parse(variants); } catch (e) {}
-              }
-
-              if (variants && Array.isArray(variants)) {
-                const mp4Variants = variants.filter(v => v.content_type === 'video/mp4').sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-                if (mp4Variants.length > 0) {
-                  mediaType = (legacy.extended_entities?.media?.[0]?.type === 'animated_gif' || obj.card?.name === 'animated_gif') ? 'animated_gif' : 'video';
-                }
-              }
-
-              // Card image fallback if no extended entities
               if (!extendedEntities && obj.card?.binding_values) {
                 let cardImgUrl = null;
                 for (const bv of obj.card.binding_values) {
@@ -261,7 +232,7 @@ async function backgroundScrape() {
                 }
                 if (cardImgUrl) {
                   if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
-                  cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=medium';
+                  cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=large';
                   const httpUrl = cardImgUrl.replace('https://', 'http://');
                   extendedEntities = {
                     media: [{
@@ -290,7 +261,7 @@ async function backgroundScrape() {
                 extendedEntities.media = extendedEntities.media.map(m => {
                   let mUrl = m.media_url_https || m.media_url || '';
                   if (mUrl.startsWith('//')) mUrl = 'https:' + mUrl;
-                  mUrl = mUrl.split('?')[0] + '?format=jpg&name=medium';
+                  mUrl = mUrl.split('?')[0] + '?format=jpg&name=large';
                   const httpUrl = mUrl.replace('https://', 'http://');
                   return {
                     id: m.id ? parseInt(m.id) : Date.now(),
@@ -301,8 +272,7 @@ async function backgroundScrape() {
                     url: m.url || '',
                     display_url: m.display_url || '',
                     expanded_url: m.expanded_url || '',
-                    type: mediaType,
-                    video_info: m.video_info || (variants ? { variants: variants } : undefined),
+                    type: m.type || 'photo',
                     sizes: m.sizes || {
                       thumb: { w: 150, h: 150, resize: 'crop' },
                       small: { w: 680, h: 680, resize: 'fit' },
@@ -316,8 +286,8 @@ async function backgroundScrape() {
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
               
-              // Guaranteed numeric metric fallbacks so NO tweet has missing stats
-              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 1);
+              // STRICTLY REAL METRICS: No random numbers or fake fallbacks. Extracts exact API counts or defaults to 0.
+              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 0);
               const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? obj.card?.binding_values?.retweet_count ?? 0);
 
               parsedTweets.push({
@@ -444,7 +414,7 @@ app.get('/1.1/users/show.json', async (req, res) => {
     return res.status(200).json(matchedTweet.user);
   }
 
-  if (screenName) {
+  if (screenName && screenName !== 'twitter_user') {
     const uid = generateUniqueUserId(screenName);
     return res.status(200).json({
       ...defaultUser,
@@ -531,31 +501,47 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 
-// Robust Tweet Detail endpoint to prevent client crashes when clicking on a tweet
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  let found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
   
-  if (found) {
-    return res.status(200).json(found);
+  if (!found) {
+    found = {
+      created_at: new Date().toUTCString(),
+      id: parseInt(tweetId) || Date.now(),
+      id_str: tweetId,
+      text: "Detailed post loaded from Windows Phone bridge",
+      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+      truncated: false,
+      user: defaultUser,
+      retweet_count: 0,
+      favorite_count: 0,
+      entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+      favorited: false,
+      retweeted: false
+    };
   }
 
-  // Fallback synthetic tweet to prevent null exceptions and app crashes on detail view
+  return res.status(200).json(found);
+});
+
+app.get('/1.1/search/tweets.json', async (req, res) => {
+  const query = req.query.q || "";
+  const cachedTweets = await getCachedTimelineFromWorker();
+  
+  let results = cachedTweets.slice(0, 5);
+  if (query.includes('to:') || query.includes('from:')) {
+    results = cachedTweets.slice(0, 8);
+  }
+
   return res.status(200).json({
-    created_at: new Date().toUTCString(),
-    id: parseInt(tweetId) || Date.now(),
-    id_str: tweetId,
-    text: "Detailed post loaded from Windows Phone bridge",
-    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-    truncated: false,
-    user: defaultUser,
-    retweet_count: 1,
-    favorite_count: 3,
-    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-    favorited: false,
-    retweeted: false
+    statuses: results.map(t => ({
+      ...t,
+      in_reply_to_status_id_str: t.id_str
+    })),
+    search_metadata: { completed_in: 0.025, count: results.length }
   });
 });
 
@@ -570,7 +556,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     truncated: false,
     user: defaultUser,
     retweet_count: 0,
-    favorite_count: 1,
+    favorite_count: 0,
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
     favorited: false,
     retweeted: false
@@ -583,7 +569,6 @@ app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favo
 app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
 app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 
-app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
