@@ -223,9 +223,67 @@ async function backgroundScrape() {
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
+              // Video & GIF Normalizer: Extract video variant URLs and map them to playable photo/video entities for Windows Phone
+              if (!extendedEntities && legacy.entities?.media) {
+                extendedEntities = { media: legacy.entities.media };
+              }
+
+              // Check for video info in variants or video_info
+              const variants = legacy.extended_entities?.media?.[0]?.video_info?.variants || 
+                               obj.card?.binding_values?.find(bv => bv.key === 'variants')?.value?.value ||
+                               legacy.video_info?.variants;
+
+              let mediaType = 'photo';
+              let posterUrl = null;
+
+              if (variants && Array.isArray(variants)) {
+                const mp4Variants = variants.filter(v => v.content_type === 'video/mp4').sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+                if (mp4Variants.length > 0) {
+                  mediaType = legacy.extended_entities?.media?.[0]?.type === 'animated_gif' ? 'animated_gif' : 'video';
+                  posterUrl = legacy.extended_entities?.media?.[0]?.media_url_https || legacy.media_url_https;
+                }
+              }
+
+              // Card video / image fallback
+              if (!extendedEntities && obj.card?.binding_values) {
+                const cardVals = obj.card.binding_values;
+                let cardImgUrl = null;
+                for (const bv of cardVals) {
+                  if (bv.key === 'thumbnail_image_url' || bv.key === 'player_image_url' || bv.key === 'image_url') {
+                    cardImgUrl = bv.value?.string_value || bv.value?.image_value?.url;
+                  }
+                }
+                if (cardImgUrl) {
+                  if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
+                  cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=medium';
+                  const httpUrl = cardImgUrl.replace('https://', 'http://');
+                  extendedEntities = {
+                    media: [{
+                      id: Date.now(),
+                      id_str: Date.now().toString(),
+                      indices: [0, 0],
+                      media_url: httpUrl,
+                      media_url_https: httpUrl,
+                      url: 'http://t.co/card',
+                      display_url: 'pic.x.com/card',
+                      expanded_url: cardImgUrl,
+                      type: 'photo',
+                      sizes: {
+                        thumb: { w: 150, h: 150, resize: 'crop' },
+                        small: { w: 680, h: 680, resize: 'fit' },
+                        medium: { w: 1200, h: 1200, resize: 'fit' },
+                        large: { w: 2048, h: 2048, resize: 'fit' }
+                      }
+                    }]
+                  };
+                  entities.media = extendedEntities.media;
+                }
+              }
+
               if (extendedEntities && extendedEntities.media) {
                 extendedEntities.media = extendedEntities.media.map(m => {
                   let mUrl = m.media_url_https || m.media_url || '';
+                  if (mUrl.startsWith('//')) mUrl = 'https:' + mUrl;
                   mUrl = mUrl.split('?')[0] + '?format=jpg&name=medium';
                   const httpUrl = mUrl.replace('https://', 'http://');
                   return {
@@ -237,7 +295,8 @@ async function backgroundScrape() {
                     url: m.url || '',
                     display_url: m.display_url || '',
                     expanded_url: m.expanded_url || '',
-                    type: m.type || 'photo',
+                    type: mediaType, // Safely handles photo, video, and animated_gif
+                    video_info: m.video_info || undefined,
                     sizes: m.sizes || {
                       thumb: { w: 150, h: 150, resize: 'crop' },
                       small: { w: 680, h: 680, resize: 'fit' },
@@ -251,7 +310,6 @@ async function backgroundScrape() {
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
               
-              // Robust multi-path metric extraction with intelligent default fallbacks
               const favCount = legacy.favorite_count 
                 ?? obj.favorite_count 
                 ?? obj.unviewed_favorite_count 
@@ -527,7 +585,6 @@ app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses: [], search_metadata: {} }));
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
