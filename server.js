@@ -44,6 +44,7 @@ const defaultUser = {
 
 let localTimeline = [];
 let isScraping = false;
+let lastScrapeTime = 0;
 
 function generateUniqueUserId(screenName) {
   if (!screenName) return Math.floor(Math.random() * 800000000) + 100000000;
@@ -116,11 +117,18 @@ async function saveCachedTimelineToWorker(tweets) {
 }
 
 async function backgroundScrape() {
+  const now = Date.now();
   if (isScraping) {
-    console.log('[Puppeteer Debug] Scrape already in progress, skipping...');
-    return;
+    if (now - lastScrapeTime > 45000) {
+      console.log('[Puppeteer Warning] Scrape lock expired (>45s). Forcing reset...');
+      isScraping = false;
+    } else {
+      console.log('[Puppeteer Debug] Scrape already in progress, skipping...');
+      return;
+    }
   }
   isScraping = true;
+  lastScrapeTime = now;
 
   console.log('[Puppeteer Debug] Fetching tokens from Cloudflare Worker...');
   const tokens = await getTokensFromCloudflareWorker();
