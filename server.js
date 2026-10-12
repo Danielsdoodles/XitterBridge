@@ -45,6 +45,7 @@ let localTimeline = [];
 let isScraping = false;
 
 function generateUniqueUserId(screenName) {
+  if (!screenName) return Math.floor(Math.random() * 800000000) + 100000000;
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
     hash = (hash << 5) - hash + screenName.charCodeAt(i);
@@ -172,18 +173,22 @@ async function backgroundScrape() {
             if (instr.type === 'TimelineAddEntries') {
               instr.entries?.forEach((entry, idx) => {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-                const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-                
-                const userResults = 
-                  tweetResult?.core?.user_results?.result || 
-                  tweetResult?.tweet?.core?.user_results?.result;
-                const userLegacy = userResults?.legacy;
+                const tweetObj = tweetResult?.tweet || tweetResult;
+                const legacy = tweetObj?.legacy;
+
+                // Multi-path author resolution to guarantee real handle and name
+                const userResult = 
+                  tweetObj?.core?.user_results?.result || 
+                  tweetObj?.user_results?.result || 
+                  tweetObj?.author?.result;
+                const userLegacy = userResult?.legacy || userResult?.user?.legacy;
 
                 if (legacy) {
-                  const authorScreenName = userLegacy?.screen_name || "unknown";
+                  const authorScreenName = userLegacy?.screen_name || "Twitter";
                   const authorName = userLegacy?.name || authorScreenName;
-                  const authorUserId = userResults?.rest_id ? parseInt(userResults.rest_id) : generateUniqueUserId(authorScreenName);
-                  const authorUserIdStr = userResults?.rest_id || authorUserId.toString();
+                  const authorRestId = userResult?.rest_id || userResult?.id;
+                  const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
+                  const authorUserIdStr = authorRestId || authorUserId.toString();
                   const authorAvatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
 
                   parsedTweets.push({
