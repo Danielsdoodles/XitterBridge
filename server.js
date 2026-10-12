@@ -81,6 +81,9 @@ function cleanStr(val) {
   if (typeof val === 'string') return val;
   if (typeof val === 'number' || typeof val === 'boolean') return String(val);
   if (typeof val === 'object') {
+    if (Array.isArray(val.urls) && val.urls.length > 0) {
+      return cleanStr(val.urls[0].expanded_url || val.urls[0].url);
+    }
     if (typeof val.expanded_url === 'string') return val.expanded_url;
     if (typeof val.url === 'string') return val.url;
     if (typeof val.display_url === 'string') return val.display_url;
@@ -673,7 +676,7 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-app.get('/1.1/statuses/show/:id.json', async (req, res) => {
+app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
@@ -699,7 +702,6 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   return res.status(200).json(sanitizeTweet(found));
 });
 
-// Explicit endpoint handlers for tweet lookup and ID lists called during tweet detail view
 app.get('/1.1/statuses/lookup.json', async (req, res) => {
   const idQuery = req.query.id || req.query.map;
   const cached = await getCachedTimelineFromWorker();
@@ -711,6 +713,7 @@ app.get('/1.1/statuses/lookup.json', async (req, res) => {
   return res.status(200).json([]);
 });
 
+app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
@@ -769,13 +772,12 @@ app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
-// Smart catch-all that returns correct types (arrays vs objects) based on route names
 app.all('/1.1/*', (req, res) => {
   const path = req.path;
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
-  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search')) {
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup')) {
     return res.status(200).json([]);
   }
   return res.status(200).json({});
