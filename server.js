@@ -53,7 +53,7 @@ async function saveTokensToWorker(authToken, ct0Token) {
 async function getTokensFromCloudflareWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
-  if (!workerUrl || !secret) return { auth_token: '', ct0: '' };
+  if (!workerUrl || !secret) return { auth_token: process.env.X_AUTH_TOKEN || '', ct0: process.env.X_CT0 || '' };
 
   try {
     const response = await fetch(`${workerUrl}/get-tokens`, { headers: { 'X-Bridge-Secret': secret } });
@@ -61,7 +61,9 @@ async function getTokensFromCloudflareWorker() {
       const data = await response.json();
       return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error('[Worker Sync Error]', err.message);
+  }
   return { auth_token: '', ct0: '' };
 }
 
@@ -91,48 +93,36 @@ async function saveCachedDataToWorker(key, payload) {
   } catch (e) {}
 }
 
-async function getLiveUserAccount() {
-  const cachedAccount = await getCachedDataFromWorker('account');
-  if (cachedAccount && cachedAccount.screen_name) return cachedAccount;
-
-  const fallbackId = generateUniqueUserId(sessionHandle);
-  return {
-    id: fallbackId,
-    id_str: fallbackId.toString(),
-    name: sessionHandle,
-    screen_name: sessionHandle,
-    location: "",
-    description: "",
-    url: null,
-    protected: false,
-    followers_count: 0,
-    friends_count: 0,
-    listed_count: 0,
-    created_at: new Date().toUTCString(),
-    favourites_count: 0,
-    statuses_count: 0,
-    profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-    profile_banner_url: "",
-    default_profile: true,
-    default_profile_image: true
-  };
-}
-
 async function backgroundScrape() {
-  if (isScraping) return;
+  if (isScraping) {
+    console.log('[Puppeteer] Scrape in progress, skipping...');
+    return;
+  }
   isScraping = true;
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
+    console.log('[Puppeteer Error] Missing auth_token or ct0!');
     isScraping = false;
     return;
   }
 
+  console.log('[Puppeteer] Starting background timeline & account profile scrape...');
   let browser;
-  try {
+
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
+  );
+
+  const scrapeTask = (async () => {
     browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--single-process'
+      ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -141,6 +131,7 @@ async function backgroundScrape() {
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    
     await page.setCookie(
       { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
@@ -150,6 +141,8 @@ async function backgroundScrape() {
 
     page.on('response', async (response) => {
       const url = response.url();
+      
+      // Capture real authenticated account profile from viewer node
       if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('Account') || url.includes('UserBy'))) {
         try {
           const json = await response.json();
@@ -183,10 +176,12 @@ async function backgroundScrape() {
             };
             sessionHandle = legacy.screen_name;
             await saveCachedDataToWorker('account', liveUserProfile);
+            console.log(`[Account Scrape] Updated live account profile in KV: @${liveUserProfile.screen_name}`);
           }
         } catch (e) {}
       }
 
+      // Capture live timeline stream & parse GraphQL into Legacy v1.1
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
@@ -196,7 +191,10 @@ async function backgroundScrape() {
               instr.entries?.forEach((entry, idx) => {
                 const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const legacy = tweetResult?.legacy || tweetResult?.tweet?.legacy;
-                const userResults = tweetResult?.core?.user_results?.result || tweetResult?.tweet?.core?.user_results?.result;
+                
+                const userResults = 
+                  tweetResult?.core?.user_results?.result || 
+                  tweetResult?.tweet?.core?.user_results?.result;
                 const userLegacy = userResults?.legacy;
 
                 if (legacy && userLegacy && userLegacy.screen_name) {
@@ -248,18 +246,58 @@ async function backgroundScrape() {
       }
     });
 
+    console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+    console.log('[Puppeteer] Waiting for feed stream...');
     await new Promise((resolve) => setTimeout(resolve, 8000));
+
     await browser.close();
 
     if (parsedTweets.length > 0) {
       await saveCachedDataToWorker('timeline', parsedTweets);
+      console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} live tweets to KV.`);
     }
+  });
+
+  try {
+    await Promise.race([scrapeTask, timeoutPromise]);
   } catch (err) {
-    if (browser) { try { await browser.close(); } catch (e) {} }
+    console.error('[Puppeteer Exec Error]:', err.message);
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
   } finally {
     isScraping = false;
   }
+}
+
+async function getLiveUserAccount() {
+  const cachedAccount = await getCachedDataFromWorker('account');
+  if (cachedAccount && cachedAccount.screen_name) return cachedAccount;
+
+  const fallbackId = generateUniqueUserId(sessionHandle);
+  return {
+    id: fallbackId,
+    id_str: fallbackId.toString(),
+    name: sessionHandle,
+    screen_name: sessionHandle,
+    location: "",
+    description: "",
+    url: null,
+    protected: false,
+    followers_count: 0,
+    friends_count: 0,
+    listed_count: 0,
+    created_at: new Date().toUTCString(),
+    favourites_count: 0,
+    statuses_count: 0,
+    profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    profile_banner_url: "",
+    default_profile: true,
+    default_profile_image: true
+  };
 }
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
