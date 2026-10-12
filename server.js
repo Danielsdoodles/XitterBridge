@@ -705,6 +705,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
+// CRITICAL FIX: Return conversation/show with structured object model wrapping statuses
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -729,8 +730,16 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   }
 
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-  const conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-  return res.status(200).json(conversationArray);
+  const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+
+  return res.status(200).json({
+    statuses: statuses,
+    conversation: statuses,
+    globalObjects: {
+      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
+    }
+  });
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -774,7 +783,7 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// CRITICAL FIX: Explicit handlers for typeahead and search suggestions returning expected object schemas instead of arrays
+// CRITICAL FIX: Return structured object for typeahead to prevent System.Object[] cast error
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -872,7 +881,8 @@ app.all('*', (req, res) => {
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
-  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup')) {
+  // Removed dangerous /search/ match to prevent returning arrays for object models
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/lookup')) {
     return res.status(200).json([]);
   }
   return res.status(200).json({});
