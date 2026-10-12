@@ -705,7 +705,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// FULLY ROBUST CONVERSATION / REPLIES ENDPOINT
+// CRITICAL FIX: Return JSON Array for conversation show so List<Tweet> deserializer succeeds
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -730,20 +730,9 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   }
 
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-  const sanitizedParent = sanitizeTweet(parentTweet);
-  const sanitizedReplies = replies.map(r => sanitizeTweet(r));
-  const allStatuses = [sanitizedParent, ...sanitizedReplies];
-
-  return res.status(200).json({
-    statuses: allStatuses,
-    conversation: allStatuses,
-    descendants: sanitizedReplies,
-    ancestors: [],
-    globalObjects: {
-      tweets: allStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
-      users: allStatuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
-    }
-  });
+  const conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+  
+  return res.status(200).json(conversationArray);
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -804,7 +793,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// FULLY ROBUST SEARCH ENDPOINT WITH GUARANTEED FALLBACK (STOPS LOOPS)
+// CRITICAL FIX: Search tweets without pagination triggers to completely stop infinite loops
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -813,35 +802,17 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
   let results = allTweets;
   const qLower = query.toLowerCase();
 
-  if (qLower.includes('to:')) {
-    const match = query.match(/to:([a-zA-Z0-9_]+)/i);
-    if (match) {
-      const targetUser = match[1].toLowerCase();
-      results = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser || t.in_reply_to_screen_name?.toLowerCase() === targetUser);
-    }
-  } else if (qLower.includes('from:')) {
-    const match = query.match(/from:([a-zA-Z0-9_]+)/i);
-    if (match) {
-      const targetUser = match[1].toLowerCase();
-      results = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser);
-    }
-  } else if (query.trim() !== '') {
+  if (query.trim() !== '') {
     results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
-  // Fallback to recent tweets if filter is empty so client never loops infinitely
-  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 20)).map(t => sanitizeTweet(t));
+  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
 
   return res.status(200).json({
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
-      max_id: 999999999999999999n.toString(),
-      max_id_str: "999999999999999999",
-      query: query,
-      count: finalStatuses.length,
-      since_id: 0,
-      since_id_str: "0"
+      count: finalStatuses.length
     }
   });
 });
