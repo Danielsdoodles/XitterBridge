@@ -186,7 +186,6 @@ async function backgroundScrape() {
 
                 const userLegacy = userResults?.legacy;
 
-                // Skip entries that don't have a real author or screen name (ads/system cards)
                 if (!legacy || !userLegacy || !userLegacy.screen_name) return;
 
                 const authorScreenName = userLegacy.screen_name;
@@ -195,6 +194,35 @@ async function backgroundScrape() {
                 const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
                 const authorUserIdStr = authorRestId || authorUserId.toString();
                 const authorAvatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
+
+                // Normalize entities and extended_entities for images with HTTP fallbacks for legacy TLS
+                let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+                let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
+
+                if (extendedEntities && extendedEntities.media) {
+                  extendedEntities.media = extendedEntities.media.map(m => {
+                    const httpsUrl = m.media_url_https || m.media_url;
+                    const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
+                    return {
+                      id: m.id ? parseInt(m.id) : Date.now(),
+                      id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
+                      indices: m.indices || [0, 0],
+                      media_url: httpUrl,
+                      media_url_https: httpsUrl,
+                      url: m.url || '',
+                      display_url: m.display_url || '',
+                      expanded_url: m.expanded_url || '',
+                      type: m.type || 'photo',
+                      sizes: m.sizes || {
+                        thumb: { w: 150, h: 150, resize: 'crop' },
+                        small: { w: 680, h: 680, resize: 'fit' },
+                        medium: { w: 1200, h: 1200, resize: 'fit' },
+                        large: { w: 2048, h: 2048, resize: 'fit' }
+                      }
+                    };
+                  });
+                  entities.media = extendedEntities.media;
+                }
 
                 parsedTweets.push({
                   created_at: legacy.created_at || new Date().toUTCString(),
@@ -239,8 +267,8 @@ async function backgroundScrape() {
                   is_quote_status: legacy.is_quote_status || false,
                   retweet_count: legacy.retweet_count || 0,
                   favorite_count: legacy.favorite_count || 0,
-                  entities: legacy.entities || { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-                  extended_entities: legacy.extended_entities || undefined,
+                  entities: entities,
+                  extended_entities: extendedEntities,
                   favorited: legacy.favorited || false,
                   retweeted: legacy.retweeted || false,
                   lang: legacy.lang || "en"
