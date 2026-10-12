@@ -56,42 +56,62 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-function parseGraphQLPayload(json) {
-  const usersMap = {};
-  const tweetsList = [];
+// Robust multi-path author extractor
+function extractAuthor(tweetResult, tweetObj) {
+  const possibleUserRes = [
+    tweetResult?.core?.user_results?.result,
+    tweetResult?.tweet?.core?.user_results?.result,
+    tweetResult?.user_results?.result,
+    tweetObj?.core?.user_results?.result,
+    tweetObj?.user_results?.result
+  ];
 
-  function walk(node) {
-    if (!node || typeof node !== 'object') return;
-
-    if (node.__typename === 'User' || (node.screen_name && node.name)) {
-      const legacy = node.legacy || node;
-      const screenName = legacy.screen_name || node.screen_name;
+  for (const uRes of possibleUserRes) {
+    if (uRes) {
+      const legacy = uRes.legacy || uRes;
+      const screenName = legacy?.screen_name || uRes?.screen_name;
       if (screenName && screenName.toLowerCase() !== 'twitter' && screenName.toLowerCase() !== 'x') {
-        const userIdStr = node.rest_id || node.id_str || legacy.id_str || generateUniqueUserId(screenName).toString();
-        usersMap[userIdStr] = {
+        const userIdStr = uRes.rest_id || uRes.id_str || legacy?.id_str || generateUniqueUserId(screenName).toString();
+        return {
           id: parseInt(userIdStr) || generateUniqueUserId(screenName),
           id_str: userIdStr,
-          name: legacy.name || node.name || screenName,
+          name: legacy?.name || uRes?.name || screenName,
           screen_name: screenName,
-          profile_image_url_https: legacy.profile_image_url_https || node.profile_image_url_https || defaultUser.profile_image_url_https
+          profile_image_url_https: legacy?.profile_image_url_https || uRes?.profile_image_url_https || defaultUser.profile_image_url_https
         };
-        usersMap[screenName.toLowerCase()] = usersMap[userIdStr];
-      }
-    }
-
-    if (node.legacy && (node.legacy.full_text || node.legacy.text)) {
-      tweetsList.push(node);
-    }
-
-    for (const key of Object.keys(node)) {
-      if (typeof node[key] === 'object' && node[key] !== null) {
-        walk(node[key]);
       }
     }
   }
 
-  walk(json);
-  return { usersMap, tweetsList };
+  // Deep recursive search fallback
+  function searchNode(node) {
+    if (!node || typeof node !== 'object') return null;
+    if (node.screen_name && node.screen_name.toLowerCase() !== 'twitter' && (node.followers_count !== undefined || node.name)) {
+      return node;
+    }
+    for (const key of Object.keys(node)) {
+      if (typeof node[key] === 'object' && node[key] !== null) {
+        const res = searchNode(node[key]);
+        if (res) return res;
+      }
+    }
+    return null;
+  }
+
+  const found = searchNode(tweetResult);
+  if (found && found.screen_name) {
+    const screenName = found.screen_name;
+    const userIdStr = found.rest_id || found.id_str || generateUniqueUserId(screenName).toString();
+    return {
+      id: parseInt(userIdStr) || generateUniqueUserId(screenName),
+      id_str: userIdStr,
+      name: found.name || screenName,
+      screen_name: screenName,
+      profile_image_url_https: found.profile_image_url_https || defaultUser.profile_image_url_https
+    };
+  }
+
+  return null;
 }
 
 async function saveTokensToWorker(authToken, ct0Token) {
@@ -140,16 +160,23 @@ async function getCachedTimelineFromWorker() {
   return [];
 }
 
-async function saveCachedTimelineToWorker(tweets) {
+// Accumulate and merge tweets into KV history to support infinite scrolling without looping
+async function appendCachedTimelineToWorker(newTweets) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
-  if (!workerUrl || !secret || !tweets.length) return;
+  if (!workerUrl || !secret || !newTweets.length) return;
 
   try {
+    const existing = await getCachedTimelineFromWorker();
+    const map = new Map();
+    existing.forEach(t => map.set(t.id_str, t));
+    newTweets.forEach(t => map.set(t.id_str, t));
+    const merged = Array.from(map.values()).sort((a, b) => b.id - a.id);
+
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(tweets)
+      body: JSON.stringify(merged.slice(0, 150)) // Keep up to 150 tweets for scrolling history
     });
   } catch (e) {}
 }
@@ -216,108 +243,102 @@ async function backgroundScrape() {
           if (!json) return;
 
           console.log('[Puppeteer GraphQL] Intercepted timeline payload!');
-          const { usersMap, tweetsList } = parseGraphQLPayload(json);
+          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
+          
+          for (const instr of instructions) {
+            if (instr.type === 'TimelineAddEntries') {
+              instr.entries?.forEach((entry, idx) => {
+                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+                const tweetObj = tweetResult?.tweet || tweetResult;
+                const legacy = tweetObj?.legacy;
 
-          tweetsList.forEach((tweetObj, idx) => {
-            const legacy = tweetObj.legacy;
-            if (!legacy) return;
+                if (!legacy) return;
 
-            const userIdStr = legacy.user_id_str || tweetObj.core?.user_results?.result?.rest_id;
-            let author = usersMap[userIdStr];
+                const author = extractAuthor(tweetResult, tweetObj);
+                if (!author) return;
 
-            if (!author) {
-              const coreUser = tweetObj.core?.user_results?.result?.legacy;
-              if (coreUser && coreUser.screen_name) {
-                author = {
-                  id: generateUniqueUserId(coreUser.screen_name),
-                  id_str: generateUniqueUserId(coreUser.screen_name).toString(),
-                  name: coreUser.name || coreUser.screen_name,
-                  screen_name: coreUser.screen_name,
-                  profile_image_url_https: coreUser.profile_image_url_https || defaultUser.profile_image_url_https
-                };
-              }
-            }
+                console.log(`[Author Extracted] @${author.screen_name} (${author.name})`);
 
-            if (!author) return;
+                let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+                let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
-            let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
-            let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
+                if (extendedEntities && extendedEntities.media) {
+                  extendedEntities.media = extendedEntities.media.map(m => {
+                    const httpsUrl = m.media_url_https || m.media_url || '';
+                    const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
+                    return {
+                      id: m.id ? parseInt(m.id) : Date.now(),
+                      id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
+                      indices: m.indices || [0, 0],
+                      media_url: httpUrl,
+                      media_url_https: httpsUrl,
+                      url: m.url || '',
+                      display_url: m.display_url || '',
+                      expanded_url: m.expanded_url || '',
+                      type: m.type || 'photo',
+                      sizes: m.sizes || {
+                        thumb: { w: 150, h: 150, resize: 'crop' },
+                        small: { w: 680, h: 680, resize: 'fit' },
+                        medium: { w: 1200, h: 1200, resize: 'fit' },
+                        large: { w: 2048, h: 2048, resize: 'fit' }
+                      }
+                    };
+                  });
+                  entities.media = extendedEntities.media;
+                }
 
-            if (extendedEntities && extendedEntities.media) {
-              extendedEntities.media = extendedEntities.media.map(m => {
-                const httpsUrl = m.media_url_https || m.media_url;
-                const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
-                return {
-                  id: m.id ? parseInt(m.id) : Date.now(),
-                  id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
-                  indices: m.indices || [0, 0],
-                  media_url: httpUrl,
-                  media_url_https: httpsUrl,
-                  url: m.url || '',
-                  display_url: m.display_url || '',
-                  expanded_url: m.expanded_url || '',
-                  type: m.type || 'photo',
-                  sizes: m.sizes || {
-                    thumb: { w: 150, h: 150, resize: 'crop' },
-                    small: { w: 680, h: 680, resize: 'fit' },
-                    medium: { w: 1200, h: 1200, resize: 'fit' },
-                    large: { w: 2048, h: 2048, resize: 'fit' }
-                  }
-                };
+                parsedTweets.push({
+                  created_at: legacy.created_at || new Date().toUTCString(),
+                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
+                  id_str: legacy.id_str || (Date.now() + idx).toString(),
+                  text: legacy.full_text || legacy.text || "",
+                  source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+                  truncated: false,
+                  in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
+                  in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                  in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
+                  in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                  in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+                  user_id: author.id,
+                  user_id_str: author.id_str,
+                  user: {
+                    id: author.id,
+                    id_str: author.id_str,
+                    name: author.name,
+                    screen_name: author.screen_name,
+                    location: "",
+                    description: "",
+                    url: null,
+                    protected: false,
+                    verified: false,
+                    followers_count: 100,
+                    friends_count: 100,
+                    listed_count: 0,
+                    created_at: "Wed Oct 10 00:00:00 +0000 2026",
+                    favourites_count: 100,
+                    statuses_count: 100,
+                    profile_image_url: author.profile_image_url_https.replace('https://', 'http://'),
+                    profile_image_url_https: author.profile_image_url_https,
+                    profile_banner_url: null,
+                    default_profile: false,
+                    default_profile_image: false
+                  },
+                  geo: null,
+                  coordinates: null,
+                  place: null,
+                  contributors: null,
+                  is_quote_status: legacy.is_quote_status || false,
+                  retweet_count: legacy.retweet_count || 0,
+                  favorite_count: legacy.favorite_count || 0,
+                  entities: entities,
+                  extended_entities: extendedEntities,
+                  favorited: legacy.favorited || false,
+                  retweeted: legacy.retweeted || false,
+                  lang: legacy.lang || "en"
+                });
               });
-              entities.media = extendedEntities.media;
             }
-
-            parsedTweets.push({
-              created_at: legacy.created_at || new Date().toUTCString(),
-              id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
-              id_str: legacy.id_str || (Date.now() + idx).toString(),
-              text: legacy.full_text || legacy.text || "",
-              source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-              truncated: false,
-              in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-              in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-              in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-              in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-              in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-              user_id: author.id,
-              user_id_str: author.id_str,
-              user: {
-                id: author.id,
-                id_str: author.id_str,
-                name: author.name,
-                screen_name: author.screen_name,
-                location: "",
-                description: "",
-                url: null,
-                protected: false,
-                verified: false,
-                followers_count: 100,
-                friends_count: 100,
-                listed_count: 0,
-                created_at: "Wed Oct 10 00:00:00 +0000 2026",
-                favourites_count: 100,
-                statuses_count: 100,
-                profile_image_url: author.profile_image_url_https.replace('https://', 'http://'),
-                profile_image_url_https: author.profile_image_url_https,
-                profile_banner_url: null,
-                default_profile: false,
-                default_profile_image: false
-              },
-              geo: null,
-              coordinates: null,
-              place: null,
-              contributors: null,
-              is_quote_status: legacy.is_quote_status || false,
-              retweet_count: legacy.retweet_count || 0,
-              favorite_count: legacy.favorite_count || 0,
-              entities: entities,
-              extended_entities: extendedEntities,
-              favorited: legacy.favorited || false,
-              retweeted: legacy.retweeted || false,
-              lang: legacy.lang || "en"
-            });
-          });
+          }
         }
       } catch (e) {}
     });
@@ -337,8 +358,8 @@ async function backgroundScrape() {
     await browser.close();
 
     if (parsedTweets.length > 0) {
-      await saveCachedTimelineToWorker(parsedTweets);
-      console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
+      await appendCachedTimelineToWorker(parsedTweets);
+      console.log(`[Puppeteer] Success! Merged ${parsedTweets.length} tweets to Worker KV history.`);
     } else {
       console.log('[Puppeteer Warning] Connected and scrolled, but 0 tweets captured.');
     }
@@ -355,7 +376,7 @@ async function backgroundScrape() {
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 app.get('/clear-cache', async (req, res) => {
-  await saveCachedTimelineToWorker([]);
+  await appendCachedTimelineToWorker([]);
   localTimeline = [];
   return res.send('KV Cache cleared successfully!');
 });
@@ -446,15 +467,17 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const maxId = req.query.max_id;
 
   if (maxId) {
-    const maxIdNum = BigInt(maxId);
-    timeline = timeline.filter(tweet => {
-      try {
-        const tweetIdNum = BigInt(tweet.id_str || tweet.id);
-        return tweetIdNum < maxIdNum;
-      } catch (e) {
-        return true;
-      }
-    });
+    try {
+      const maxIdNum = BigInt(maxId);
+      timeline = timeline.filter(tweet => {
+        try {
+          const tweetIdNum = BigInt(tweet.id_str || tweet.id);
+          return tweetIdNum < maxIdNum;
+        } catch (e) {
+          return true;
+        }
+      });
+    } catch (e) {}
   }
 
   return res.status(200).json(timeline);
@@ -498,6 +521,7 @@ app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12
 
 app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
+app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
