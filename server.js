@@ -56,48 +56,45 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Fail-safe author extraction that never fails or returns null
-function extractAuthorInfo(tweetResult, entry) {
-  const paths = [
-    tweetResult?.core?.user_results?.result?.legacy,
-    tweetResult?.tweet?.core?.user_results?.result?.legacy,
-    tweetResult?.user_results?.result?.legacy,
-    tweetResult?.tweet?.user_results?.result?.legacy,
-    tweetResult?.author?.result?.legacy
-  ];
+// Deep recursive scanner to extract all user objects and tweet entries in the payload
+function parseGraphQLPayload(json) {
+  const usersMap = {};
+  const tweetsList = [];
 
-  for (const legacyUser of paths) {
-    if (legacyUser && legacyUser.screen_name && legacyUser.screen_name.toLowerCase() !== 'twitter') {
-      return {
-        handle: legacyUser.screen_name,
-        name: legacyUser.name || legacyUser.screen_name,
-        avatar: legacyUser.profile_image_url_https || defaultUser.profile_image_url_https
-      };
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+
+    // Collect user profile data
+    if (node.__typename === 'User' || (node.screen_name && node.name)) {
+      const legacy = node.legacy || node;
+      const screenName = legacy.screen_name || node.screen_name;
+      if (screenName && screenName.toLowerCase() !== 'twitter' && screenName.toLowerCase() !== 'x') {
+        const userIdStr = node.rest_id || node.id_str || legacy.id_str || generateUniqueUserId(screenName).toString();
+        usersMap[userIdStr] = {
+          id: parseInt(userIdStr) || generateUniqueUserId(screenName),
+          id_str: userIdStr,
+          name: legacy.name || node.name || screenName,
+          screen_name: screenName,
+          profile_image_url_https: legacy.profile_image_url_https || node.profile_image_url_https || defaultUser.profile_image_url_https
+        };
+        usersMap[screenName.toLowerCase()] = usersMap[userIdStr];
+      }
+    }
+
+    // Collect tweet items
+    if (node.legacy && (node.legacy.full_text || node.legacy.text)) {
+      tweetsList.push(node);
+    }
+
+    for (const key of Object.keys(node)) {
+      if (typeof node[key] === 'object' && node[key] !== null) {
+        walk(node[key]);
+      }
     }
   }
 
-  // Fallback regex search within the entry, avoiding the global "twitter" string
-  try {
-    const jsonStr = JSON.stringify(entry);
-    const matches = [...jsonStr.matchAll(/"screen_name":"([^"]+)"/g)];
-    for (const match of matches) {
-      const val = match[1];
-      if (val && val.toLowerCase() !== 'twitter' && val.toLowerCase() !== 'x' && val.length > 0) {
-        return {
-          handle: val,
-          name: val,
-          avatar: defaultUser.profile_image_url_https
-        };
-      }
-    }
-  } catch (e) {}
-
-  // Ultimate fallback to ensure the tweet is never dropped
-  return {
-    handle: "user_" + Math.floor(Math.random() * 10000),
-    name: "User",
-    avatar: defaultUser.profile_image_url_https
-  };
+  walk(json);
+  return { usersMap, tweetsList };
 }
 
 async function saveTokensToWorker(authToken, ct0Token) {
@@ -176,7 +173,6 @@ async function backgroundScrape() {
 
   console.log('[Puppeteer Debug] Fetching tokens from Cloudflare Worker...');
   const tokens = await getTokensFromCloudflareWorker();
-  console.log(`[Puppeteer Debug] Tokens retrieved. auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
 
   if (!tokens.auth_token || !tokens.ct0) {
     console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV! Aborting scrape.');
@@ -222,104 +218,112 @@ async function backgroundScrape() {
           const json = await response.json().catch(() => null);
           if (!json) return;
 
-          console.log('[Puppeteer GraphQL] Successfully intercepted timeline feed!');
-          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
-          for (const instr of instructions) {
-            if (instr.type === 'TimelineAddEntries') {
-              instr.entries?.forEach((entry, idx) => {
-                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-                const tweetObj = tweetResult?.tweet || tweetResult;
-                const legacy = tweetObj?.legacy;
+          console.log('[Puppeteer GraphQL] Intercepted timeline payload!');
+          const { usersMap, tweetsList } = parseGraphQLPayload(json);
 
-                if (!legacy) return;
+          tweetsList.forEach((tweetObj, idx) => {
+            const legacy = tweetObj.legacy;
+            if (!legacy) return;
 
-                const authorInfo = extractAuthorInfo(tweetResult, entry);
-                const authorScreenName = authorInfo.handle;
-                const authorName = authorInfo.name;
-                const authorUserId = generateUniqueUserId(authorScreenName);
-                const authorUserIdStr = authorUserId.toString();
-                const authorAvatar = authorInfo.avatar;
+            // Resolve user metadata by user_id_str or nested core node
+            const userIdStr = legacy.user_id_str || tweetObj.core?.user_results?.result?.rest_id;
+            let author = usersMap[userIdStr];
 
-                let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
-                let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
-
-                if (extendedEntities && extendedEntities.media) {
-                  extendedEntities.media = extendedEntities.media.map(m => {
-                    const httpsUrl = m.media_url_https || m.media_url;
-                    const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
-                    return {
-                      id: m.id ? parseInt(m.id) : Date.now(),
-                      id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
-                      indices: m.indices || [0, 0],
-                      media_url: httpUrl,
-                      media_url_https: httpsUrl,
-                      url: m.url || '',
-                      display_url: m.display_url || '',
-                      expanded_url: m.expanded_url || '',
-                      type: m.type || 'photo',
-                      sizes: m.sizes || {
-                        thumb: { w: 150, h: 150, resize: 'crop' },
-                        small: { w: 680, h: 680, resize: 'fit' },
-                        medium: { w: 1200, h: 1200, resize: 'fit' },
-                        large: { w: 2048, h: 2048, resize: 'fit' }
-                      }
-                    };
-                  });
-                  entities.media = extendedEntities.media;
-                }
-
-                parsedTweets.push({
-                  created_at: legacy.created_at || new Date().toUTCString(),
-                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
-                  id_str: legacy.id_str || (Date.now() + idx).toString(),
-                  text: legacy.full_text || legacy.text || "",
-                  source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-                  truncated: false,
-                  in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-                  in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-                  in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-                  in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-                  in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                  user_id: authorUserId,
-                  user_id_str: authorUserIdStr,
-                  user: {
-                    id: authorUserId,
-                    id_str: authorUserIdStr,
-                    name: authorName,
-                    screen_name: authorScreenName,
-                    location: "",
-                    description: "",
-                    url: null,
-                    protected: false,
-                    verified: false,
-                    followers_count: 100,
-                    friends_count: 100,
-                    listed_count: 0,
-                    created_at: "Wed Oct 10 00:00:00 +0000 2026",
-                    favourites_count: 100,
-                    statuses_count: 100,
-                    profile_image_url: authorAvatar.replace('https://', 'http://'),
-                    profile_image_url_https: authorAvatar,
-                    profile_banner_url: null,
-                    default_profile: false,
-                    default_profile_image: false
-                  },
-                  geo: null,
-                  coordinates: null,
-                  place: null,
-                  contributors: null,
-                  is_quote_status: legacy.is_quote_status || false,
-                  retweet_count: legacy.retweet_count || 0,
-                  favorite_count: legacy.favorite_count || 0,
-                  entities: entities,
-                  extended_entities: extendedEntities,
-                  favorited: legacy.favorited || false,
-                  retweeted: legacy.retweeted || false,
-                  lang: legacy.lang || "en"
-                });
-              });
+            if (!author) {
+              const coreUser = tweetObj.core?.user_results?.result?.legacy;
+              if (coreUser && coreUser.screen_name) {
+                author = {
+                  id: generateUniqueUserId(coreUser.screen_name),
+                  id_str: generateUniqueUserId(coreUser.screen_name).toString(),
+                  name: coreUser.name || coreUser.screen_name,
+                  screen_name: coreUser.screen_name,
+                  profile_image_url_https: coreUser.profile_image_url_https || defaultUser.profile_image_url_https
+                };
+              }
             }
-          }
+
+            if (!author) return;
+
+            console.log(`[Author Extracted] @${author.screen_name} (${author.name})`);
+
+            let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+            let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
+
+            if (extendedEntities && extendedEntities.media) {
+              extendedEntities.media = extendedEntities.media.map(m => {
+                const httpsUrl = m.media_url_https || m.media_url;
+                const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
+                return {
+                  id: m.id ? parseInt(m.id) : Date.now(),
+                  id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
+                  indices: m.indices || [0, 0],
+                  media_url: httpUrl,
+                  media_url_https: httpsUrl,
+                  url: m.url || '',
+                  display_url: m.display_url || '',
+                  expanded_url: m.expanded_url || '',
+                  type: m.type || 'photo',
+                  sizes: m.sizes || {
+                    thumb: { w: 150, h: 150, resize: 'crop' },
+                    small: { w: 680, h: 680, resize: 'fit' },
+                    medium: { w: 1200, h: 1200, resize: 'fit' },
+                    large: { w: 2048, h: 2048, resize: 'fit' }
+                  }
+                };
+              });
+              entities.media = extendedEntities.media;
+            }
+
+            parsedTweets.push({
+              created_at: legacy.created_at || new Date().toUTCString(),
+              id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
+              id_str: legacy.id_str || (Date.now() + idx).toString(),
+              text: legacy.full_text || legacy.text || "",
+              source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+              truncated: false,
+              in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
+              in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+              in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
+              in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+              in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+              user_id: author.id,
+              user_id_str: author.id_str,
+              user: {
+                id: author.id,
+                id_str: author.id_str,
+                name: author.name,
+                screen_name: author.screen_name,
+                location: "",
+                description: "",
+                url: null,
+                protected: false,
+                verified: false,
+                followers_count: 100,
+                friends_count: 100,
+                listed_count: 0,
+                created_at: "Wed Oct 10 00:00:00 +0000 2026",
+                favourites_count: 100,
+                statuses_count: 100,
+                profile_image_url: author.profile_image_url_https.replace('https://', 'http://'),
+                profile_image_url_https: author.profile_image_url_https,
+                profile_banner_url: null,
+                default_profile: false,
+                default_profile_image: false
+              },
+              geo: null,
+              coordinates: null,
+              place: null,
+              contributors: null,
+              is_quote_status: legacy.is_quote_status || false,
+              retweet_count: legacy.retweet_count || 0,
+              favorite_count: legacy.favorite_count || 0,
+              entities: entities,
+              extended_entities: extendedEntities,
+              favorited: legacy.favorited || false,
+              retweeted: legacy.retweeted || false,
+              lang: legacy.lang || "en"
+            });
+          });
         }
       } catch (e) {}
     });
