@@ -144,7 +144,7 @@ async function backgroundScrape() {
         '--no-zygote',
         '--disable-extensions'
       ],
-      defaultViewport: chromium.defaultViewport,
+      defaultViewport: { width: 1280, height: 800 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
       ignoreHTTPSErrors: true,
@@ -163,10 +163,6 @@ async function backgroundScrape() {
 
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/')) {
-        console.log('[Puppeteer Network Hit]', url.split('?')[0]);
-      }
-
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
@@ -234,9 +230,13 @@ async function backgroundScrape() {
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-    console.log('[Puppeteer] Page loaded. Waiting for network stream...');
+    console.log('[Puppeteer] Page loaded. Waiting for feed to render...');
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+
+    console.log('[Puppeteer] Scrolling down to trigger timeline stream...');
+    await page.evaluate(() => window.scrollBy(0, 800));
     await new Promise((resolve) => setTimeout(resolve, 6000));
 
     await browser.close();
@@ -245,7 +245,7 @@ async function backgroundScrape() {
       await saveCachedTimelineToWorker(parsedTweets);
       console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
     } else {
-      console.log('[Puppeteer Warning] Connected, but 0 tweets captured.');
+      console.log('[Puppeteer Warning] Connected and scrolled, but 0 tweets captured.');
     }
   } catch (err) {
     console.error('[Puppeteer Error]:', err.message);
