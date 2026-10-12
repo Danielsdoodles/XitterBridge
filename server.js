@@ -134,7 +134,7 @@ async function backgroundScrape() {
   let browser;
   
   const timeoutPromise = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error('Scrape operation timed out after 25s')), 25000)
+    setTimeout(() => reject(new Error('Scrape operation timed out after 30s')), 30000)
   );
 
   const scrapeTask = (async () => {
@@ -144,7 +144,8 @@ async function backgroundScrape() {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--single-process'
+        '--single-process',
+        '--disable-blink-features=AutomationControlled'
       ],
       defaultViewport: chromium.defaultViewport,
       executablePath: await chromium.executablePath(),
@@ -157,16 +158,19 @@ async function backgroundScrape() {
     
     await page.setCookie(
       { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
-      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' },
+      { name: 'auth_token', value: tokens.auth_token.trim(), domain: 'x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0.trim(), domain: 'x.com', path: '/' }
     );
 
     let parsedTweets = [];
 
     page.on('response', async (response) => {
       const url = response.url();
-      if (url.includes('/graphql/')) {
-        console.log('[Puppeteer Network Hit]', url.split('?')[0]);
+      if (url.includes('/i/api/') || url.includes('x.com')) {
+        console.log('[Puppeteer URL Log]', url.split('?')[0]);
       }
+
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
@@ -234,10 +238,13 @@ async function backgroundScrape() {
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 25000 });
+
+    const finalUrl = page.url();
+    console.log(`[Puppeteer] Navigation complete. Current page URL: ${finalUrl}`);
 
     console.log('[Puppeteer] Waiting for timeline feed stream...');
-    await new Promise((resolve) => setTimeout(resolve, 8000));
+    await new Promise((resolve) => setTimeout(resolve, 10000));
 
     await browser.close();
 
@@ -245,7 +252,7 @@ async function backgroundScrape() {
       await saveCachedTimelineToWorker(parsedTweets);
       console.log(`[Puppeteer] Success! Cached ${parsedTweets.length} tweets to Worker KV.`);
     } else {
-      console.log('[Puppeteer Warning] Connected, but 0 tweets captured. Tokens may need re-authorizing or X is challenging.');
+      console.log('[Puppeteer Warning] Connected, but 0 tweets captured. Check if tokens are valid or if redirected to login.');
     }
   });
 
