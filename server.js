@@ -231,25 +231,6 @@ function sanitizeTweet(t) {
   };
 }
 
-function createDiagnosticTweet(message) {
-  return sanitizeTweet({
-    created_at: new Date().toUTCString(),
-    id: Date.now().toString(),
-    id_str: Date.now().toString(),
-    text: `[DIAGNOSTIC] ${message}`,
-    source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
-    user: {
-      id: 99999999,
-      id_str: "99999999",
-      name: "Bridge Diagnostics",
-      screen_name: "XitterBridgeDebug",
-      profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-      profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-      verified: true
-    }
-  });
-}
-
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -724,14 +705,12 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// DIAGNOSTIC REPLIES / CONVERSATION ENDPOINT
+// EXPLICIT CONVERSATION / SHOW ENDPOINT
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  console.log(`[DIAGNOSTIC] Conversation requested for ID: ${tweetId}. Total cached tweets: ${allTweets.length}`);
-
   let parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
 
@@ -739,10 +718,17 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   if (parentTweet) {
     conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
   } else {
-    // Inject diagnostic post visible on screen if tweet is missing from cache
-    console.warn(`[DIAGNOSTIC WARNING] Tweet ID ${tweetId} not found in cache!`);
-    const diagPost = createDiagnosticTweet(`REPLY MISSING: ID ${tweetId} not found in cache (Total cached: ${allTweets.length})`);
-    conversationArray = [diagPost];
+    const diagPost = {
+      created_at: new Date().toUTCString(),
+      id: Date.now(),
+      id_str: Date.now().toString(),
+      text: `[DIAGNOSTIC] Reply Thread Missing: ID ${tweetId} not found in cache.`,
+      source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
+      user: defaultUser,
+      retweet_count: 0,
+      favorite_count: 0
+    };
+    conversationArray = [sanitizeTweet(diagPost)];
   }
 
   return res.status(200).json(conversationArray);
@@ -755,7 +741,14 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
   let found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
   
   if (!found) {
-    found = createDiagnosticTweet(`STATUS SHOW MISSING: ID ${tweetId} not found`);
+    found = {
+      created_at: new Date().toUTCString(),
+      id: Date.now(),
+      id_str: Date.now().toString(),
+      text: `[DIAGNOSTIC] Status Show Missing: ID ${tweetId}`,
+      source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
+      user: defaultUser
+    };
   }
 
   return res.status(200).json(sanitizeTweet(found));
@@ -776,6 +769,45 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
+// TRENDS CLOSEST ENDPOINT (FIXES UNHANDLED LOG HIT)
+app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
+  return res.status(200).json([{
+    woeid: 1,
+    name: "Worldwide",
+    country_code: "",
+    parentid: 0,
+    placeType: { code: 19, name: "Global" },
+    url: "http://where.yahooapis.com/v1/place/1",
+    centroid: [0, 0]
+  }]);
+});
+
+app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
+
+// UNIVERSAL SEARCH ENDPOINT (FIXES INFINITE SEARCH LOOP)
+app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, res) => {
+  const query = req.query.q || "";
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  
+  const qLower = query.toLowerCase();
+  const matching = query.trim() !== '' ? allTweets.filter(t => t.text?.toLowerCase().includes(qLower)) : allTweets;
+  const statuses = (matching.length > 0 ? matching : allTweets).slice(0, 15).map(t => sanitizeTweet(t));
+  const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
+
+  return res.status(200).json({
+    modules: [
+      { type: "status", items: statuses.map(s => ({ status: { id: s.id, id_str: s.id_str } })) },
+      { type: "user", items: users.map(u => ({ user: { id: u.id, id_str: u.id_str } })) }
+    ],
+    globalObjects: {
+      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: users.reduce((acc, u) => { acc[u.id_str] = u; return acc; }, {})
+    },
+    cursor: null
+  });
+});
+
 // TYPEAHEAD ENDPOINT
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
   const query = req.query.q || "";
@@ -793,14 +825,11 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// DIAGNOSTIC SEARCH ENDPOINT (Prevents loops and posts diagnostic info if empty)
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  console.log(`[DIAGNOSTIC] Search query received: "${query}" | Total cached tweets: ${allTweets.length}`);
-
   let results = allTweets;
   const qLower = query.toLowerCase();
 
@@ -808,14 +837,7 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
-  let finalStatuses = [];
-  if (results.length > 0) {
-    finalStatuses = results.map(t => sanitizeTweet(t));
-  } else {
-    // Inject diagnostic post on phone screen so you know why search returned empty
-    console.warn(`[DIAGNOSTIC WARNING] Search query "${query}" matched 0 tweets.`);
-    finalStatuses = [createDiagnosticTweet(`SEARCH 0 RESULTS FOR "${query}". Cache size: ${allTweets.length}`)];
-  }
+  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
 
   return res.status(200).json({
     statuses: finalStatuses,
@@ -855,8 +877,6 @@ app.post('/1.1/statuses/update.json', (req, res) => {
 app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favorited: true }));
 app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
 app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
-
-app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [sanitizeUser(defaultUser)], next_cursor: 0 }));
 app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [sanitizeUser(defaultUser)], next_cursor: 0 }));
