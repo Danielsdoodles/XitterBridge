@@ -48,7 +48,7 @@ const defaultUser = {
   statuses_count: 10,
   profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-  profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
+  profile_banner_url: "http://pbs.twimg.com/profile_banners/12345678/1600000000/web",
   default_profile: true,
   default_profile_image: true,
   utc_offset: null,
@@ -59,7 +59,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -109,16 +109,26 @@ function cleanStr(val) {
   return null;
 }
 
+// CRITICAL FIX: Force all image URLs to http:// to prevent WP TLS handshake failures and blank white screens
+function forceHttp(url) {
+  if (!url) return '';
+  let str = cleanStr(url);
+  if (!str) return '';
+  if (str.startsWith('//')) str = 'http:' + str;
+  return str.replace('https://', 'http://');
+}
+
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return m;
+  const mediaUrl = forceHttp(m.media_url_https || m.media_url);
   return {
     id: Number(m.id || Date.now()),
     id_str: cleanStr(m.id_str) || String(m.id || Date.now()),
-    media_url: cleanStr(m.media_url) || '',
-    media_url_https: cleanStr(m.media_url_https) || cleanStr(m.media_url) || '',
+    media_url: mediaUrl,
+    media_url_https: mediaUrl,
     url: cleanStr(m.url) || '',
     display_url: cleanStr(m.display_url) || '',
-    expanded_url: cleanStr(m.expanded_url) || '',
+    expanded_url: forceHttp(m.expanded_url) || '',
     type: cleanStr(m.type) || 'photo',
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
     sizes: m.sizes || {
@@ -132,6 +142,8 @@ function sanitizeMedia(m) {
 
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return defaultUser;
+  const avatar = forceHttp(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url;
+  const banner = forceHttp(u.profile_banner_url);
   return {
     id: Number(u.id || 12345678),
     id_str: cleanStr(u.id_str) || '12345678',
@@ -148,9 +160,9 @@ function sanitizeUser(u) {
     created_at: cleanStr(u.created_at) || "Wed Oct 10 00:00:00 +0000 2026",
     favourites_count: Number(u.favourites_count ?? 100),
     statuses_count: Number(u.statuses_count ?? 100),
-    profile_image_url: cleanStr(u.profile_image_url)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
-    profile_image_url_https: cleanStr(u.profile_image_url_https)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
-    profile_banner_url: cleanStr(u.profile_banner_url) || null,
+    profile_image_url: avatar,
+    profile_image_url_https: avatar,
+    profile_banner_url: banner,
     default_profile: !!u.default_profile,
     default_profile_image: !!u.default_profile_image,
     utc_offset: null,
@@ -161,7 +173,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
@@ -180,7 +192,14 @@ function sanitizeTweet(t) {
   if (!t || typeof t !== 'object') return t;
   
   const idStr = cleanStr(t.id_str) || String(t.id || Date.now());
-  const safeId = parseInt(idStr.slice(-9)) || 123456789;
+  // Preserve full ID mapping safely for C# Int64 / long models
+  let safeId = 123456789;
+  try {
+    safeId = Number(idStr) || 123456789;
+    if (safeId > Number.MAX_SAFE_INTEGER) {
+      safeId = parseInt(idStr.slice(-9)) || 123456789;
+    }
+  } catch (e) {}
 
   let entities = t.entities && typeof t.entities === 'object' ? t.entities : {};
   entities.hashtags = Array.isArray(entities.hashtags) ? entities.hashtags : [];
@@ -188,7 +207,7 @@ function sanitizeTweet(t) {
   entities.user_mentions = Array.isArray(entities.user_mentions) ? entities.user_mentions : [];
   entities.urls = Array.isArray(entities.urls) ? entities.urls.map(u => ({
     url: cleanStr(u.url) || '',
-    expanded_url: cleanStr(u.expanded_url) || '',
+    expanded_url: forceHttp(u.expanded_url) || '',
     display_url: cleanStr(u.display_url) || '',
     indices: Array.isArray(u.indices) ? u.indices : [0, 0]
   })) : [];
@@ -202,6 +221,7 @@ function sanitizeTweet(t) {
   }
 
   const langVal = cleanStr(t.lang) || 'en';
+  const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
@@ -210,9 +230,9 @@ function sanitizeTweet(t) {
     text: cleanStr(t.text) || '',
     source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: !!t.truncated,
-    in_reply_to_status_id: t.in_reply_to_status_id ? parseInt(String(t.in_reply_to_status_id).slice(-9)) : null,
-    in_reply_to_status_id_str: cleanStr(t.in_reply_to_status_id_str),
-    in_reply_to_user_id: t.in_reply_to_user_id ? parseInt(String(t.in_reply_to_user_id).slice(-9)) : null,
+    in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
+    in_reply_to_status_id_str: replyIdStr,
+    in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
     in_reply_to_user_id_str: cleanStr(t.in_reply_to_user_id_str),
     in_reply_to_screen_name: cleanStr(t.in_reply_to_screen_name),
     user_id: Number(t.user_id || t.user?.id || 12345678),
@@ -415,7 +435,7 @@ async function backgroundScrape() {
 
               const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : 'danieldoodl5802');
               const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
-              const avatar = cleanStr(userLegacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
+              const avatar = forceHttp(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url) || defaultUser.profile_image_url;
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
               const userIdStr = restId || userId.toString();
 
@@ -423,29 +443,7 @@ async function backgroundScrape() {
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
               if (extendedEntities && extendedEntities.media) {
-                extendedEntities.media = extendedEntities.media.map(m => {
-                  let mUrl = cleanStr(m.media_url_https || m.media_url) || '';
-                  if (mUrl.startsWith('//')) mUrl = 'https:' + mUrl;
-                  mUrl = mUrl.split('?')[0] + '?format=jpg&name=large';
-                  const httpUrl = mUrl.replace('https://', 'http://');
-                  return {
-                    id: m.id ? parseInt(m.id) : Date.now(),
-                    id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
-                    indices: m.indices || [0, 0],
-                    media_url: httpUrl,
-                    media_url_https: httpUrl,
-                    url: cleanStr(m.url) || '',
-                    display_url: cleanStr(m.display_url) || '',
-                    expanded_url: cleanStr(m.expanded_url) || '',
-                    type: cleanStr(m.type) || 'photo',
-                    sizes: m.sizes || {
-                      thumb: { w: 150, h: 150, resize: 'crop' },
-                      small: { w: 680, h: 680, resize: 'fit' },
-                      medium: { w: 1200, h: 1200, resize: 'fit' },
-                      large: { w: 2048, h: 2048, resize: 'fit' }
-                    }
-                  };
-                });
+                extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
                 entities.media = extendedEntities.media;
               }
 
@@ -483,9 +481,9 @@ async function backgroundScrape() {
                   created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
                   favourites_count: userLegacy?.favourites_count || 100,
                   statuses_count: userLegacy?.statuses_count || 100,
-                  profile_image_url: avatar.replace('https://', 'http://'),
-                  profile_image_url_https: avatar.replace('https://', 'http://'),
-                  profile_banner_url: userLegacy?.profile_banner_url || null,
+                  profile_image_url: avatar,
+                  profile_image_url_https: avatar,
+                  profile_banner_url: forceHttp(userLegacy?.profile_banner_url),
                   default_profile: userLegacy?.default_profile || false,
                   default_profile_image: userLegacy?.default_profile_image || false
                 },
@@ -687,7 +685,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// FULLY ROBUST CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH PATH & QUERY PARAMS)
+// BULLETPROOF CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH ARRAY AND OBJECT DESERIALIZERS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -715,7 +713,7 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
 
-  // Return dual wrapper object containing both pure array and graph dictionaries for C# client compatibility
+  // Return dual wrapper object supporting both collection lists and graph dictionaries
   return res.status(200).json({
     statuses: statuses,
     conversation: statuses,
@@ -815,7 +813,6 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// FULLY FIXED SEARCH ENDPOINT WITH METADATA-INJECTED TWEETS TO STOP WHITE SCREENS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
