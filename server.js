@@ -182,7 +182,6 @@ async function backgroundScrape() {
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               
-              // Extract correct user result object recursively or directly
               let userLegacy = null;
               let restId = null;
 
@@ -200,7 +199,6 @@ async function backgroundScrape() {
                 }
               }
 
-              // Fallback deep search for user legacy if needed
               if (!userLegacy || !userLegacy.screen_name) {
                 function findUser(n) {
                   if (!n || typeof n !== 'object') return null;
@@ -252,6 +250,11 @@ async function backgroundScrape() {
               }
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
+              
+              // Extract accurate counts with fallbacks to other property paths if needed
+              const favCount = legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? 0;
+              const retCount = legacy.retweet_count ?? obj.retweet_count ?? 0;
+
               parsedTweets.push({
                 created_at: legacy.created_at || new Date().toUTCString(),
                 id: parseInt(tweetIdStr.slice(-12)) || Date.now(),
@@ -292,8 +295,8 @@ async function backgroundScrape() {
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
                 retweeted: legacy.retweeted || false,
-                retweet_count: legacy.retweet_count || 0,
-                favorite_count: legacy.favorite_count || 0,
+                retweet_count: retCount,
+                favorite_count: favCount,
                 lang: legacy.lang || "en"
               });
             }
@@ -467,7 +470,7 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = allTweets.entfind ? allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId)) : allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
   
   if (found) {
     return res.status(200).json(found);
