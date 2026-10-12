@@ -163,10 +163,12 @@ async function backgroundScrape() {
     let parsedTweets = [];
 
     page.on('response', async (response) => {
-      const url = response.url();
-      if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
-        try {
-          const json = await response.json();
+      try {
+        const url = response.url();
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
+          const json = await response.json().catch(() => null);
+          if (!json) return;
+
           console.log('[Puppeteer GraphQL] Successfully intercepted timeline feed!');
           const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
           for (const instr of instructions) {
@@ -176,9 +178,9 @@ async function backgroundScrape() {
                 const tweetObj = tweetResult?.tweet || tweetResult;
                 const legacy = tweetObj?.legacy;
 
-                // Multi-path author resolution to guarantee real handle and name
                 const userResult = 
                   tweetObj?.core?.user_results?.result || 
+                  tweetResult?.core?.user_results?.result || 
                   tweetObj?.user_results?.result || 
                   tweetObj?.author?.result;
                 const userLegacy = userResult?.legacy || userResult?.user?.legacy;
@@ -228,9 +230,9 @@ async function backgroundScrape() {
               });
             }
           }
-        } catch (e) {
-          console.error('[Puppeteer Parse Error]', e.message);
         }
+      } catch (e) {
+        // Suppress target closed errors safely
       }
     });
 
@@ -348,7 +350,6 @@ app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
