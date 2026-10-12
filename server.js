@@ -36,7 +36,7 @@ const defaultUser = {
   favourites_count: 0,
   statuses_count: 1,
   profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-  profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+  profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
   default_profile: true,
   default_profile_image: true
@@ -56,7 +56,6 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Robust multi-path author extractor
 function extractAuthor(tweetResult, tweetObj) {
   const possibleUserRes = [
     tweetResult?.core?.user_results?.result,
@@ -72,18 +71,19 @@ function extractAuthor(tweetResult, tweetObj) {
       const screenName = legacy?.screen_name || uRes?.screen_name;
       if (screenName && screenName.toLowerCase() !== 'twitter' && screenName.toLowerCase() !== 'x') {
         const userIdStr = uRes.rest_id || uRes.id_str || legacy?.id_str || generateUniqueUserId(screenName).toString();
+        const avatarHttps = legacy?.profile_image_url_https || uRes?.profile_image_url_https || defaultUser.profile_image_url_https;
         return {
           id: parseInt(userIdStr) || generateUniqueUserId(screenName),
           id_str: userIdStr,
           name: legacy?.name || uRes?.name || screenName,
           screen_name: screenName,
-          profile_image_url_https: legacy?.profile_image_url_https || uRes?.profile_image_url_https || defaultUser.profile_image_url_https
+          profile_image_url_https: avatarHttps,
+          profile_image_url: avatarHttps.replace('https://', 'http://')
         };
       }
     }
   }
 
-  // Deep recursive search fallback
   function searchNode(node) {
     if (!node || typeof node !== 'object') return null;
     if (node.screen_name && node.screen_name.toLowerCase() !== 'twitter' && (node.followers_count !== undefined || node.name)) {
@@ -102,12 +102,14 @@ function extractAuthor(tweetResult, tweetObj) {
   if (found && found.screen_name) {
     const screenName = found.screen_name;
     const userIdStr = found.rest_id || found.id_str || generateUniqueUserId(screenName).toString();
+    const avatarHttps = found.profile_image_url_https || defaultUser.profile_image_url_https;
     return {
       id: parseInt(userIdStr) || generateUniqueUserId(screenName),
       id_str: userIdStr,
       name: found.name || screenName,
       screen_name: screenName,
-      profile_image_url_https: found.profile_image_url_https || defaultUser.profile_image_url_https
+      profile_image_url_https: avatarHttps,
+      profile_image_url: avatarHttps.replace('https://', 'http://')
     };
   }
 
@@ -125,10 +127,7 @@ async function saveTokensToWorker(authToken, ct0Token) {
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
       body: JSON.stringify({ auth_token: authToken, ct0: ct0Token })
     });
-    console.log('[Worker Sync] Tokens updated successfully.');
-  } catch (err) {
-    console.error('[Worker Sync Error]', err.message);
-  }
+  } catch (err) {}
 }
 
 async function getTokensFromCloudflareWorker() {
@@ -142,9 +141,7 @@ async function getTokensFromCloudflareWorker() {
       const data = await response.json();
       return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
     }
-  } catch (err) {
-    console.error('[Worker Sync Error]', err.message);
-  }
+  } catch (err) {}
   return { auth_token: '', ct0: '' };
 }
 
@@ -160,7 +157,6 @@ async function getCachedTimelineFromWorker() {
   return [];
 }
 
-// Accumulate and merge tweets into KV history to support infinite scrolling without looping
 async function appendCachedTimelineToWorker(newTweets) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -171,12 +167,18 @@ async function appendCachedTimelineToWorker(newTweets) {
     const map = new Map();
     existing.forEach(t => map.set(t.id_str, t));
     newTweets.forEach(t => map.set(t.id_str, t));
-    const merged = Array.from(map.values()).sort((a, b) => b.id - a.id);
+    const merged = Array.from(map.values()).sort((a, b) => {
+      try {
+        return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
+      } catch (e) {
+        return b.id - a.id;
+      }
+    });
 
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 150)) // Keep up to 150 tweets for scrolling history
+      body: JSON.stringify(merged.slice(0, 200))
     });
   } catch (e) {}
 }
@@ -185,28 +187,21 @@ async function backgroundScrape() {
   const now = Date.now();
   if (isScraping) {
     if (now - lastScrapeTime > 45000) {
-      console.log('[Puppeteer Warning] Scrape lock expired (>45s). Forcing reset...');
       isScraping = false;
     } else {
-      console.log('[Puppeteer Debug] Scrape already in progress, skipping...');
       return;
     }
   }
   isScraping = true;
   lastScrapeTime = now;
 
-  console.log('[Puppeteer Debug] Fetching tokens from Cloudflare Worker...');
   const tokens = await getTokensFromCloudflareWorker();
-
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV! Aborting scrape.');
     isScraping = false;
     return;
   }
 
-  console.log('[Puppeteer] Starting background timeline scrape...');
   let browser;
-
   try {
     browser = await puppeteer.launch({
       args: [
@@ -224,7 +219,6 @@ async function backgroundScrape() {
       ignoreHTTPSErrors: true,
     });
 
-    console.log('[Puppeteer Debug] Browser launched successfully.');
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
@@ -242,7 +236,6 @@ async function backgroundScrape() {
           const json = await response.json().catch(() => null);
           if (!json) return;
 
-          console.log('[Puppeteer GraphQL] Intercepted timeline payload!');
           const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
           
           for (const instr of instructions) {
@@ -257,8 +250,6 @@ async function backgroundScrape() {
                 const author = extractAuthor(tweetResult, tweetObj);
                 if (!author) return;
 
-                console.log(`[Author Extracted] @${author.screen_name} (${author.name})`);
-
                 let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
                 let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
@@ -271,7 +262,7 @@ async function backgroundScrape() {
                       id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
                       indices: m.indices || [0, 0],
                       media_url: httpUrl,
-                      media_url_https: httpsUrl,
+                      media_url_https: httpUrl, // Forced HTTP to prevent Windows Phone SSL/TLS handshake errors on expand
                       url: m.url || '',
                       display_url: m.display_url || '',
                       expanded_url: m.expanded_url || '',
@@ -317,8 +308,8 @@ async function backgroundScrape() {
                     created_at: "Wed Oct 10 00:00:00 +0000 2026",
                     favourites_count: 100,
                     statuses_count: 100,
-                    profile_image_url: author.profile_image_url_https.replace('https://', 'http://'),
-                    profile_image_url_https: author.profile_image_url_https,
+                    profile_image_url: author.profile_image_url,
+                    profile_image_url_https: author.profile_image_url,
                     profile_banner_url: null,
                     default_profile: false,
                     default_profile_image: false
@@ -343,28 +334,16 @@ async function backgroundScrape() {
       } catch (e) {}
     });
 
-    console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    console.log('[Puppeteer] Page loaded. Waiting for feed to render...');
     await new Promise((resolve) => setTimeout(resolve, 3000));
-
-    console.log('[Puppeteer] Scrolling down to trigger timeline stream...');
-    try {
-      await page.evaluate(() => window.scrollBy(0, 800));
-    } catch (e) {}
+    try { await page.evaluate(() => window.scrollBy(0, 800)); } catch (e) {}
     await new Promise((resolve) => setTimeout(resolve, 4000));
-
     await browser.close();
 
     if (parsedTweets.length > 0) {
       await appendCachedTimelineToWorker(parsedTweets);
-      console.log(`[Puppeteer] Success! Merged ${parsedTweets.length} tweets to Worker KV history.`);
-    } else {
-      console.log('[Puppeteer Warning] Connected and scrolled, but 0 tweets captured.');
     }
   } catch (err) {
-    console.error('[Puppeteer Error]:', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
@@ -459,23 +438,41 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
   return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
 
+// Fully fixed timeline with since_id and max_id support for infinite scroll & refresh
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
 
   let timeline = [...localTimeline, ...cachedTweets];
+  
+  // Deduplicate
+  const uniqueMap = new Map();
+  timeline.forEach(t => uniqueMap.set(t.id_str || t.id, t));
+  timeline = Array.from(uniqueMap.values()).sort((a, b) => {
+    try {
+      return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
+    } catch (e) {
+      return b.id - a.id;
+    }
+  });
+
+  const sinceId = req.query.since_id;
   const maxId = req.query.max_id;
+
+  if (sinceId) {
+    try {
+      const sinceIdNum = BigInt(sinceId);
+      timeline = timeline.filter(tweet => {
+        try { return BigInt(tweet.id_str || tweet.id) > sinceIdNum; } catch (e) { return true; }
+      });
+    } catch (e) {}
+  }
 
   if (maxId) {
     try {
       const maxIdNum = BigInt(maxId);
       timeline = timeline.filter(tweet => {
-        try {
-          const tweetIdNum = BigInt(tweet.id_str || tweet.id);
-          return tweetIdNum < maxIdNum;
-        } catch (e) {
-          return true;
-        }
+        try { return BigInt(tweet.id_str || tweet.id) < maxIdNum; } catch (e) { return true; }
       });
     } catch (e) {}
   }
@@ -485,7 +482,15 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
-app.get('/1.1/statuses/show/:id.json', (req, res) => res.status(200).json(localTimeline[0] || defaultUser));
+
+// Fixed status show endpoint so clicking tweets and images loads the correct record instead of a fallback
+app.get('/1.1/statuses/show/:id.json', async (req, res) => {
+  const tweetId = req.params.id.replace('.json', '');
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  return res.status(200).json(found || localTimeline[0] || defaultUser);
+});
 
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
@@ -521,7 +526,6 @@ app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12
 
 app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
-app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
