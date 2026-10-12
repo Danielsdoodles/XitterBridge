@@ -118,7 +118,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 400))
+      body: JSON.stringify(merged.slice(0, 500))
     });
   } catch (e) {}
 }
@@ -172,7 +172,7 @@ async function backgroundScrape() {
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets'))) {
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail'))) {
           const json = await response.json().catch(() => null);
           if (!json) return;
 
@@ -223,32 +223,38 @@ async function backgroundScrape() {
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
-              // Video & GIF Normalizer: Extract video variant URLs and map them to playable photo/video entities for Windows Phone
-              if (!extendedEntities && legacy.entities?.media) {
-                extendedEntities = { media: legacy.entities.media };
-              }
-
-              // Check for video info in variants or video_info
-              const variants = legacy.extended_entities?.media?.[0]?.video_info?.variants || 
-                               obj.card?.binding_values?.find(bv => bv.key === 'variants')?.value?.value ||
-                               legacy.video_info?.variants;
+              // Comprehensive Video, GIF, and Media Extractor
+              const videoResult = obj.card?.legacy?.binding_values || 
+                                  obj.video_info || 
+                                  obj.tweet_results?.result?.video_info ||
+                                  obj.media_Details;
 
               let mediaType = 'photo';
-              let posterUrl = null;
+              let variants = legacy.extended_entities?.media?.[0]?.video_info?.variants || videoResult?.variants;
+
+              if (!variants && obj.card?.binding_values) {
+                for (const bv of obj.card.binding_values) {
+                  if (bv.key === 'variants' || bv.key === 'video_info_variants') {
+                    variants = bv.value?.value || bv.value?.string_value;
+                  }
+                }
+              }
+
+              if (variants && typeof variants === 'string') {
+                try { variants = JSON.parse(variants); } catch (e) {}
+              }
 
               if (variants && Array.isArray(variants)) {
                 const mp4Variants = variants.filter(v => v.content_type === 'video/mp4').sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
                 if (mp4Variants.length > 0) {
-                  mediaType = legacy.extended_entities?.media?.[0]?.type === 'animated_gif' ? 'animated_gif' : 'video';
-                  posterUrl = legacy.extended_entities?.media?.[0]?.media_url_https || legacy.media_url_https;
+                  mediaType = (legacy.extended_entities?.media?.[0]?.type === 'animated_gif' || obj.card?.name === 'animated_gif') ? 'animated_gif' : 'video';
                 }
               }
 
-              // Card video / image fallback
+              // Card image fallback if no extended entities
               if (!extendedEntities && obj.card?.binding_values) {
-                const cardVals = obj.card.binding_values;
                 let cardImgUrl = null;
-                for (const bv of cardVals) {
+                for (const bv of obj.card.binding_values) {
                   if (bv.key === 'thumbnail_image_url' || bv.key === 'player_image_url' || bv.key === 'image_url') {
                     cardImgUrl = bv.value?.string_value || bv.value?.image_value?.url;
                   }
@@ -295,8 +301,8 @@ async function backgroundScrape() {
                     url: m.url || '',
                     display_url: m.display_url || '',
                     expanded_url: m.expanded_url || '',
-                    type: mediaType, // Safely handles photo, video, and animated_gif
-                    video_info: m.video_info || undefined,
+                    type: mediaType,
+                    video_info: m.video_info || (variants ? { variants: variants } : undefined),
                     sizes: m.sizes || {
                       thumb: { w: 150, h: 150, resize: 'crop' },
                       small: { w: 680, h: 680, resize: 'fit' },
@@ -310,16 +316,9 @@ async function backgroundScrape() {
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
               
-              const favCount = legacy.favorite_count 
-                ?? obj.favorite_count 
-                ?? obj.unviewed_favorite_count 
-                ?? obj.card?.binding_values?.favorite_count 
-                ?? Math.floor(Math.random() * 25) + 3;
-
-              const retCount = legacy.retweet_count 
-                ?? obj.retweet_count 
-                ?? obj.card?.binding_values?.retweet_count 
-                ?? Math.floor(Math.random() * 10) + 1;
+              // Guaranteed numeric metric fallbacks so NO tweet has missing stats
+              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 1);
+              const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? obj.card?.binding_values?.retweet_count ?? 0);
 
               parsedTweets.push({
                 created_at: legacy.created_at || new Date().toUTCString(),
@@ -532,6 +531,7 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 
+// Robust Tweet Detail endpoint to prevent client crashes when clicking on a tweet
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -542,16 +542,17 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
     return res.status(200).json(found);
   }
 
+  // Fallback synthetic tweet to prevent null exceptions and app crashes on detail view
   return res.status(200).json({
     created_at: new Date().toUTCString(),
     id: parseInt(tweetId) || Date.now(),
     id_str: tweetId,
-    text: "Media item loaded from Windows Phone bridge",
+    text: "Detailed post loaded from Windows Phone bridge",
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     user: defaultUser,
-    retweet_count: 5,
-    favorite_count: 12,
+    retweet_count: 1,
+    favorite_count: 3,
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
     favorited: false,
     retweeted: false
@@ -569,7 +570,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     truncated: false,
     user: defaultUser,
     retweet_count: 0,
-    favorite_count: 0,
+    favorite_count: 1,
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
     favorited: false,
     retweeted: false
