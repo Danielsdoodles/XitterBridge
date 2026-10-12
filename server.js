@@ -583,9 +583,12 @@ app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200)
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(sanitizeUser(defaultUser)));
 
-app.get('/1.1/users/show.json', async (req, res) => {
-  const screenName = req.query.screen_name;
-  const userId = req.query.user_id;
+// Push notifications endpoint called by Windows Phone client
+app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json({ status: "ok" }));
+
+app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
+  const screenName = req.query.screen_name || req.body?.screen_name;
+  const userId = req.query.user_id || req.body?.user_id;
   const cachedTweets = await getCachedTimelineFromWorker();
   
   const matchedTweet = cachedTweets.find(t => 
@@ -611,16 +614,16 @@ app.get('/1.1/users/show.json', async (req, res) => {
   return res.status(200).json(sanitizeUser(defaultUser));
 });
 
-app.get('/1.1/users/lookup.json', async (req, res) => {
-  const screenNameQuery = req.query.screen_name;
+app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => {
+  const screenNameQuery = req.query.screen_name || req.body?.screen_name || req.query.user_id || req.body?.user_id;
   const cachedTweets = await getCachedTimelineFromWorker();
 
   if (screenNameQuery) {
-    const requestedNames = screenNameQuery.split(',').map(s => s.trim().toLowerCase());
+    const requestedNames = String(screenNameQuery).split(',').map(s => s.trim().toLowerCase());
     const matchedUsers = [];
 
     for (const name of requestedNames) {
-      const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name);
+      const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name || t.user?.id_str === name);
       if (match && match.user) {
         matchedUsers.push(sanitizeUser(match.user));
       } else {
@@ -684,7 +687,27 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id'], async (req, res) => {
+// CRITICAL FIX: Explicit Handler for Tweet Detail Activity Summaries requested when tapping a tweet
+app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
+  const tweetId = req.params.id.replace('.json', '');
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+
+  const favs = found ? found.favorite_count : 0;
+  const rts = found ? found.retweet_count : 0;
+
+  return res.status(200).json({
+    favoriters_count: favs,
+    retweeters_count: rts,
+    replies_count: 0,
+    favoriters: [],
+    retweeters: [],
+    replies: []
+  });
+});
+
+app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
@@ -710,7 +733,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id'], async (req, r
   return res.status(200).json(sanitizeTweet(found));
 });
 
-app.get('/1.1/statuses/lookup.json', async (req, res) => {
+app.get(['/1.1/statuses/lookup.json', '/1/statuses/lookup.json'], async (req, res) => {
   const idQuery = req.query.id || req.query.map;
   const cached = await getCachedTimelineFromWorker();
   if (idQuery) {
@@ -780,7 +803,7 @@ app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
-app.all('/1.1/*', (req, res) => {
+app.all('*', (req, res) => {
   const path = req.path;
   console.log(`[XitterBridge] Unhandled endpoint hit: ${path}`);
   if (path.includes('/ids')) {
@@ -792,7 +815,7 @@ app.all('/1.1/*', (req, res) => {
   return res.status(200).json({});
 });
 
-// Global Error Handler Middleware: Logs exact crash stack to Render console and returns clean API error JSON
+// Global Error Handler Middleware
 app.use((err, req, res, next) => {
   console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
   console.error(err.stack || err);
