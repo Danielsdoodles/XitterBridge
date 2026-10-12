@@ -201,6 +201,8 @@ function sanitizeTweet(t) {
     extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
   }
 
+  const langVal = cleanStr(t.lang) || 'en';
+
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
     id: safeId,
@@ -227,7 +229,12 @@ function sanitizeTweet(t) {
     extended_entities: extendedEntities,
     favorited: !!t.favorited,
     retweeted: !!t.retweeted,
-    lang: cleanStr(t.lang) || 'en',
+    lang: langVal,
+    // CRITICAL FIX: Windows Phone search and timeline XAML templates require metadata to render correctly without white screens
+    metadata: {
+      result_type: "recent",
+      iso_language_code: langVal
+    },
     possibly_sensitive: false,
     filter_level: "medium",
     retweeted_status: t.retweeted_status ? sanitizeTweet(t.retweeted_status) : null,
@@ -681,9 +688,9 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: CONVERSATION THREAD MUST RETURN A PURE JSON ARRAY FOR C# List<Status> DESERIALIZATION
-app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
-  const tweetId = req.params.id;
+// CRITICAL FIX: CONVERSATION ENDPOINT HANDLES BOTH PATH PARAMS AND QUERY PARAMS (?id=...) RETURNING A PURE JSON ARRAY
+app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+  const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
@@ -708,8 +715,6 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   });
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-
-  // Return pure array of sanitized tweets to match C# client List<Status> expectation
   return res.status(200).json(statuses);
 });
 
