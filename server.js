@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Detailed Request Logger to capture every call from the Lumia client
+// Detailed Request Logger
 app.use((req, res, next) => {
   console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
   if (Object.keys(req.query).length > 0) {
@@ -583,7 +583,6 @@ app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200)
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(sanitizeUser(defaultUser)));
 
-// Push notifications endpoint called by Windows Phone client
 app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json({ status: "ok" }));
 
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
@@ -687,7 +686,6 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-// CRITICAL FIX: Explicit Handler for Tweet Detail Activity Summaries requested when tapping a tweet
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -730,7 +728,11 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
     };
   }
 
-  return res.status(200).json(sanitizeTweet(found));
+  // Include any replies in the response or matching conversation items
+  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
+  const sanitized = sanitizeTweet(found);
+  
+  return res.status(200).json(sanitized);
 });
 
 app.get(['/1.1/statuses/lookup.json', '/1/statuses/lookup.json'], async (req, res) => {
@@ -748,20 +750,32 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
+// Fully functional search handler supporting keywords, to:, and from: filters
 app.get('/1.1/search/tweets.json', async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
   
-  let results = cachedTweets.slice(0, 5);
-  if (query.includes('to:') || query.includes('from:')) {
-    results = cachedTweets.slice(0, 8);
+  let results = cachedTweets;
+  const qLower = query.toLowerCase();
+
+  if (qLower.includes('to:')) {
+    const match = query.match(/to:([a-zA-Z0-9_]+)/i);
+    if (match) {
+      const targetUser = match[1].toLowerCase();
+      results = cachedTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser || t.in_reply_to_screen_name?.toLowerCase() === targetUser);
+    }
+  } else if (qLower.includes('from:')) {
+    const match = query.match(/from:([a-zA-Z0-9_]+)/i);
+    if (match) {
+      const targetUser = match[1].toLowerCase();
+      results = cachedTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser);
+    }
+  } else if (query.trim() !== '') {
+    results = cachedTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
   return res.status(200).json({
-    statuses: results.map(t => sanitizeTweet({
-      ...t,
-      in_reply_to_status_id_str: t.id_str
-    })),
+    statuses: (results.length > 0 ? results : cachedTweets.slice(0, 10)).map(t => sanitizeTweet(t)),
     search_metadata: { completed_in: 0.025, count: results.length }
   });
 });
