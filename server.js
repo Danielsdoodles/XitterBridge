@@ -179,23 +179,25 @@ async function backgroundScrape() {
                 const tweetObj = tweetResult?.tweet || tweetResult;
                 const legacy = tweetObj?.legacy;
 
+                if (!legacy) return;
+
+                // Fail-safe deep extraction across all possible X GraphQL schemas
                 const userResults = 
                   tweetResult?.core?.user_results?.result || 
                   tweetResult?.tweet?.core?.user_results?.result ||
-                  tweetResult?.user_results?.result;
+                  tweetResult?.user_results?.result ||
+                  tweetObj?.core?.user_results?.result;
 
-                const userLegacy = userResults?.legacy;
+                const userLegacy = userResults?.legacy || {};
 
-                if (!legacy || !userLegacy || !userLegacy.screen_name) return;
-
-                const authorScreenName = userLegacy.screen_name;
+                const authorScreenName = userLegacy.screen_name || tweetObj?.source_user_screen_name || "Twitter";
                 const authorName = userLegacy.name || authorScreenName;
                 const authorRestId = userResults?.rest_id || userResults?.id;
                 const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
                 const authorUserIdStr = authorRestId || authorUserId.toString();
                 const authorAvatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
 
-                // Normalize entities and extended_entities for images with HTTP fallbacks for legacy TLS
+                // Normalize media entities and extended_entities for images with HTTP fallbacks for legacy TLS
                 let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
                 let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
