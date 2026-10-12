@@ -231,6 +231,25 @@ function sanitizeTweet(t) {
   };
 }
 
+function createDiagnosticTweet(message) {
+  return sanitizeTweet({
+    created_at: new Date().toUTCString(),
+    id: Date.now().toString(),
+    id_str: Date.now().toString(),
+    text: `[DIAGNOSTIC] ${message}`,
+    source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
+    user: {
+      id: 99999999,
+      id_str: "99999999",
+      name: "Bridge Diagnostics",
+      screen_name: "XitterBridgeDebug",
+      profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+      profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+      verified: true
+    }
+  });
+}
+
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -705,33 +724,27 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: Return JSON Array for conversation show so List<Tweet> deserializer succeeds
+// DIAGNOSTIC REPLIES / CONVERSATION ENDPOINT
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
+  console.log(`[DIAGNOSTIC] Conversation requested for ID: ${tweetId}. Total cached tweets: ${allTweets.length}`);
+
   let parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
-  if (!parentTweet) {
-    parentTweet = {
-      created_at: new Date().toUTCString(),
-      id: tweetId,
-      id_str: tweetId,
-      text: "Detailed post loaded from Windows Phone bridge",
-      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-      truncated: false,
-      user: defaultUser,
-      retweet_count: 0,
-      favorite_count: 0,
-      entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-      favorited: false,
-      retweeted: false
-    };
+  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
+
+  let conversationArray = [];
+  if (parentTweet) {
+    conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+  } else {
+    // Inject diagnostic post visible on screen if tweet is missing from cache
+    console.warn(`[DIAGNOSTIC WARNING] Tweet ID ${tweetId} not found in cache!`);
+    const diagPost = createDiagnosticTweet(`REPLY MISSING: ID ${tweetId} not found in cache (Total cached: ${allTweets.length})`);
+    conversationArray = [diagPost];
   }
 
-  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-  const conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-  
   return res.status(200).json(conversationArray);
 });
 
@@ -742,20 +755,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
   let found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
   
   if (!found) {
-    found = {
-      created_at: new Date().toUTCString(),
-      id: tweetId,
-      id_str: tweetId,
-      text: "Detailed post loaded from Windows Phone bridge",
-      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-      truncated: false,
-      user: defaultUser,
-      retweet_count: 0,
-      favorite_count: 0,
-      entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-      favorited: false,
-      retweeted: false
-    };
+    found = createDiagnosticTweet(`STATUS SHOW MISSING: ID ${tweetId} not found`);
   }
 
   return res.status(200).json(sanitizeTweet(found));
@@ -793,12 +793,14 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// CRITICAL FIX: Search tweets without pagination triggers to completely stop infinite loops
+// DIAGNOSTIC SEARCH ENDPOINT (Prevents loops and posts diagnostic info if empty)
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
+  console.log(`[DIAGNOSTIC] Search query received: "${query}" | Total cached tweets: ${allTweets.length}`);
+
   let results = allTweets;
   const qLower = query.toLowerCase();
 
@@ -806,7 +808,14 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
-  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
+  let finalStatuses = [];
+  if (results.length > 0) {
+    finalStatuses = results.map(t => sanitizeTweet(t));
+  } else {
+    // Inject diagnostic post on phone screen so you know why search returned empty
+    console.warn(`[DIAGNOSTIC WARNING] Search query "${query}" matched 0 tweets.`);
+    finalStatuses = [createDiagnosticTweet(`SEARCH 0 RESULTS FOR "${query}". Cache size: ${allTweets.length}`)];
+  }
 
   return res.status(200).json({
     statuses: finalStatuses,
