@@ -705,7 +705,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: Return conversation/show with structured object model wrapping statuses
+// FULLY ROBUST CONVERSATION / REPLIES ENDPOINT
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -730,14 +730,18 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   }
 
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-  const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+  const sanitizedParent = sanitizeTweet(parentTweet);
+  const sanitizedReplies = replies.map(r => sanitizeTweet(r));
+  const allStatuses = [sanitizedParent, ...sanitizedReplies];
 
   return res.status(200).json({
-    statuses: statuses,
-    conversation: statuses,
+    statuses: allStatuses,
+    conversation: allStatuses,
+    descendants: sanitizedReplies,
+    ancestors: [],
     globalObjects: {
-      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
-      users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
+      tweets: allStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: allStatuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
     }
   });
 });
@@ -783,7 +787,7 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// CRITICAL FIX: Return structured object for typeahead to prevent System.Object[] cast error
+// TYPEAHEAD ENDPOINT
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -800,6 +804,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
+// FULLY ROBUST SEARCH ENDPOINT WITH GUARANTEED FALLBACK (STOPS LOOPS)
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -824,11 +829,20 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
-  const sanitizedStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
+  // Fallback to recent tweets if filter is empty so client never loops infinitely
+  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 20)).map(t => sanitizeTweet(t));
 
   return res.status(200).json({
-    statuses: sanitizedStatuses,
-    search_metadata: { completed_in: 0.025, count: sanitizedStatuses.length }
+    statuses: finalStatuses,
+    search_metadata: {
+      completed_in: 0.025,
+      max_id: 999999999999999999n.toString(),
+      max_id_str: "999999999999999999",
+      query: query,
+      count: finalStatuses.length,
+      since_id: 0,
+      since_id_str: "0"
+    }
   });
 });
 
@@ -881,7 +895,6 @@ app.all('*', (req, res) => {
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
-  // Removed dangerous /search/ match to prevent returning arrays for object models
   if (path.includes('/list') || path.includes('/timeline') || path.includes('/lookup')) {
     return res.status(200).json([]);
   }
