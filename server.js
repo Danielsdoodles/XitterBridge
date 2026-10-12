@@ -39,7 +39,27 @@ const defaultUser = {
   profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
   default_profile: true,
-  default_profile_image: true
+  default_profile_image: true,
+  utc_offset: null,
+  time_zone: null,
+  geo_enabled: true,
+  lang: "en",
+  contributors_enabled: false,
+  is_translator: false,
+  profile_background_color: "C0DEED",
+  profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_tile: false,
+  profile_link_color: "1DA1F2",
+  profile_sidebar_border_color: "C0DEED",
+  profile_sidebar_fill_color: "DDEEF6",
+  profile_text_color: "333333",
+  profile_use_background_image: true,
+  has_extended_profile: true,
+  following: false,
+  follow_request_sent: false,
+  notifications: false,
+  translator_type: "none"
 };
 
 let localTimeline = [];
@@ -103,9 +123,9 @@ function sanitizeUser(u) {
     id_str: cleanStr(u.id_str) || '12345678',
     name: cleanStr(u.name) || 'Daniel',
     screen_name: cleanStr(u.screen_name) || 'danieldoodl5802',
-    location: cleanStr(u.location),
-    description: cleanStr(u.description),
-    url: cleanStr(u.url),
+    location: cleanStr(u.location) || "",
+    description: cleanStr(u.description) || "",
+    url: cleanStr(u.url) || null,
     protected: !!u.protected,
     verified: !!u.verified,
     followers_count: Number(u.followers_count ?? 100),
@@ -116,9 +136,29 @@ function sanitizeUser(u) {
     statuses_count: Number(u.statuses_count ?? 100),
     profile_image_url: cleanStr(u.profile_image_url)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
     profile_image_url_https: cleanStr(u.profile_image_url_https)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
-    profile_banner_url: cleanStr(u.profile_banner_url),
+    profile_banner_url: cleanStr(u.profile_banner_url) || null,
     default_profile: !!u.default_profile,
-    default_profile_image: !!u.default_profile_image
+    default_profile_image: !!u.default_profile_image,
+    utc_offset: null,
+    time_zone: null,
+    geo_enabled: true,
+    lang: "en",
+    contributors_enabled: false,
+    is_translator: false,
+    profile_background_color: "C0DEED",
+    profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_tile: false,
+    profile_link_color: "1DA1F2",
+    profile_sidebar_border_color: "C0DEED",
+    profile_sidebar_fill_color: "DDEEF6",
+    profile_text_color: "333333",
+    profile_use_background_image: true,
+    has_extended_profile: true,
+    following: false,
+    follow_request_sent: false,
+    notifications: false,
+    translator_type: "none"
   };
 }
 
@@ -175,7 +215,9 @@ function sanitizeTweet(t) {
     retweeted: !!t.retweeted,
     lang: cleanStr(t.lang) || 'en',
     possibly_sensitive: false,
-    filter_level: "medium"
+    filter_level: "medium",
+    retweeted_status: t.retweeted_status ? sanitizeTweet(t.retweeted_status) : null,
+    quoted_status: t.quoted_status ? sanitizeTweet(t.quoted_status) : null
   };
 }
 
@@ -657,6 +699,21 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   return res.status(200).json(sanitizeTweet(found));
 });
 
+// Explicit endpoint handlers for tweet lookup and ID lists called during tweet detail view
+app.get('/1.1/statuses/lookup.json', async (req, res) => {
+  const idQuery = req.query.id || req.query.map;
+  const cached = await getCachedTimelineFromWorker();
+  if (idQuery) {
+    const ids = idQuery.split(',').map(s => s.trim());
+    const found = cached.filter(t => ids.includes(t.id_str) || ids.includes(String(t.id)));
+    return res.status(200).json(found.map(t => sanitizeTweet(t)));
+  }
+  return res.status(200).json([]);
+});
+
+app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
+app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
+
 app.get('/1.1/search/tweets.json', async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -712,7 +769,17 @@ app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
-app.all('/1.1/*', (req, res) => res.status(200).json({}));
+// Smart catch-all that returns correct types (arrays vs objects) based on route names
+app.all('/1.1/*', (req, res) => {
+  const path = req.path;
+  if (path.includes('/ids')) {
+    return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
+  }
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search')) {
+    return res.status(200).json([]);
+  }
+  return res.status(200).json({});
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`XitterBridge listening on port ${PORT}`));
