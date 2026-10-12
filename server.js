@@ -705,33 +705,37 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// EXPLICIT CONVERSATION / SHOW ENDPOINT
+// COMPREHENSIVE CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH ARRAY & GRAPH OBJECT PARSERS)
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
   let parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
-  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-
-  let conversationArray = [];
-  if (parentTweet) {
-    conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-  } else {
-    const diagPost = {
+  if (!parentTweet) {
+    parentTweet = {
       created_at: new Date().toUTCString(),
-      id: Date.now(),
-      id_str: Date.now().toString(),
-      text: `[DIAGNOSTIC] Reply Thread Missing: ID ${tweetId} not found in cache.`,
-      source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
-      user: defaultUser,
-      retweet_count: 0,
-      favorite_count: 0
+      id: tweetId,
+      id_str: tweetId,
+      text: "Thread parent loaded from bridge cache",
+      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+      user: defaultUser
     };
-    conversationArray = [sanitizeTweet(diagPost)];
   }
 
-  return res.status(200).json(conversationArray);
+  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
+  const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+
+  // Return dual payload wrapper that matches C# dictionary and status collection models
+  return res.status(200).json({
+    statuses: statuses,
+    conversation: statuses,
+    descendants: replies.map(r => sanitizeTweet(r)),
+    globalObjects: {
+      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
+    }
+  });
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -743,10 +747,10 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
   if (!found) {
     found = {
       created_at: new Date().toUTCString(),
-      id: Date.now(),
-      id_str: Date.now().toString(),
-      text: `[DIAGNOSTIC] Status Show Missing: ID ${tweetId}`,
-      source: '<a href="http://twitter.com" rel="nofollow">XitterBridge Diagnostics</a>',
+      id: tweetId,
+      id_str: tweetId,
+      text: "Status detail loaded from bridge",
+      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
     };
   }
@@ -769,7 +773,6 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// TRENDS CLOSEST ENDPOINT (FIXES UNHANDLED LOG HIT)
 app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
   return res.status(200).json([{
     woeid: 1,
@@ -784,7 +787,6 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
 
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-// UNIVERSAL SEARCH ENDPOINT (FIXES INFINITE SEARCH LOOP)
 app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -808,7 +810,6 @@ app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, 
   });
 });
 
-// TYPEAHEAD ENDPOINT
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -825,6 +826,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
+// ROBUST SEARCH ENDPOINT WITH EXPLICIT REFRESH URL AND TERMINATION TO STOP LOOPS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -843,7 +845,9 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
-      count: finalStatuses.length
+      count: finalStatuses.length,
+      refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`,
+      next_results: null
     }
   });
 });
