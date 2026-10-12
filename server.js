@@ -705,7 +705,6 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: Return conversation thread as a standard JSON array containing parent tweet + replies
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -730,8 +729,6 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
   }
 
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-
-  // Return a JSON array ResponseList containing the parent tweet followed by replies
   const conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
   return res.status(200).json(conversationArray);
 });
@@ -777,7 +774,23 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// Fully functional Search Handler supporting keywords, to:, and from:
+// CRITICAL FIX: Explicit handlers for typeahead and search suggestions returning expected object schemas instead of arrays
+app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
+  const query = req.query.q || "";
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  
+  const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
+  const qLower = query.toLowerCase();
+  const matchingStatuses = allTweets.filter(t => t.text?.toLowerCase().includes(qLower)).slice(0, 5);
+
+  return res.status(200).json({
+    users: users,
+    statuses: matchingStatuses.map(t => sanitizeTweet(t)),
+    topics: [{ topic: "#WindowsPhone", query: "%23WindowsPhone" }]
+  });
+});
+
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
