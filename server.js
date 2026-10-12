@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// CRITICAL FIX: Global Rate Limit & Access Headers required by Windows Phone client state machine
+// Global Rate Limit & Access Headers required by Windows Phone client state machine
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -681,6 +681,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
+// CRITICAL FIX: CONVERSATION THREAD MUST RETURN A PURE JSON ARRAY FOR C# List<Status> DESERIALIZATION
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id;
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -691,7 +692,7 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
     parentTweet = {
       created_at: new Date().toUTCString(),
       id: tweetId,
-      id_str: tweetId.replace('.json', ''),
+      id_str: String(tweetId).replace('.json', ''),
       text: "Thread parent loaded from bridge cache",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser,
@@ -708,15 +709,8 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
 
-  return res.status(200).json({
-    statuses: statuses,
-    conversation: statuses,
-    descendants: replies.map(r => sanitizeTweet(r)),
-    globalObjects: {
-      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
-      users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
-    }
-  });
+  // Return pure array of sanitized tweets to match C# client List<Status> expectation
+  return res.status(200).json(statuses);
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -729,7 +723,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
     found = {
       created_at: new Date().toUTCString(),
       id: tweetId,
-      id_str: tweetId.replace('.json', ''),
+      id_str: String(tweetId).replace('.json', ''),
       text: "Status detail loaded from bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
@@ -807,7 +801,6 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// FULLY FIXED SEARCH ENDPOINT WITH PROPER METADATA FIELDS TO STOP RETRY LOOPS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
