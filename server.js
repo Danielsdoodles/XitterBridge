@@ -56,21 +56,53 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Deep search to extract screen_name and name anywhere in the GraphQL entry
-function extractAuthorInfo(entry) {
-  try {
-    const str = JSON.stringify(entry);
-    const screenNameMatch = str.match(/"screen_name":"([^"]+)"/);
-    const nameMatch = str.match(/"name":"([^"]+)"/);
-    const avatarMatch = str.match(/"profile_image_url_https":"([^"]+)"/);
+// Structural recursive search to find the tweet author's legacy user object
+function extractAuthorInfo(tweetResult) {
+  if (!tweetResult) return null;
 
-    if (screenNameMatch && screenNameMatch[1]) {
-      const handle = screenNameMatch[1];
-      const name = (nameMatch && nameMatch[1]) ? nameMatch[1] : handle;
-      const avatar = (avatarMatch && avatarMatch[1]) ? avatarMatch[1] : defaultUser.profile_image_url_https;
-      return { handle, name, avatar };
+  // Direct paths check first
+  const paths = [
+    tweetResult?.core?.user_results?.result?.legacy,
+    tweetResult?.tweet?.core?.user_results?.result?.legacy,
+    tweetResult?.user_results?.result?.legacy,
+    tweetResult?.tweet?.user_results?.result?.legacy,
+    tweetResult?.author?.result?.legacy
+  ];
+
+  for (const legacyUser of paths) {
+    if (legacyUser && legacyUser.screen_name && legacyUser.screen_name.toLowerCase() !== 'twitter') {
+      return {
+        handle: legacyUser.screen_name,
+        name: legacyUser.name || legacyUser.screen_name,
+        avatar: legacyUser.profile_image_url_https || defaultUser.profile_image_url_https
+      };
     }
-  } catch (e) {}
+  }
+
+  // Deep structural search specifically looking for user profile nodes
+  function searchObj(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj.screen_name && obj.screen_name.toLowerCase() !== 'twitter' && (obj.followers_count !== undefined || obj.statuses_count !== undefined || obj.name)) {
+      return obj;
+    }
+    for (const key of Object.keys(obj)) {
+      if (typeof obj[key] === 'object' && obj[key] !== null) {
+        const res = searchObj(obj[key]);
+        if (res) return res;
+      }
+    }
+    return null;
+  }
+
+  const foundUser = searchObj(tweetResult);
+  if (foundUser && foundUser.screen_name) {
+    return {
+      handle: foundUser.screen_name,
+      name: foundUser.name || foundUser.screen_name,
+      avatar: foundUser.profile_image_url_https || defaultUser.profile_image_url_https
+    };
+  }
+
   return null;
 }
 
@@ -207,8 +239,8 @@ async function backgroundScrape() {
 
                 if (!legacy) return;
 
-                // Extract author information using string regex search
-                const authorInfo = extractAuthorInfo(entry);
+                // Extract real author using precise structural search
+                const authorInfo = extractAuthorInfo(tweetResult);
                 if (!authorInfo) return;
 
                 const authorScreenName = authorInfo.handle;
