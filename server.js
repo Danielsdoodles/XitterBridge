@@ -169,98 +169,101 @@ async function backgroundScrape() {
 
     console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    // Scroll multiple times to load 40+ unique tweets into DOM
-    for (let i = 0; i < 4; i++) {
-      try {
-        await page.evaluate(() => window.scrollBy(0, 1500));
-      } catch (e) {}
-      await new Promise((resolve) => setTimeout(resolve, 2500));
-    }
+    try {
+      await page.waitForSelector('article[data-testid="tweet"]', { timeout: 10000 });
+    } catch (e) {}
 
-    const scrapedTweets = await page.evaluate(() => {
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      const results = [];
-      
-      articles.forEach((article, idx) => {
-        try {
-          const textEl = article.querySelector('[data-testid="tweetText"]');
-          const text = textEl ? textEl.innerText : '';
+    // Scroll loop inside browser context to continuously extract fresh DOM nodes
+    const scrapedTweets = await page.evaluate(async () => {
+      const resultsMap = new Map();
 
-          let name = 'Twitter User';
-          let screenName = 'twitter_user';
-          let avatarUrl = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
-          let tweetIdStr = (Date.now() + idx).toString();
+      for (let i = 0; i < 5; i++) {
+        const articles = document.querySelectorAll('article[data-testid="tweet"]');
+        
+        articles.forEach((article, idx) => {
+          try {
+            const textEl = article.querySelector('[data-testid="tweetText"]');
+            const text = textEl ? textEl.innerText : '';
 
-          // Extract real Twitter status ID from permalink
-          const timeLink = article.querySelector('a[href*="/status/"]');
-          if (timeLink) {
-            const href = timeLink.getAttribute('href');
-            const match = href.match(/\/status\/(\d+)/);
-            if (match) {
-              tweetIdStr = match[1];
-            }
-          }
+            let name = 'Twitter User';
+            let screenName = 'twitter_user';
+            let avatarUrl = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
+            let tweetIdStr = (Date.now() - (idx * 1000)).toString();
 
-          const userCell = article.querySelector('[data-testid="User-Name"]');
-          if (userCell) {
-            const spans = userCell.querySelectorAll('span');
-            for (const span of spans) {
-              const txt = span.innerText;
-              if (txt && txt.startsWith('@')) {
-                screenName = txt.replace('@', '').trim();
-                break;
+            const timeLink = article.querySelector('a[href*="/status/"]');
+            if (timeLink) {
+              const href = timeLink.getAttribute('href');
+              const match = href.match(/\/status\/(\d+)/);
+              if (match) {
+                tweetIdStr = match[1];
               }
             }
-            const firstSpan = userCell.querySelector('span');
-            if (firstSpan) name = firstSpan.innerText;
-          }
 
-          const avatarImg = article.querySelector('img[src*="profile_images"]');
-          if (avatarImg) avatarUrl = avatarImg.src;
-
-          const mediaImgs = article.querySelectorAll('img[src*="media"]');
-          const mediaList = [];
-          mediaImgs.forEach((img, mi) => {
-            let mUrl = img.src;
-            if (mUrl && !mUrl.includes('profile_images')) {
-              mUrl = mUrl.split('?')[0] + '?format=jpg&name=medium';
-              const httpUrl = mUrl.replace('https://', 'http://');
-              mediaList.push({
-                id: Date.now() + mi,
-                id_str: (Date.now() + mi).toString(),
-                media_url: httpUrl,
-                media_url_https: httpUrl,
-                url: 'http://t.co/' + Math.random().toString(36).substring(7),
-                display_url: 'pic.x.com/' + Math.random().toString(36).substring(7),
-                expanded_url: 'https://x.com/' + screenName + '/status/' + tweetIdStr,
-                type: 'photo',
-                sizes: {
-                  thumb: { w: 150, h: 150, resize: 'crop' },
-                  small: { w: 680, h: 680, resize: 'fit' },
-                  medium: { w: 1200, h: 1200, resize: 'fit' },
-                  large: { w: 2048, h: 2048, resize: 'fit' }
+            const userCell = article.querySelector('[data-testid="User-Name"]');
+            if (userCell) {
+              const spans = userCell.querySelectorAll('span');
+              for (const span of spans) {
+                const txt = span.innerText;
+                if (txt && txt.startsWith('@')) {
+                  screenName = txt.replace('@', '').trim();
+                  break;
                 }
+              }
+              const firstSpan = userCell.querySelector('span');
+              if (firstSpan) name = firstSpan.innerText;
+            }
+
+            const avatarImg = article.querySelector('img[src*="profile_images"]');
+            if (avatarImg) avatarUrl = avatarImg.src;
+
+            const mediaImgs = article.querySelectorAll('img[src*="media"]');
+            const mediaList = [];
+            mediaImgs.forEach((img, mi) => {
+              let mUrl = img.src;
+              if (mUrl && !mUrl.includes('profile_images')) {
+                mUrl = mUrl.split('?')[0] + '?format=jpg&name=medium';
+                const httpUrl = mUrl.replace('https://', 'http://');
+                mediaList.push({
+                  id: Date.now() + mi,
+                  id_str: (Date.now() + mi).toString(),
+                  media_url: httpUrl,
+                  media_url_https: httpUrl,
+                  url: 'http://t.co/' + Math.random().toString(36).substring(7),
+                  display_url: 'pic.x.com/' + Math.random().toString(36).substring(7),
+                  expanded_url: 'https://x.com/' + screenName + '/status/' + tweetIdStr,
+                  type: 'photo',
+                  sizes: {
+                    thumb: { w: 150, h: 150, resize: 'crop' },
+                    small: { w: 680, h: 680, resize: 'fit' },
+                    medium: { w: 1200, h: 1200, resize: 'fit' },
+                    large: { w: 2048, h: 2048, resize: 'fit' }
+                  }
+                });
+              }
+            });
+
+            if (!resultsMap.has(tweetIdStr)) {
+              resultsMap.set(tweetIdStr, {
+                created_at: new Date().toUTCString(),
+                id: parseInt(tweetIdStr.slice(-12)) || Date.now() - (idx * 1000),
+                id_str: tweetIdStr,
+                text: text,
+                source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+                name: name,
+                screen_name: screenName,
+                avatar: avatarUrl.replace('https://', 'http://'),
+                media: mediaList
               });
             }
-          });
+          } catch (err) {}
+        });
 
-          results.push({
-            created_at: new Date().toUTCString(),
-            id: parseInt(tweetIdStr.slice(-12)) || Date.now() + idx,
-            id_str: tweetIdStr,
-            text: text,
-            source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-            name: name,
-            screen_name: screenName,
-            avatar: avatarUrl.replace('https://', 'http://'),
-            media: mediaList
-          });
-        } catch (err) {}
-      });
+        window.scrollBy(0, 1500);
+        await new Promise((r) => setTimeout(r, 2000));
+      }
 
-      return results;
+      return Array.from(resultsMap.values());
     });
 
     await browser.close();
@@ -414,7 +417,6 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
   return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
 
-// Home timeline with strict since_id and max_id pagination for true infinite scrolling
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
@@ -458,7 +460,6 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 
-// Robust status show lookup for image expansion and detail viewing
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
