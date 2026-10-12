@@ -705,6 +705,23 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
+// CRITICAL FIX: Explicit handlers for conversation threads requested by Windows Phone
+app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+  const tweetId = req.params.id.replace('.json', '');
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  
+  // Find parent tweet and any replies linked to it
+  const parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
+  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
+
+  const conversationList = [];
+  if (parentTweet) conversationList.push(sanitizeTweet(parentTweet));
+  replies.forEach(r => conversationList.push(sanitizeTweet(r)));
+
+  return res.status(200).json(conversationList.length > 0 ? conversationList : (parentTweet ? [sanitizeTweet(parentTweet)] : []));
+});
+
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -728,11 +745,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
     };
   }
 
-  // Include any replies in the response or matching conversation items
-  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
-  const sanitized = sanitizeTweet(found);
-  
-  return res.status(200).json(sanitized);
+  return res.status(200).json(sanitizeTweet(found));
 });
 
 app.get(['/1.1/statuses/lookup.json', '/1/statuses/lookup.json'], async (req, res) => {
@@ -750,7 +763,7 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// Fully functional search handler supporting keywords, to:, and from: filters
+// Search Handler supporting keywords, to:, and from:
 app.get('/1.1/search/tweets.json', async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -782,6 +795,8 @@ app.get('/1.1/search/tweets.json', async (req, res) => {
 
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
+  const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
+
   const newTweet = sanitizeTweet({
     created_at: new Date().toUTCString(),
     id: Date.now().toString(),
@@ -789,6 +804,8 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     text: tweetText,
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
+    in_reply_to_status_id: inReplyToStatusId || null,
+    in_reply_to_status_id_str: inReplyToStatusId ? String(inReplyToStatusId) : null,
     user: defaultUser,
     retweet_count: 0,
     favorite_count: 0,
@@ -796,7 +813,9 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     favorited: false,
     retweeted: false
   });
+
   localTimeline.unshift(newTweet);
+  appendCachedTimelineToWorker([newTweet]);
   return res.status(200).json(newTweet);
 });
 
@@ -823,7 +842,7 @@ app.all('*', (req, res) => {
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
-  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup')) {
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/search') || path.includes('/lookup') || path.includes('/conversation')) {
     return res.status(200).json([]);
   }
   return res.status(200).json({});
