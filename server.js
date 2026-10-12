@@ -44,7 +44,6 @@ const defaultUser = {
 let localTimeline = [];
 let isScraping = false;
 
-// Generate unique deterministic user IDs per handle so Lumia won't map posts to defaultUser
 function generateUniqueUserId(screenName) {
   let hash = 0;
   for (let i = 0; i < screenName.length; i++) {
@@ -116,14 +115,17 @@ async function saveCachedTimelineToWorker(tweets) {
 
 async function backgroundScrape() {
   if (isScraping) {
-    console.log('[Puppeteer] Scrape already in progress, skipping...');
+    console.log('[Puppeteer Debug] Scrape already in progress, skipping...');
     return;
   }
   isScraping = true;
 
+  console.log('[Puppeteer Debug] Fetching tokens from Cloudflare Worker...');
   const tokens = await getTokensFromCloudflareWorker();
+  console.log(`[Puppeteer Debug] Tokens retrieved. auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
+
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV!');
+    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV! Aborting scrape.');
     isScraping = false;
     return;
   }
@@ -163,11 +165,12 @@ async function backgroundScrape() {
     page.on('response', async (response) => {
       const url = response.url();
       if (url.includes('/graphql/')) {
-        console.log('[Puppeteer Network]', url.split('?')[0]);
+        console.log('[Puppeteer Network Hit]', url.split('?')[0]);
       }
       if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
         try {
           const json = await response.json();
+          console.log('[Puppeteer GraphQL] Successfully intercepted timeline feed response!');
           const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
           for (const instr of instructions) {
             if (instr.type === 'TimelineAddEntries') {
@@ -224,7 +227,9 @@ async function backgroundScrape() {
               });
             }
           }
-        } catch (e) {}
+        } catch (e) {
+          console.error('[Puppeteer Parse Error]', e.message);
+        }
       }
     });
 
