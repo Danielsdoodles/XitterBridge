@@ -28,6 +28,7 @@ const defaultUser = {
   description: "Windows Phone preservation project",
   url: null,
   protected: false,
+  verified: false,
   followers_count: 10,
   friends_count: 10,
   listed_count: 0,
@@ -178,17 +179,17 @@ async function backgroundScrape() {
                 const tweetObj = tweetResult?.tweet || tweetResult;
                 const legacy = tweetObj?.legacy;
 
-                const userResult = 
-                  tweetObj?.core?.user_results?.result || 
+                const userResults = 
                   tweetResult?.core?.user_results?.result || 
-                  tweetObj?.user_results?.result || 
-                  tweetObj?.author?.result;
-                const userLegacy = userResult?.legacy || userResult?.user?.legacy;
+                  tweetResult?.tweet?.core?.user_results?.result ||
+                  tweetResult?.user_results?.result;
+
+                const userLegacy = userResults?.legacy;
 
                 if (legacy) {
                   const authorScreenName = userLegacy?.screen_name || "Twitter";
                   const authorName = userLegacy?.name || authorScreenName;
-                  const authorRestId = userResult?.rest_id || userResult?.id;
+                  const authorRestId = userResults?.rest_id || userResults?.id;
                   const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
                   const authorUserIdStr = authorRestId || authorUserId.toString();
                   const authorAvatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
@@ -198,7 +199,13 @@ async function backgroundScrape() {
                     id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
                     id_str: legacy.id_str || (Date.now() + idx).toString(),
                     text: legacy.full_text || legacy.text || "",
+                    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
                     truncated: false,
+                    in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
+                    in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                    in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
+                    in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                    in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
                     user_id: authorUserId,
                     user_id_str: authorUserIdStr,
                     user: {
@@ -210,6 +217,7 @@ async function backgroundScrape() {
                       description: userLegacy?.description || "",
                       url: userLegacy?.url || null,
                       protected: userLegacy?.protected || false,
+                      verified: userLegacy?.verified || false,
                       followers_count: userLegacy?.followers_count || 0,
                       friends_count: userLegacy?.friends_count || 0,
                       listed_count: userLegacy?.listed_count || 0,
@@ -218,22 +226,29 @@ async function backgroundScrape() {
                       statuses_count: userLegacy?.statuses_count || 0,
                       profile_image_url: authorAvatar.replace('https://', 'http://'),
                       profile_image_url_https: authorAvatar,
+                      profile_banner_url: userLegacy?.profile_banner_url || null,
                       default_profile: userLegacy?.default_profile || false,
                       default_profile_image: userLegacy?.default_profile_image || false
                     },
+                    geo: null,
+                    coordinates: null,
+                    place: null,
+                    contributors: null,
+                    is_quote_status: legacy.is_quote_status || false,
                     retweet_count: legacy.retweet_count || 0,
                     favorite_count: legacy.favorite_count || 0,
+                    entities: legacy.entities || { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+                    extended_entities: legacy.extended_entities || undefined,
                     favorited: legacy.favorited || false,
-                    retweeted: legacy.retweeted || false
+                    retweeted: legacy.retweeted || false,
+                    lang: legacy.lang || "en"
                   });
                 }
               });
             }
           }
         }
-      } catch (e) {
-        // Suppress target closed errors safely
-      }
+      } catch (e) {}
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
@@ -331,10 +346,12 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     id: Date.now(),
     id_str: Date.now().toString(),
     text: tweetText,
+    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     user: defaultUser,
     retweet_count: 0,
     favorite_count: 0,
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
     favorited: false,
     retweeted: false
   };
@@ -350,6 +367,7 @@ app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
+app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
