@@ -56,6 +56,21 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
+// Deep search helper to find user_results anywhere inside a GraphQL tweet object
+function findUserResults(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (obj.user_results?.result) return obj.user_results.result;
+  if (obj.core?.user_results?.result) return obj.core.user_results.result;
+
+  for (const key of Object.keys(obj)) {
+    if (typeof obj[key] === 'object' && obj[key] !== null) {
+      const res = findUserResults(obj[key]);
+      if (res) return res;
+    }
+  }
+  return null;
+}
+
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -183,21 +198,20 @@ async function backgroundScrape() {
           for (const instr of instructions) {
             if (instr.type === 'TimelineAddEntries') {
               instr.entries?.forEach((entry, idx) => {
-                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
+                const itemContent = entry?.content?.itemContent;
+                const tweetResult = itemContent?.tweet_results?.result;
                 const tweetObj = tweetResult?.tweet || tweetResult;
                 const legacy = tweetObj?.legacy;
 
                 if (!legacy) return;
 
-                const userResults = 
-                  tweetResult?.core?.user_results?.result || 
-                  tweetResult?.tweet?.core?.user_results?.result ||
-                  tweetResult?.user_results?.result ||
-                  tweetObj?.core?.user_results?.result;
+                // Use recursive deep lookup to guarantee finding real author metadata
+                const userResults = findUserResults(tweetResult) || findUserResults(itemContent);
+                const userLegacy = userResults?.legacy;
 
-                const userLegacy = userResults?.legacy || {};
+                if (!userLegacy || !userLegacy.screen_name) return;
 
-                const authorScreenName = userLegacy.screen_name || tweetObj?.source_user_screen_name || "Twitter";
+                const authorScreenName = userLegacy.screen_name;
                 const authorName = userLegacy.name || authorScreenName;
                 const authorRestId = userResults?.rest_id || userResults?.id;
                 const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
@@ -359,11 +373,45 @@ app.get('/1.1/users/show.json', async (req, res) => {
   if (matchedTweet && matchedTweet.user) {
     return res.status(200).json(matchedTweet.user);
   }
+
+  if (screenName) {
+    return res.status(200).json({
+      ...defaultUser,
+      id: generateUniqueUserId(screenName),
+      id_str: generateUniqueUserId(screenName).toString(),
+      name: screenName,
+      screen_name: screenName
+    });
+  }
+
   return res.status(200).json(defaultUser);
 });
 
 app.get('/1.1/users/lookup.json', async (req, res) => {
+  const screenNameQuery = req.query.screen_name;
   const cachedTweets = await getCachedTimelineFromWorker();
+
+  if (screenNameQuery) {
+    const requestedNames = screenNameQuery.split(',').map(s => s.trim().toLowerCase());
+    const matchedUsers = [];
+
+    for (const name of requestedNames) {
+      const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name);
+      if (match && match.user) {
+        matchedUsers.push(match.user);
+      } else {
+        matchedUsers.push({
+          ...defaultUser,
+          id: generateUniqueUserId(name),
+          id_str: generateUniqueUserId(name).toString(),
+          name: name,
+          screen_name: name
+        });
+      }
+    }
+    return res.status(200).json(matchedUsers);
+  }
+
   const users = cachedTweets.map(t => t.user).filter(Boolean);
   return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
