@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Comprehensive Debug Logging & Required WP Rate Limit Headers
+// Global Rate Limit & Access Headers required by Windows Phone client state machine
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -23,12 +23,9 @@ app.use((req, res, next) => {
   res.setHeader('X-Access-Level', 'read-write');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   
-  console.log(`[XitterBridge REQUEST] ${req.method} ${req.originalUrl || req.url}`);
+  console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
   if (Object.keys(req.query).length > 0) {
-    console.log(`  Query:`, JSON.stringify(req.query));
-  }
-  if (req.body && Object.keys(req.body).length > 0) {
-    console.log(`  Body:`, JSON.stringify(req.body));
+    console.log(`  Query Params:`, JSON.stringify(req.query));
   }
   next();
 });
@@ -62,7 +59,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -230,7 +227,7 @@ function sanitizeTweet(t) {
     id: safeId,
     id_str: idStr,
     text: textVal,
-    full_text: textVal, // Satisfy extended client format
+    full_text: textVal,
     source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
@@ -459,6 +456,7 @@ async function backgroundScrape() {
                 id: tweetIdStr,
                 id_str: tweetIdStr,
                 text: legacy.full_text || legacy.text || "",
+                full_text: legacy.full_text || legacy.text || "",
                 source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
                 truncated: false,
                 in_reply_to_status_id: legacy.in_reply_to_status_id_str || null,
@@ -688,7 +686,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// MULTI-SUPPORT CONVERSATION ENDPOINT (SUPPORTS BOTH ARRAY AND GRAPH OBJECTS)
+// HARDENED CONVERSATION THREAD ENDPOINT (INCLUDES globalObjects DICTIONARY MAPPING)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -817,6 +815,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
+// FULLY HARDENED SEARCH ENDPOINT WITH EMBEDDED globalObjects TO PREVENT BLANK WHITE XAML SCREENS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
@@ -831,6 +830,10 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
   }
 
   const finalStatuses = (results.length > 0 ? results : allTweets).slice(0, 20).map(t => sanitizeTweet(t));
+  const uniqueUsers = {};
+  finalStatuses.forEach(s => {
+    if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user;
+  });
 
   return res.status(200).json({
     statuses: finalStatuses,
@@ -844,6 +847,10 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
       since_id_str: "0",
       refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`,
       next_results: null
+    },
+    globalObjects: {
+      tweets: finalStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: uniqueUsers
     }
   });
 });
