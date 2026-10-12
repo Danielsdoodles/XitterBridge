@@ -186,64 +186,65 @@ async function backgroundScrape() {
 
                 const userLegacy = userResults?.legacy;
 
-                if (legacy) {
-                  const authorScreenName = userLegacy?.screen_name || "Twitter";
-                  const authorName = userLegacy?.name || authorScreenName;
-                  const authorRestId = userResults?.rest_id || userResults?.id;
-                  const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
-                  const authorUserIdStr = authorRestId || authorUserId.toString();
-                  const authorAvatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
+                // Skip entries that don't have a real author or screen name (ads/system cards)
+                if (!legacy || !userLegacy || !userLegacy.screen_name) return;
 
-                  parsedTweets.push({
-                    created_at: legacy.created_at || new Date().toUTCString(),
-                    id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
-                    id_str: legacy.id_str || (Date.now() + idx).toString(),
-                    text: legacy.full_text || legacy.text || "",
-                    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-                    truncated: false,
-                    in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-                    in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-                    in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-                    in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-                    in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                    user_id: authorUserId,
-                    user_id_str: authorUserIdStr,
-                    user: {
-                      id: authorUserId,
-                      id_str: authorUserIdStr,
-                      name: authorName,
-                      screen_name: authorScreenName,
-                      location: userLegacy?.location || "",
-                      description: userLegacy?.description || "",
-                      url: userLegacy?.url || null,
-                      protected: userLegacy?.protected || false,
-                      verified: userLegacy?.verified || false,
-                      followers_count: userLegacy?.followers_count || 0,
-                      friends_count: userLegacy?.friends_count || 0,
-                      listed_count: userLegacy?.listed_count || 0,
-                      created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
-                      favourites_count: userLegacy?.favourites_count || 0,
-                      statuses_count: userLegacy?.statuses_count || 0,
-                      profile_image_url: authorAvatar.replace('https://', 'http://'),
-                      profile_image_url_https: authorAvatar,
-                      profile_banner_url: userLegacy?.profile_banner_url || null,
-                      default_profile: userLegacy?.default_profile || false,
-                      default_profile_image: userLegacy?.default_profile_image || false
-                    },
-                    geo: null,
-                    coordinates: null,
-                    place: null,
-                    contributors: null,
-                    is_quote_status: legacy.is_quote_status || false,
-                    retweet_count: legacy.retweet_count || 0,
-                    favorite_count: legacy.favorite_count || 0,
-                    entities: legacy.entities || { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-                    extended_entities: legacy.extended_entities || undefined,
-                    favorited: legacy.favorited || false,
-                    retweeted: legacy.retweeted || false,
-                    lang: legacy.lang || "en"
-                  });
-                }
+                const authorScreenName = userLegacy.screen_name;
+                const authorName = userLegacy.name || authorScreenName;
+                const authorRestId = userResults?.rest_id || userResults?.id;
+                const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
+                const authorUserIdStr = authorRestId || authorUserId.toString();
+                const authorAvatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
+
+                parsedTweets.push({
+                  created_at: legacy.created_at || new Date().toUTCString(),
+                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
+                  id_str: legacy.id_str || (Date.now() + idx).toString(),
+                  text: legacy.full_text || legacy.text || "",
+                  source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+                  truncated: false,
+                  in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
+                  in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                  in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
+                  in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                  in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+                  user_id: authorUserId,
+                  user_id_str: authorUserIdStr,
+                  user: {
+                    id: authorUserId,
+                    id_str: authorUserIdStr,
+                    name: authorName,
+                    screen_name: authorScreenName,
+                    location: userLegacy?.location || "",
+                    description: userLegacy?.description || "",
+                    url: userLegacy?.url || null,
+                    protected: userLegacy?.protected || false,
+                    verified: userLegacy?.verified || false,
+                    followers_count: userLegacy?.followers_count || 0,
+                    friends_count: userLegacy?.friends_count || 0,
+                    listed_count: userLegacy?.listed_count || 0,
+                    created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
+                    favourites_count: userLegacy?.favourites_count || 0,
+                    statuses_count: userLegacy?.statuses_count || 0,
+                    profile_image_url: authorAvatar.replace('https://', 'http://'),
+                    profile_image_url_https: authorAvatar,
+                    profile_banner_url: userLegacy?.profile_banner_url || null,
+                    default_profile: userLegacy?.default_profile || false,
+                    default_profile_image: userLegacy?.default_profile_image || false
+                  },
+                  geo: null,
+                  coordinates: null,
+                  place: null,
+                  contributors: null,
+                  is_quote_status: legacy.is_quote_status || false,
+                  retweet_count: legacy.retweet_count || 0,
+                  favorite_count: legacy.favorite_count || 0,
+                  entities: legacy.entities || { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+                  extended_entities: legacy.extended_entities || undefined,
+                  favorited: legacy.favorited || false,
+                  retweeted: legacy.retweeted || false,
+                  lang: legacy.lang || "en"
+                });
               });
             }
           }
