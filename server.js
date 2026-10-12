@@ -137,7 +137,6 @@ async function backgroundScrape() {
 
   const tokens = await getTokensFromCloudflareWorker();
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log('[Puppeteer Error] Missing auth_token or ct0 in Worker KV.');
     isScraping = false;
     return;
   }
@@ -170,7 +169,6 @@ async function backgroundScrape() {
 
     let parsedTweets = [];
 
-    // Intercept GraphQL network responses directly to get your true account timeline JSON
     page.on('response', async (response) => {
       try {
         const url = response.url();
@@ -181,18 +179,48 @@ async function backgroundScrape() {
           function recursiveSearch(obj) {
             if (!obj || typeof obj !== 'object') return;
 
-            if (obj.legacy && obj.legacy.full_text) {
+            if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
-              const tweetResult = obj.tweet_results?.result || obj;
               
-              // Extract user info safely
-              const userRes = tweetResult.core?.user_results?.result || obj.core?.user_results?.result;
-              const userLegacy = userRes?.legacy || {};
-              const screenName = userLegacy.screen_name || 'twitter_user';
-              const name = userLegacy.name || screenName;
-              const avatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
-              const userId = userRes?.rest_id ? parseInt(userRes.rest_id) : generateUniqueUserId(screenName);
-              const userIdStr = userRes?.rest_id || userId.toString();
+              // Extract correct user result object recursively or directly
+              let userLegacy = null;
+              let restId = null;
+
+              const possibleUserRes = [
+                obj.core?.user_results?.result,
+                obj.tweet_results?.result?.core?.user_results?.result,
+                obj.user_results?.result
+              ];
+
+              for (const uRes of possibleUserRes) {
+                if (uRes) {
+                  userLegacy = uRes.legacy || uRes;
+                  restId = uRes.rest_id || uRes.id_str;
+                  break;
+                }
+              }
+
+              // Fallback deep search for user legacy if needed
+              if (!userLegacy || !userLegacy.screen_name) {
+                function findUser(n) {
+                  if (!n || typeof n !== 'object') return null;
+                  if (n.screen_name && n.name && (n.followers_count !== undefined || n.profile_image_url_https)) return n;
+                  for (const k of Object.keys(n)) {
+                    if (typeof n[k] === 'object' && n[k] !== null) {
+                      const res = findUser(n[k]);
+                      if (res) return res;
+                    }
+                  }
+                  return null;
+                }
+                userLegacy = findUser(obj);
+              }
+
+              const screenName = userLegacy?.screen_name || 'twitter_user';
+              const name = userLegacy?.name || screenName;
+              const avatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
+              const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
+              const userIdStr = restId || userId.toString();
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -243,27 +271,29 @@ async function backgroundScrape() {
                   id_str: userIdStr,
                   name: name,
                   screen_name: screenName,
-                  location: userLegacy.location || "",
-                  description: userLegacy.description || "",
-                  url: userLegacy.url || null,
-                  protected: userLegacy.protected || false,
-                  verified: userLegacy.verified || false,
-                  followers_count: userLegacy.followers_count || 100,
-                  friends_count: userLegacy.friends_count || 100,
-                  listed_count: userLegacy.listed_count || 0,
-                  created_at: userLegacy.created_at || "Wed Oct 10 00:00:00 +0000 2026",
-                  favourites_count: userLegacy.favourites_count || 100,
-                  statuses_count: userLegacy.statuses_count || 100,
+                  location: userLegacy?.location || "",
+                  description: userLegacy?.description || "",
+                  url: userLegacy?.url || null,
+                  protected: userLegacy?.protected || false,
+                  verified: userLegacy?.verified || false,
+                  followers_count: userLegacy?.followers_count || 100,
+                  friends_count: userLegacy?.friends_count || 100,
+                  listed_count: userLegacy?.listed_count || 0,
+                  created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
+                  favourites_count: userLegacy?.favourites_count || 100,
+                  statuses_count: userLegacy?.statuses_count || 100,
                   profile_image_url: avatar.replace('https://', 'http://'),
                   profile_image_url_https: avatar.replace('https://', 'http://'),
-                  profile_banner_url: userLegacy.profile_banner_url || null,
-                  default_profile: userLegacy.default_profile || false,
-                  default_profile_image: userLegacy.default_profile_image || false
+                  profile_banner_url: userLegacy?.profile_banner_url || null,
+                  default_profile: userLegacy?.default_profile || false,
+                  default_profile_image: userLegacy?.default_profile_image || false
                 },
                 entities: entities,
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
                 retweeted: legacy.retweeted || false,
+                retweet_count: legacy.retweet_count || 0,
+                favorite_count: legacy.favorite_count || 0,
                 lang: legacy.lang || "en"
               });
             }
@@ -280,11 +310,9 @@ async function backgroundScrape() {
       } catch (e) {}
     });
 
-    console.log('[Puppeteer] Navigating to x.com/home...');
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    // Scroll multiple times to trigger network requests for full timeline history
     for (let i = 0; i < 5; i++) {
       try {
         await page.evaluate(() => window.scrollBy(0, 1500));
@@ -296,7 +324,6 @@ async function backgroundScrape() {
 
     if (parsedTweets.length > 0) {
       await appendCachedTimelineToWorker(parsedTweets);
-      console.log(`[Puppeteer GraphQL] Successfully intercepted and cached ${parsedTweets.length} unique timeline tweets.`);
     }
   } catch (err) {
     if (browser) {
@@ -440,7 +467,7 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  const found = allTweets.entfind ? allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId)) : allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
   
   if (found) {
     return res.status(200).json(found);
