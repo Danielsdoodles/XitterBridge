@@ -20,9 +20,6 @@ app.use((req, res, next) => {
   if (Object.keys(req.query).length > 0) {
     console.log(`  Query Params:`, JSON.stringify(req.query));
   }
-  if (req.body && Object.keys(req.body).length > 0) {
-    console.log(`  Body:`, JSON.stringify(req.body));
-  }
   next();
 });
 
@@ -231,6 +228,18 @@ function sanitizeTweet(t) {
   };
 }
 
+// Bulletproof ID Matcher for lookups and threads
+function findTweetById(allTweets, idInput) {
+  if (!idInput) return null;
+  const cleanId = String(idInput).replace('.json', '').trim();
+  return allTweets.find(t => 
+    String(t.id_str) === cleanId || 
+    String(t.id) === cleanId || 
+    String(t.id_str).slice(-9) === cleanId.slice(-9) ||
+    String(t.id).slice(-9) === cleanId.slice(-9)
+  );
+}
+
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -401,43 +410,6 @@ async function backgroundScrape() {
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
-              if (!extendedEntities && obj.card?.binding_values) {
-                let cardImgUrl = null;
-                for (const bv of obj.card.binding_values) {
-                  if (bv.key === 'thumbnail_image_url' || bv.key === 'player_image_url' || bv.key === 'image_url') {
-                    cardImgUrl = bv.value?.string_value || bv.value?.image_value?.url;
-                  }
-                }
-                if (cardImgUrl) {
-                  cardImgUrl = cleanStr(cardImgUrl);
-                  if (cardImgUrl) {
-                    if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
-                    cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=large';
-                    const httpUrl = cardImgUrl.replace('https://', 'http://');
-                    extendedEntities = {
-                      media: [{
-                        id: Date.now(),
-                        id_str: Date.now().toString(),
-                        indices: [0, 0],
-                        media_url: httpUrl,
-                        media_url_https: httpUrl,
-                        url: 'http://t.co/card',
-                        display_url: 'pic.x.com/card',
-                        expanded_url: cardImgUrl,
-                        type: 'photo',
-                        sizes: {
-                          thumb: { w: 150, h: 150, resize: 'crop' },
-                          small: { w: 680, h: 680, resize: 'fit' },
-                          medium: { w: 1200, h: 1200, resize: 'fit' },
-                          large: { w: 2048, h: 2048, resize: 'fit' }
-                        }
-                      }]
-                    };
-                    entities.media = extendedEntities.media;
-                  }
-                }
-              }
-
               if (extendedEntities && extendedEntities.media) {
                 extendedEntities.media = extendedEntities.media.map(m => {
                   let mUrl = cleanStr(m.media_url_https || m.media_url) || '';
@@ -466,9 +438,8 @@ async function backgroundScrape() {
               }
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
-              
-              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 0);
-              const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? obj.card?.binding_values?.retweet_count ?? 0);
+              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? 0);
+              const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? 0);
 
               const rawTweet = {
                 created_at: legacy.created_at || new Date().toUTCString(),
@@ -582,7 +553,6 @@ app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ scree
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(sanitizeUser(defaultUser)));
-
 app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json({ status: "ok" }));
 
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
@@ -690,7 +660,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  const found = findTweetById(allTweets, tweetId);
 
   const favs = found ? found.favorite_count : 0;
   const rts = found ? found.retweet_count : 0;
@@ -705,28 +675,34 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// COMPREHENSIVE CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH ARRAY & GRAPH OBJECT PARSERS)
+// BULLETPROOF CONVERSATION THREAD ENDPOINT
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
-  const tweetId = req.params.id.replace('.json', '');
+  const tweetId = req.params.id;
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  let parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
+  let parentTweet = findTweetById(allTweets, tweetId);
   if (!parentTweet) {
     parentTweet = {
       created_at: new Date().toUTCString(),
       id: tweetId,
-      id_str: tweetId,
+      id_str: tweetId.replace('.json', ''),
       text: "Thread parent loaded from bridge cache",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-      user: defaultUser
+      user: defaultUser,
+      retweet_count: 0,
+      favorite_count: 0
     };
   }
 
-  const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
+  const parentIdStr = String(parentTweet.id_str || parentTweet.id);
+  const replies = allTweets.filter(t => {
+    const replyTo = String(t.in_reply_to_status_id_str || t.in_reply_to_status_id || '');
+    return replyTo === parentIdStr || replyTo.slice(-9) === parentIdStr.slice(-9);
+  });
+
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
 
-  // Return dual payload wrapper that matches C# dictionary and status collection models
   return res.status(200).json({
     statuses: statuses,
     conversation: statuses,
@@ -739,16 +715,16 @@ app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
-  const tweetId = req.params.id.replace('.json', '');
+  const tweetId = req.params.id;
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  let found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
+  let found = findTweetById(allTweets, tweetId);
   
   if (!found) {
     found = {
       created_at: new Date().toUTCString(),
       id: tweetId,
-      id_str: tweetId,
+      id_str: tweetId.replace('.json', ''),
       text: "Status detail loaded from bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
@@ -762,7 +738,7 @@ app.get(['/1.1/statuses/lookup.json', '/1/statuses/lookup.json'], async (req, re
   const idQuery = req.query.id || req.query.map;
   const cached = await getCachedTimelineFromWorker();
   if (idQuery) {
-    const ids = idQuery.split(',').map(s => s.trim());
+    const ids = String(idQuery).split(',').map(s => s.trim());
     const found = cached.filter(t => ids.includes(t.id_str) || ids.includes(String(t.id)));
     return res.status(200).json(found.map(t => sanitizeTweet(t)));
   }
@@ -788,12 +764,12 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, res) => {
-  const query = req.query.q || "";
+  const rawQuery = req.query.q || "";
+  const query = decodeURIComponent(rawQuery).trim().toLowerCase();
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  const qLower = query.toLowerCase();
-  const matching = query.trim() !== '' ? allTweets.filter(t => t.text?.toLowerCase().includes(qLower)) : allTweets;
+  const matching = query !== '' ? allTweets.filter(t => t.text?.toLowerCase().includes(query)) : allTweets;
   const statuses = (matching.length > 0 ? matching : allTweets).slice(0, 15).map(t => sanitizeTweet(t));
   const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
 
@@ -811,13 +787,13 @@ app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, 
 });
 
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
-  const query = req.query.q || "";
+  const rawQuery = req.query.q || "";
+  const query = decodeURIComponent(rawQuery).trim().toLowerCase();
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
   const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
-  const qLower = query.toLowerCase();
-  const matchingStatuses = allTweets.filter(t => t.text?.toLowerCase().includes(qLower)).slice(0, 5);
+  const matchingStatuses = allTweets.filter(t => query === '' || t.text?.toLowerCase().includes(query)).slice(0, 5);
 
   return res.status(200).json({
     users: users,
@@ -826,28 +802,30 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// ROBUST SEARCH ENDPOINT WITH EXPLICIT REFRESH URL AND TERMINATION TO STOP LOOPS
+// ROBUST SEARCH ENDPOINT WITH DECODED QUERY & EXPLICIT PAGINATION TERMINATION
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
-  const query = req.query.q || "";
+  const rawQuery = req.query.q || "";
+  const query = decodeURIComponent(rawQuery).trim();
+  const qLower = query.toLowerCase();
+
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
   let results = allTweets;
-  const qLower = query.toLowerCase();
-
-  if (query.trim() !== '') {
-    results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
+  if (query !== '') {
+    results = allTweets.filter(t => t.text && t.text.toLowerCase().includes(qLower));
   }
 
-  const finalStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
+  const finalStatuses = (results.length > 0 ? results : allTweets).slice(0, 20).map(t => sanitizeTweet(t));
 
   return res.status(200).json({
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
       count: finalStatuses.length,
+      query: query,
       refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`,
-      next_results: null
+      next_results: null // Terminates search looping
     }
   });
 });
@@ -887,11 +865,12 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
+// Corrected schemas for DMs and Activity to prevent C# deserialization crashes
 app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
-app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
+app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json({ direct_messages: [] }));
+app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json({ direct_messages: [] }));
+app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json({ activities: [] }));
 
 app.all('*', (req, res) => {
   const path = req.path;
