@@ -14,8 +14,15 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// Detailed Request Logger to capture every call from the Lumia client
 app.use((req, res, next) => {
-  console.log(`[XitterBridge] ${req.method} ${req.path}`);
+  console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
+  if (Object.keys(req.query).length > 0) {
+    console.log(`  Query Params:`, JSON.stringify(req.query));
+  }
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log(`  Body:`, JSON.stringify(req.body));
+  }
   next();
 });
 
@@ -539,6 +546,7 @@ async function backgroundScrape() {
       await appendCachedTimelineToWorker(parsedTweets);
     }
   } catch (err) {
+    console.error('[backgroundScrape] Error:', err);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
@@ -774,6 +782,7 @@ app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json([]));
 
 app.all('/1.1/*', (req, res) => {
   const path = req.path;
+  console.log(`[XitterBridge] Unhandled endpoint hit: ${path}`);
   if (path.includes('/ids')) {
     return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   }
@@ -781,6 +790,15 @@ app.all('/1.1/*', (req, res) => {
     return res.status(200).json([]);
   }
   return res.status(200).json({});
+});
+
+// Global Error Handler Middleware: Logs exact crash stack to Render console and returns clean API error JSON
+app.use((err, req, res, next) => {
+  console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
+  console.error(err.stack || err);
+  res.status(200).json({
+    errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") }]
+  });
 });
 
 const PORT = process.env.PORT || 3000;
