@@ -56,6 +56,15 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
+function safeString(val, fallback = null) {
+  if (!val) return fallback;
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object') {
+    return val.expanded_url || val.url || val.string_value || fallback;
+  }
+  return String(val);
+}
+
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -214,9 +223,9 @@ async function backgroundScrape() {
                 userLegacy = findUser(obj) || userLegacy;
               }
 
-              const screenName = (userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user') ? userLegacy.screen_name : 'danieldoodl5802';
-              const name = (userLegacy?.name && userLegacy.name !== 'twitter_user') ? userLegacy.name : screenName;
-              const avatar = userLegacy?.profile_image_url_https || defaultUser.profile_image_url_https;
+              const screenName = safeString(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : null, 'danieldoodl5802');
+              const name = safeString(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : null, screenName);
+              const avatar = safeString(userLegacy?.profile_image_url_https, defaultUser.profile_image_url_https);
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
               const userIdStr = restId || userId.toString();
 
@@ -231,35 +240,38 @@ async function backgroundScrape() {
                   }
                 }
                 if (cardImgUrl) {
-                  if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
-                  cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=large';
-                  const httpUrl = cardImgUrl.replace('https://', 'http://');
-                  extendedEntities = {
-                    media: [{
-                      id: Date.now(),
-                      id_str: Date.now().toString(),
-                      indices: [0, 0],
-                      media_url: httpUrl,
-                      media_url_https: httpUrl,
-                      url: 'http://t.co/card',
-                      display_url: 'pic.x.com/card',
-                      expanded_url: cardImgUrl,
-                      type: 'photo',
-                      sizes: {
-                        thumb: { w: 150, h: 150, resize: 'crop' },
-                        small: { w: 680, h: 680, resize: 'fit' },
-                        medium: { w: 1200, h: 1200, resize: 'fit' },
-                        large: { w: 2048, h: 2048, resize: 'fit' }
-                      }
-                    }]
-                  };
-                  entities.media = extendedEntities.media;
+                  cardImgUrl = safeString(cardImgUrl);
+                  if (cardImgUrl) {
+                    if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
+                    cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=large';
+                    const httpUrl = cardImgUrl.replace('https://', 'http://');
+                    extendedEntities = {
+                      media: [{
+                        id: Date.now(),
+                        id_str: Date.now().toString(),
+                        indices: [0, 0],
+                        media_url: httpUrl,
+                        media_url_https: httpUrl,
+                        url: 'http://t.co/card',
+                        display_url: 'pic.x.com/card',
+                        expanded_url: cardImgUrl,
+                        type: 'photo',
+                        sizes: {
+                          thumb: { w: 150, h: 150, resize: 'crop' },
+                          small: { w: 680, h: 680, resize: 'fit' },
+                          medium: { w: 1200, h: 1200, resize: 'fit' },
+                          large: { w: 2048, h: 2048, resize: 'fit' }
+                        }
+                      }]
+                    };
+                    entities.media = extendedEntities.media;
+                  }
                 }
               }
 
               if (extendedEntities && extendedEntities.media) {
                 extendedEntities.media = extendedEntities.media.map(m => {
-                  let mUrl = m.media_url_https || m.media_url || '';
+                  let mUrl = safeString(m.media_url_https || m.media_url, '');
                   if (mUrl.startsWith('//')) mUrl = 'https:' + mUrl;
                   mUrl = mUrl.split('?')[0] + '?format=jpg&name=large';
                   const httpUrl = mUrl.replace('https://', 'http://');
@@ -269,10 +281,10 @@ async function backgroundScrape() {
                     indices: m.indices || [0, 0],
                     media_url: httpUrl,
                     media_url_https: httpUrl,
-                    url: m.url || '',
-                    display_url: m.display_url || '',
-                    expanded_url: m.expanded_url || '',
-                    type: m.type || 'photo',
+                    url: safeString(m.url, ''),
+                    display_url: safeString(m.display_url, ''),
+                    expanded_url: safeString(m.expanded_url, ''),
+                    type: safeString(m.type, 'photo'),
                     sizes: m.sizes || {
                       thumb: { w: 150, h: 150, resize: 'crop' },
                       small: { w: 680, h: 680, resize: 'fit' },
@@ -286,22 +298,21 @@ async function backgroundScrape() {
 
               const tweetIdStr = legacy.id_str || Date.now().toString();
               
-              // STRICTLY REAL METRICS: No random numbers or fake fallbacks. Extracts exact API counts or defaults to 0.
               const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 0);
               const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? obj.card?.binding_values?.retweet_count ?? 0);
 
               parsedTweets.push({
-                created_at: legacy.created_at || new Date().toUTCString(),
+                created_at: safeString(legacy.created_at, new Date().toUTCString()),
                 id: parseInt(tweetIdStr.slice(-12)) || Date.now(),
                 id_str: tweetIdStr,
-                text: legacy.full_text || legacy.text || "",
+                text: safeString(legacy.full_text || legacy.text, ''),
                 source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
                 truncated: false,
                 in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-                in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                in_reply_to_status_id_str: safeString(legacy.in_reply_to_status_id_str),
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-                in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-                in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+                in_reply_to_user_id_str: safeString(legacy.in_reply_to_user_id_str),
+                in_reply_to_screen_name: safeString(legacy.in_reply_to_screen_name),
                 user_id: userId,
                 user_id_str: userIdStr,
                 user: {
@@ -309,30 +320,30 @@ async function backgroundScrape() {
                   id_str: userIdStr,
                   name: name,
                   screen_name: screenName,
-                  location: userLegacy?.location || "",
-                  description: userLegacy?.description || "",
-                  url: userLegacy?.url || null,
-                  protected: userLegacy?.protected || false,
-                  verified: userLegacy?.verified || false,
-                  followers_count: userLegacy?.followers_count || 100,
-                  friends_count: userLegacy?.friends_count || 100,
-                  listed_count: userLegacy?.listed_count || 0,
-                  created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
-                  favourites_count: userLegacy?.favourites_count || 100,
-                  statuses_count: userLegacy?.statuses_count || 100,
+                  location: safeString(userLegacy?.location, ''),
+                  description: safeString(userLegacy?.description, ''),
+                  url: safeString(userLegacy?.url, null),
+                  protected: !!userLegacy?.protected,
+                  verified: !!userLegacy?.verified,
+                  followers_count: Number(userLegacy?.followers_count ?? 100),
+                  friends_count: Number(userLegacy?.friends_count ?? 100),
+                  listed_count: Number(userLegacy?.listed_count ?? 0),
+                  created_at: safeString(userLegacy?.created_at, "Wed Oct 10 00:00:00 +0000 2026"),
+                  favourites_count: Number(userLegacy?.favourites_count ?? 100),
+                  statuses_count: Number(userLegacy?.statuses_count ?? 100),
                   profile_image_url: avatar.replace('https://', 'http://'),
                   profile_image_url_https: avatar.replace('https://', 'http://'),
-                  profile_banner_url: userLegacy?.profile_banner_url || null,
-                  default_profile: userLegacy?.default_profile || false,
-                  default_profile_image: userLegacy?.default_profile_image || false
+                  profile_banner_url: safeString(userLegacy?.profile_banner_url, null),
+                  default_profile: !!userLegacy?.default_profile,
+                  default_profile_image: !!userLegacy?.default_profile_image
                 },
                 entities: entities,
                 extended_entities: extendedEntities,
-                favorited: legacy.favorited || false,
-                retweeted: legacy.retweeted || false,
+                favorited: !!legacy.favorited,
+                retweeted: !!legacy.retweeted,
                 retweet_count: retCount,
                 favorite_count: favCount,
-                lang: legacy.lang || "en"
+                lang: safeString(legacy.lang, 'en')
               });
             }
 
