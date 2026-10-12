@@ -56,66 +56,6 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-function extractAuthor(tweetResult, tweetObj) {
-  const possibleUserRes = [
-    tweetResult?.core?.user_results?.result,
-    tweetResult?.tweet?.core?.user_results?.result,
-    tweetResult?.user_results?.result,
-    tweetObj?.core?.user_results?.result,
-    tweetObj?.user_results?.result
-  ];
-
-  for (const uRes of possibleUserRes) {
-    if (uRes) {
-      const legacy = uRes.legacy || uRes;
-      const screenName = legacy?.screen_name || uRes?.screen_name;
-      if (screenName && screenName.toLowerCase() !== 'twitter' && screenName.toLowerCase() !== 'x') {
-        const userIdStr = uRes.rest_id || uRes.id_str || legacy?.id_str || generateUniqueUserId(screenName).toString();
-        const avatarHttps = legacy?.profile_image_url_https || uRes?.profile_image_url_https || defaultUser.profile_image_url_https;
-        return {
-          id: parseInt(userIdStr) || generateUniqueUserId(screenName),
-          id_str: userIdStr,
-          name: legacy?.name || uRes?.name || screenName,
-          screen_name: screenName,
-          profile_image_url_https: avatarHttps,
-          profile_image_url: avatarHttps.replace('https://', 'http://')
-        };
-      }
-    }
-  }
-
-  function searchNode(node) {
-    if (!node || typeof node !== 'object') return null;
-    if (node.screen_name && node.screen_name.toLowerCase() !== 'twitter' && (node.followers_count !== undefined || node.name)) {
-      return node;
-    }
-    for (const key of Object.keys(node)) {
-      if (typeof node[key] === 'object' && node[key] !== null) {
-        const res = searchNode(node[key]);
-        if (res) return res;
-      }
-    }
-    return null;
-  }
-
-  const found = searchNode(tweetResult);
-  if (found && found.screen_name) {
-    const screenName = found.screen_name;
-    const userIdStr = found.rest_id || found.id_str || generateUniqueUserId(screenName).toString();
-    const avatarHttps = found.profile_image_url_https || defaultUser.profile_image_url_https;
-    return {
-      id: parseInt(userIdStr) || generateUniqueUserId(screenName),
-      id_str: userIdStr,
-      name: found.name || screenName,
-      screen_name: screenName,
-      profile_image_url_https: avatarHttps,
-      profile_image_url: avatarHttps.replace('https://', 'http://')
-    };
-  }
-
-  return null;
-}
-
 async function saveTokensToWorker(authToken, ct0Token) {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -165,8 +105,8 @@ async function appendCachedTimelineToWorker(newTweets) {
   try {
     const existing = await getCachedTimelineFromWorker();
     const map = new Map();
-    existing.forEach(t => map.set(t.id_str, t));
-    newTweets.forEach(t => map.set(t.id_str, t));
+    existing.forEach(t => map.set(t.id_str || t.id, t));
+    newTweets.forEach(t => map.set(t.id_str || t.id, t));
     const merged = Array.from(map.values()).sort((a, b) => {
       try {
         return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
@@ -178,7 +118,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 200))
+      body: JSON.stringify(merged.slice(0, 250))
     });
   } catch (e) {}
 }
@@ -227,123 +167,155 @@ async function backgroundScrape() {
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
-    let parsedTweets = [];
+    console.log('[Puppeteer] Navigating to x.com/home...');
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    page.on('response', async (response) => {
-      try {
-        const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline'))) {
-          const json = await response.json().catch(() => null);
-          if (!json) return;
+    // Scroll down to load more content
+    try {
+      await page.evaluate(() => window.scrollBy(0, 1200));
+    } catch (e) {}
+    await new Promise((resolve) => setTimeout(resolve, 4000));
 
-          const instructions = json?.data?.home?.home_timeline_urt?.instructions || [];
-          
-          for (const instr of instructions) {
-            if (instr.type === 'TimelineAddEntries') {
-              instr.entries?.forEach((entry, idx) => {
-                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
-                const tweetObj = tweetResult?.tweet || tweetResult;
-                const legacy = tweetObj?.legacy;
+    // Robust DOM scraping of actual timeline tweets and media
+    const scrapedTweets = await page.evaluate(() => {
+      const articles = document.querySelectorAll('article[data-testid="tweet"]');
+      const results = [];
+      
+      articles.forEach((article, idx) => {
+        try {
+          const textEl = article.querySelector('[data-testid="tweetText"]');
+          const text = textEl ? textEl.innerText : '';
 
-                if (!legacy) return;
+          let name = 'Twitter User';
+          let screenName = 'twitter_user';
+          let avatarUrl = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
 
-                const author = extractAuthor(tweetResult, tweetObj);
-                if (!author) return;
+          const userCell = article.querySelector('[data-testid="User-Name"]');
+          if (userCell) {
+            const spans = userCell.querySelectorAll('span');
+            for (const span of spans) {
+              const txt = span.innerText;
+              if (txt && txt.startsWith('@')) {
+                screenName = txt.replace('@', '').trim();
+                break;
+              }
+            }
+            const firstSpan = userCell.querySelector('span');
+            if (firstSpan) name = firstSpan.innerText;
+          }
 
-                let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
-                let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
+          const avatarImg = article.querySelector('img[src*="profile_images"]');
+          if (avatarImg) avatarUrl = avatarImg.src;
 
-                if (extendedEntities && extendedEntities.media) {
-                  extendedEntities.media = extendedEntities.media.map(m => {
-                    const httpsUrl = m.media_url_https || m.media_url || '';
-                    const httpUrl = httpsUrl ? httpsUrl.replace('https://', 'http://') : m.media_url;
-                    return {
-                      id: m.id ? parseInt(m.id) : Date.now(),
-                      id_str: m.id_str || (m.id ? m.id.toString() : Date.now().toString()),
-                      indices: m.indices || [0, 0],
-                      media_url: httpUrl,
-                      media_url_https: httpUrl, // Forced HTTP to prevent Windows Phone SSL/TLS handshake errors on expand
-                      url: m.url || '',
-                      display_url: m.display_url || '',
-                      expanded_url: m.expanded_url || '',
-                      type: m.type || 'photo',
-                      sizes: m.sizes || {
-                        thumb: { w: 150, h: 150, resize: 'crop' },
-                        small: { w: 680, h: 680, resize: 'fit' },
-                        medium: { w: 1200, h: 1200, resize: 'fit' },
-                        large: { w: 2048, h: 2048, resize: 'fit' }
-                      }
-                    };
-                  });
-                  entities.media = extendedEntities.media;
+          const mediaImgs = article.querySelectorAll('img[src*="media"]');
+          const mediaList = [];
+          mediaImgs.forEach((img, mi) => {
+            const mUrl = img.src;
+            if (mUrl && !mUrl.includes('profile_images')) {
+              mediaList.push({
+                id: Date.now() + mi,
+                id_str: (Date.now() + mi).toString(),
+                media_url: mUrl.replace('https://', 'http://'),
+                media_url_https: mUrl.replace('https://', 'http://'), // Force HTTP for Windows Phone SSL compatibility
+                type: 'photo',
+                sizes: {
+                  thumb: { w: 150, h: 150, resize: 'crop' },
+                  small: { w: 680, h: 680, resize: 'fit' },
+                  medium: { w: 1200, h: 1200, resize: 'fit' },
+                  large: { w: 2048, h: 2048, resize: 'fit' }
                 }
-
-                parsedTweets.push({
-                  created_at: legacy.created_at || new Date().toUTCString(),
-                  id: legacy.id_str ? parseInt(legacy.id_str) : Date.now() + idx,
-                  id_str: legacy.id_str || (Date.now() + idx).toString(),
-                  text: legacy.full_text || legacy.text || "",
-                  source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-                  truncated: false,
-                  in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-                  in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-                  in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-                  in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-                  in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                  user_id: author.id,
-                  user_id_str: author.id_str,
-                  user: {
-                    id: author.id,
-                    id_str: author.id_str,
-                    name: author.name,
-                    screen_name: author.screen_name,
-                    location: "",
-                    description: "",
-                    url: null,
-                    protected: false,
-                    verified: false,
-                    followers_count: 100,
-                    friends_count: 100,
-                    listed_count: 0,
-                    created_at: "Wed Oct 10 00:00:00 +0000 2026",
-                    favourites_count: 100,
-                    statuses_count: 100,
-                    profile_image_url: author.profile_image_url,
-                    profile_image_url_https: author.profile_image_url,
-                    profile_banner_url: null,
-                    default_profile: false,
-                    default_profile_image: false
-                  },
-                  geo: null,
-                  coordinates: null,
-                  place: null,
-                  contributors: null,
-                  is_quote_status: legacy.is_quote_status || false,
-                  retweet_count: legacy.retweet_count || 0,
-                  favorite_count: legacy.favorite_count || 0,
-                  entities: entities,
-                  extended_entities: extendedEntities,
-                  favorited: legacy.favorited || false,
-                  retweeted: legacy.retweeted || false,
-                  lang: legacy.lang || "en"
-                });
               });
             }
+          });
+
+          // Generate stable ID based on text/author combo or timestamp
+          const uniqueString = screenName + text.substring(0, 20);
+          let hash = 0;
+          for (let i = 0; i < uniqueString.length; i++) {
+            hash = (hash << 5) - hash + uniqueString.charCodeAt(i);
+            hash |= 0;
           }
-        }
-      } catch (e) {}
+          const baseId = Math.abs(hash) + 1800000000000000000n;
+          const tweetIdStr = baseId.toString();
+
+          results.push({
+            created_at: new Date().toUTCString(),
+            id: Number(baseId % 900000000000000000n),
+            id_str: tweetIdStr,
+            text: text,
+            source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+            name: name,
+            screen_name: screenName,
+            avatar: avatarUrl.replace('https://', 'http://'),
+            media: mediaList
+          });
+        } catch (err) {}
+      });
+
+      return results;
     });
 
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    try { await page.evaluate(() => window.scrollBy(0, 800)); } catch (e) {}
-    await new Promise((resolve) => setTimeout(resolve, 4000));
     await browser.close();
 
-    if (parsedTweets.length > 0) {
-      await appendCachedTimelineToWorker(parsedTweets);
+    if (scrapedTweets && scrapedTweets.length > 0) {
+      const formatted = scrapedTweets.map(t => {
+        const userId = generateUniqueUserId(t.screen_name);
+        const userIdStr = userId.toString();
+        const entities = { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+        let extendedEntities = undefined;
+
+        if (t.media && t.media.length > 0) {
+          entities.media = t.media;
+          extendedEntities = { media: t.media };
+        }
+
+        return {
+          created_at: t.created_at,
+          id: t.id,
+          id_str: t.id_str,
+          text: t.text,
+          source: t.source,
+          truncated: false,
+          user_id: userId,
+          user_id_str: userIdStr,
+          user: {
+            id: userId,
+            id_str: userIdStr,
+            name: t.name,
+            screen_name: t.screen_name,
+            location: "",
+            description: "",
+            url: null,
+            protected: false,
+            verified: false,
+            followers_count: 100,
+            friends_count: 100,
+            listed_count: 0,
+            created_at: "Wed Oct 10 00:00:00 +0000 2026",
+            favourites_count: 100,
+            statuses_count: 100,
+            profile_image_url: t.avatar,
+            profile_image_url_https: t.avatar,
+            profile_banner_url: null,
+            default_profile: false,
+            default_profile_image: false
+          },
+          entities: entities,
+          extended_entities: extendedEntities,
+          favorited: false,
+          retweeted: false,
+          lang: "en"
+        };
+      });
+
+      await appendCachedTimelineToWorker(formatted);
+      console.log(`[Puppeteer DOM Scraper] Successfully cached ${formatted.length} tweets with correct authors & images.`);
+    } else {
+      console.log('[Puppeteer DOM Scraper] 0 tweets found in DOM.');
     }
   } catch (err) {
+    console.error('[Puppeteer Error]', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
@@ -438,14 +410,13 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
   return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
 
-// Fully fixed timeline with since_id and max_id support for infinite scroll & refresh
+// Fully fixed home timeline with proper pagination and deduplication
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
 
   let timeline = [...localTimeline, ...cachedTweets];
   
-  // Deduplicate
   const uniqueMap = new Map();
   timeline.forEach(t => uniqueMap.set(t.id_str || t.id, t));
   timeline = Array.from(uniqueMap.values()).sort((a, b) => {
@@ -483,13 +454,32 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 
-// Fixed status show endpoint so clicking tweets and images loads the correct record instead of a fallback
+// Fixed status show endpoint so clicking tweets and images loads the exact record
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   const found = allTweets.find(t => (t.id_str === tweetId) || (t.id.toString() === tweetId));
-  return res.status(200).json(found || localTimeline[0] || defaultUser);
+  
+  if (found) {
+    return res.status(200).json(found);
+  }
+
+  // Fallback builder if tweet ID isn't found in cache yet
+  return res.status(200).json({
+    created_at: new Date().toUTCString(),
+    id: parseInt(tweetId) || Date.now(),
+    id_str: tweetId,
+    text: "Loaded from Windows Phone bridge",
+    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    truncated: false,
+    user: defaultUser,
+    retweet_count: 0,
+    favorite_count: 0,
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+    favorited: false,
+    retweeted: false
+  });
 });
 
 app.post('/1.1/statuses/update.json', (req, res) => {
