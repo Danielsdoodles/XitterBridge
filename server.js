@@ -56,18 +56,21 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Deep search helper to find user_results anywhere inside a GraphQL tweet object
-function findUserResults(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  if (obj.user_results?.result) return obj.user_results.result;
-  if (obj.core?.user_results?.result) return obj.core.user_results.result;
+// Deep search to extract screen_name and name anywhere in the GraphQL entry
+function extractAuthorInfo(entry) {
+  try {
+    const str = JSON.stringify(entry);
+    const screenNameMatch = str.match(/"screen_name":"([^"]+)"/);
+    const nameMatch = str.match(/"name":"([^"]+)"/);
+    const avatarMatch = str.match(/"profile_image_url_https":"([^"]+)"/);
 
-  for (const key of Object.keys(obj)) {
-    if (typeof obj[key] === 'object' && obj[key] !== null) {
-      const res = findUserResults(obj[key]);
-      if (res) return res;
+    if (screenNameMatch && screenNameMatch[1]) {
+      const handle = screenNameMatch[1];
+      const name = (nameMatch && nameMatch[1]) ? nameMatch[1] : handle;
+      const avatar = (avatarMatch && avatarMatch[1]) ? avatarMatch[1] : defaultUser.profile_image_url_https;
+      return { handle, name, avatar };
     }
-  }
+  } catch (e) {}
   return null;
 }
 
@@ -198,25 +201,23 @@ async function backgroundScrape() {
           for (const instr of instructions) {
             if (instr.type === 'TimelineAddEntries') {
               instr.entries?.forEach((entry, idx) => {
-                const itemContent = entry?.content?.itemContent;
-                const tweetResult = itemContent?.tweet_results?.result;
+                const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
                 const tweetObj = tweetResult?.tweet || tweetResult;
                 const legacy = tweetObj?.legacy;
 
                 if (!legacy) return;
 
-                // Use recursive deep lookup to guarantee finding real author metadata
-                const userResults = findUserResults(tweetResult) || findUserResults(itemContent);
-                const userLegacy = userResults?.legacy;
+                // Extract author information using string regex search
+                const authorInfo = extractAuthorInfo(entry);
+                if (!authorInfo) return;
 
-                if (!userLegacy || !userLegacy.screen_name) return;
+                const authorScreenName = authorInfo.handle;
+                const authorName = authorInfo.name;
+                const authorUserId = generateUniqueUserId(authorScreenName);
+                const authorUserIdStr = authorUserId.toString();
+                const authorAvatar = authorInfo.avatar;
 
-                const authorScreenName = userLegacy.screen_name;
-                const authorName = userLegacy.name || authorScreenName;
-                const authorRestId = userResults?.rest_id || userResults?.id;
-                const authorUserId = authorRestId ? parseInt(authorRestId) : generateUniqueUserId(authorScreenName);
-                const authorUserIdStr = authorRestId || authorUserId.toString();
-                const authorAvatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
+                console.log(`[Author Extracted] @${authorScreenName} (${authorName})`);
 
                 let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
                 let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -265,22 +266,22 @@ async function backgroundScrape() {
                     id_str: authorUserIdStr,
                     name: authorName,
                     screen_name: authorScreenName,
-                    location: userLegacy?.location || "",
-                    description: userLegacy?.description || "",
-                    url: userLegacy?.url || null,
-                    protected: userLegacy?.protected || false,
-                    verified: userLegacy?.verified || false,
-                    followers_count: userLegacy?.followers_count || 0,
-                    friends_count: userLegacy?.friends_count || 0,
-                    listed_count: userLegacy?.listed_count || 0,
-                    created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
-                    favourites_count: userLegacy?.favourites_count || 0,
-                    statuses_count: userLegacy?.statuses_count || 0,
+                    location: "",
+                    description: "",
+                    url: null,
+                    protected: false,
+                    verified: false,
+                    followers_count: 100,
+                    friends_count: 100,
+                    listed_count: 0,
+                    created_at: "Wed Oct 10 00:00:00 +0000 2026",
+                    favourites_count: 100,
+                    statuses_count: 100,
                     profile_image_url: authorAvatar.replace('https://', 'http://'),
                     profile_image_url_https: authorAvatar,
-                    profile_banner_url: userLegacy?.profile_banner_url || null,
-                    default_profile: userLegacy?.default_profile || false,
-                    default_profile_image: userLegacy?.default_profile_image || false
+                    profile_banner_url: null,
+                    default_profile: false,
+                    default_profile_image: false
                   },
                   geo: null,
                   coordinates: null,
@@ -375,10 +376,11 @@ app.get('/1.1/users/show.json', async (req, res) => {
   }
 
   if (screenName) {
+    const uid = generateUniqueUserId(screenName);
     return res.status(200).json({
       ...defaultUser,
-      id: generateUniqueUserId(screenName),
-      id_str: generateUniqueUserId(screenName).toString(),
+      id: uid,
+      id_str: uid.toString(),
       name: screenName,
       screen_name: screenName
     });
@@ -400,10 +402,11 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
       if (match && match.user) {
         matchedUsers.push(match.user);
       } else {
+        const uid = generateUniqueUserId(name);
         matchedUsers.push({
           ...defaultUser,
-          id: generateUniqueUserId(name),
-          id_str: generateUniqueUserId(name).toString(),
+          id: uid,
+          id_str: uid.toString(),
           name: name,
           screen_name: name
         });
