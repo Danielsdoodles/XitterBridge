@@ -230,7 +230,6 @@ function sanitizeTweet(t) {
     favorited: !!t.favorited,
     retweeted: !!t.retweeted,
     lang: langVal,
-    // CRITICAL FIX: Windows Phone search and timeline XAML templates require metadata to render correctly without white screens
     metadata: {
       result_type: "recent",
       iso_language_code: langVal
@@ -688,7 +687,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: CONVERSATION ENDPOINT HANDLES BOTH PATH PARAMS AND QUERY PARAMS (?id=...) RETURNING A PURE JSON ARRAY
+// FULLY ROBUST CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH PATH & QUERY PARAMS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -715,7 +714,17 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
   });
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-  return res.status(200).json(statuses);
+
+  // Return dual wrapper object containing both pure array and graph dictionaries for C# client compatibility
+  return res.status(200).json({
+    statuses: statuses,
+    conversation: statuses,
+    descendants: replies.map(r => sanitizeTweet(r)),
+    globalObjects: {
+      tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
+      users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
+    }
+  });
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -806,6 +815,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
+// FULLY FIXED SEARCH ENDPOINT WITH METADATA-INJECTED TWEETS TO STOP WHITE SCREENS
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
