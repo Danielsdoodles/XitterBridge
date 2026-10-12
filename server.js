@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Global Rate Limit & Access Headers required by Windows Phone client state machine
+// Comprehensive Debug Logging & Required WP Rate Limit Headers
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -23,9 +23,12 @@ app.use((req, res, next) => {
   res.setHeader('X-Access-Level', 'read-write');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   
-  console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
+  console.log(`[XitterBridge REQUEST] ${req.method} ${req.originalUrl || req.url}`);
   if (Object.keys(req.query).length > 0) {
-    console.log(`  Query Params:`, JSON.stringify(req.query));
+    console.log(`  Query:`, JSON.stringify(req.query));
+  }
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log(`  Body:`, JSON.stringify(req.body));
   }
   next();
 });
@@ -109,7 +112,6 @@ function cleanStr(val) {
   return null;
 }
 
-// CRITICAL FIX: Force all image URLs to http:// to prevent WP TLS handshake failures and blank white screens
 function forceHttp(url) {
   if (!url) return '';
   let str = cleanStr(url);
@@ -173,7 +175,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
@@ -192,7 +194,6 @@ function sanitizeTweet(t) {
   if (!t || typeof t !== 'object') return t;
   
   const idStr = cleanStr(t.id_str) || String(t.id || Date.now());
-  // Preserve full ID mapping safely for C# Int64 / long models
   let safeId = 123456789;
   try {
     safeId = Number(idStr) || 123456789;
@@ -221,15 +222,17 @@ function sanitizeTweet(t) {
   }
 
   const langVal = cleanStr(t.lang) || 'en';
+  const textVal = cleanStr(t.text) || cleanStr(t.full_text) || '';
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
     id: safeId,
     id_str: idStr,
-    text: cleanStr(t.text) || '',
+    text: textVal,
+    full_text: textVal, // Satisfy extended client format
     source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-    truncated: !!t.truncated,
+    truncated: false,
     in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
     in_reply_to_status_id_str: replyIdStr,
     in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
@@ -685,7 +688,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// BULLETPROOF CONVERSATION THREAD ENDPOINT (SUPPORTS BOTH ARRAY AND OBJECT DESERIALIZERS)
+// MULTI-SUPPORT CONVERSATION ENDPOINT (SUPPORTS BOTH ARRAY AND GRAPH OBJECTS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -698,6 +701,7 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
       id: tweetId,
       id_str: String(tweetId).replace('.json', ''),
       text: "Thread parent loaded from bridge cache",
+      full_text: "Thread parent loaded from bridge cache",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser,
       retweet_count: 0,
@@ -713,7 +717,6 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
 
-  // Return dual wrapper object supporting both collection lists and graph dictionaries
   return res.status(200).json({
     statuses: statuses,
     conversation: statuses,
@@ -737,6 +740,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
       id: tweetId,
       id_str: String(tweetId).replace('.json', ''),
       text: "Status detail loaded from bridge",
+      full_text: "Status detail loaded from bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
     };
@@ -774,7 +778,7 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
 
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-app.get(['/1.1/search/universal.json', '/1/search/universal.json'], async (req, res) => {
+app.get(['/1.1/search/universal.json', '/1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim().toLowerCase();
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -853,6 +857,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     id: Date.now().toString(),
     id_str: Date.now().toString(),
     text: tweetText,
+    full_text: tweetText,
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     in_reply_to_status_id: inReplyToStatusId || null,
