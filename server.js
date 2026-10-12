@@ -56,7 +56,6 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Deep recursive scanner to extract all user objects and tweet entries in the payload
 function parseGraphQLPayload(json) {
   const usersMap = {};
   const tweetsList = [];
@@ -64,7 +63,6 @@ function parseGraphQLPayload(json) {
   function walk(node) {
     if (!node || typeof node !== 'object') return;
 
-    // Collect user profile data
     if (node.__typename === 'User' || (node.screen_name && node.name)) {
       const legacy = node.legacy || node;
       const screenName = legacy.screen_name || node.screen_name;
@@ -81,7 +79,6 @@ function parseGraphQLPayload(json) {
       }
     }
 
-    // Collect tweet items
     if (node.legacy && (node.legacy.full_text || node.legacy.text)) {
       tweetsList.push(node);
     }
@@ -225,7 +222,6 @@ async function backgroundScrape() {
             const legacy = tweetObj.legacy;
             if (!legacy) return;
 
-            // Resolve user metadata by user_id_str or nested core node
             const userIdStr = legacy.user_id_str || tweetObj.core?.user_results?.result?.rest_id;
             let author = usersMap[userIdStr];
 
@@ -243,8 +239,6 @@ async function backgroundScrape() {
             }
 
             if (!author) return;
-
-            console.log(`[Author Extracted] @${author.screen_name} (${author.name})`);
 
             let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
             let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -447,7 +441,23 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
-  return res.status(200).json([...localTimeline, ...cachedTweets]);
+
+  let timeline = [...localTimeline, ...cachedTweets];
+  const maxId = req.query.max_id;
+
+  if (maxId) {
+    const maxIdNum = BigInt(maxId);
+    timeline = timeline.filter(tweet => {
+      try {
+        const tweetIdNum = BigInt(tweet.id_str || tweet.id);
+        return tweetIdNum < maxIdNum;
+      } catch (e) {
+        return true;
+      }
+    });
+  }
+
+  return res.status(200).json(timeline);
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
