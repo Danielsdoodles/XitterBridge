@@ -705,43 +705,35 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// CRITICAL FIX: Windows Phone Legacy Conversation Schema Fix
+// CRITICAL FIX: Return conversation thread as a standard JSON array containing parent tweet + replies
 app.get(['/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  // Find parent tweet and any child replies
-  const parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
+  let parentTweet = allTweets.find(t => t.id_str === tweetId || String(t.id) === tweetId);
+  if (!parentTweet) {
+    parentTweet = {
+      created_at: new Date().toUTCString(),
+      id: tweetId,
+      id_str: tweetId,
+      text: "Detailed post loaded from Windows Phone bridge",
+      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+      truncated: false,
+      user: defaultUser,
+      retweet_count: 0,
+      favorite_count: 0,
+      entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+      favorited: false,
+      retweeted: false
+    };
+  }
+
   const replies = allTweets.filter(t => t.in_reply_to_status_id_str === tweetId || String(t.in_reply_to_status_id) === tweetId);
 
-  const cleanParent = parentTweet ? sanitizeTweet(parentTweet) : null;
-  const cleanReplies = replies.map(r => sanitizeTweet(r));
-
-  // Legacy Windows Phone expects both standard array and wrapped instruction objects
-  return res.status(200).json({
-    instructions: [
-      {
-        addEntries: {
-          entries: cleanReplies.map(reply => ({
-            entryId: `tweet-${reply.id_str}`,
-            sortIndex: reply.id_str,
-            content: {
-              item: {
-                content: {
-                  tweet: reply
-                }
-              }
-            }
-          }))
-        }
-      }
-    ],
-    ancestors: cleanParent ? [cleanParent] : [],
-    descendants: cleanReplies,
-    conversation: cleanReplies,
-    statuses: cleanParent ? [cleanParent, ...cleanReplies] : cleanReplies
-  });
+  // Return a JSON array ResponseList containing the parent tweet followed by replies
+  const conversationArray = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+  return res.status(200).json(conversationArray);
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -785,33 +777,36 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
-// Search Handler supporting keywords, to:, and from:
-app.get('/1.1/search/tweets.json', async (req, res) => {
+// Fully functional Search Handler supporting keywords, to:, and from:
+app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const query = req.query.q || "";
   const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
   
-  let results = cachedTweets;
+  let results = allTweets;
   const qLower = query.toLowerCase();
 
   if (qLower.includes('to:')) {
     const match = query.match(/to:([a-zA-Z0-9_]+)/i);
     if (match) {
       const targetUser = match[1].toLowerCase();
-      results = cachedTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser || t.in_reply_to_screen_name?.toLowerCase() === targetUser);
+      results = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser || t.in_reply_to_screen_name?.toLowerCase() === targetUser);
     }
   } else if (qLower.includes('from:')) {
     const match = query.match(/from:([a-zA-Z0-9_]+)/i);
     if (match) {
       const targetUser = match[1].toLowerCase();
-      results = cachedTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser);
+      results = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetUser);
     }
   } else if (query.trim() !== '') {
-    results = cachedTweets.filter(t => t.text?.toLowerCase().includes(qLower));
+    results = allTweets.filter(t => t.text?.toLowerCase().includes(qLower));
   }
 
+  const sanitizedStatuses = (results.length > 0 ? results : allTweets.slice(0, 15)).map(t => sanitizeTweet(t));
+
   return res.status(200).json({
-    statuses: (results.length > 0 ? results : cachedTweets.slice(0, 10)).map(t => sanitizeTweet(t)),
-    search_metadata: { completed_in: 0.025, count: results.length }
+    statuses: sanitizedStatuses,
+    search_metadata: { completed_in: 0.025, count: sanitizedStatuses.length }
   });
 });
 
