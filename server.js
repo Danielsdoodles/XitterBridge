@@ -56,7 +56,6 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-// Guaranteed primitive string converter to prevent C# Dictionary-to-String cast exceptions
 function cleanStr(val) {
   if (val === null || val === undefined) return null;
   if (typeof val === 'string') return val;
@@ -126,15 +125,19 @@ function sanitizeUser(u) {
 function sanitizeTweet(t) {
   if (!t || typeof t !== 'object') return t;
   
-  let entities = t.entities && typeof t.entities === 'object' ? t.entities : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
-  if (Array.isArray(entities.urls)) {
-    entities.urls = entities.urls.map(u => ({
-      url: cleanStr(u.url) || '',
-      expanded_url: cleanStr(u.expanded_url) || '',
-      display_url: cleanStr(u.display_url) || '',
-      indices: Array.isArray(u.indices) ? u.indices : [0, 0]
-    }));
-  }
+  const idStr = cleanStr(t.id_str) || String(t.id || Date.now());
+  const safeId = parseInt(idStr.slice(-9)) || 123456789;
+
+  let entities = t.entities && typeof t.entities === 'object' ? t.entities : {};
+  entities.hashtags = Array.isArray(entities.hashtags) ? entities.hashtags : [];
+  entities.symbols = Array.isArray(entities.symbols) ? entities.symbols : [];
+  entities.user_mentions = Array.isArray(entities.user_mentions) ? entities.user_mentions : [];
+  entities.urls = Array.isArray(entities.urls) ? entities.urls.map(u => ({
+    url: cleanStr(u.url) || '',
+    expanded_url: cleanStr(u.expanded_url) || '',
+    display_url: cleanStr(u.display_url) || '',
+    indices: Array.isArray(u.indices) ? u.indices : [0, 0]
+  })) : [];
   if (Array.isArray(entities.media)) {
     entities.media = entities.media.map(m => sanitizeMedia(m));
   }
@@ -146,26 +149,33 @@ function sanitizeTweet(t) {
 
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
-    id: Number(t.id || Date.now()),
-    id_str: cleanStr(t.id_str) || String(t.id || Date.now()),
+    id: safeId,
+    id_str: idStr,
     text: cleanStr(t.text) || '',
     source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: !!t.truncated,
-    in_reply_to_status_id: t.in_reply_to_status_id ? Number(t.in_reply_to_status_id) : null,
+    in_reply_to_status_id: t.in_reply_to_status_id ? parseInt(String(t.in_reply_to_status_id).slice(-9)) : null,
     in_reply_to_status_id_str: cleanStr(t.in_reply_to_status_id_str),
-    in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
+    in_reply_to_user_id: t.in_reply_to_user_id ? parseInt(String(t.in_reply_to_user_id).slice(-9)) : null,
     in_reply_to_user_id_str: cleanStr(t.in_reply_to_user_id_str),
     in_reply_to_screen_name: cleanStr(t.in_reply_to_screen_name),
     user_id: Number(t.user_id || t.user?.id || 12345678),
     user_id_str: cleanStr(t.user_id_str || t.user?.id_str) || '12345678',
     user: sanitizeUser(t.user),
+    geo: null,
+    coordinates: null,
+    place: null,
+    contributors: null,
+    is_quote_status: !!t.is_quote_status,
+    retweet_count: Number(t.retweet_count ?? 0),
+    favorite_count: Number(t.favorite_count ?? 0),
     entities: entities,
     extended_entities: extendedEntities,
     favorited: !!t.favorited,
     retweeted: !!t.retweeted,
-    retweet_count: Number(t.retweet_count ?? 0),
-    favorite_count: Number(t.favorite_count ?? 0),
-    lang: cleanStr(t.lang) || 'en'
+    lang: cleanStr(t.lang) || 'en',
+    possibly_sensitive: false,
+    filter_level: "medium"
   };
 }
 
@@ -410,14 +420,14 @@ async function backgroundScrape() {
 
               const rawTweet = {
                 created_at: legacy.created_at || new Date().toUTCString(),
-                id: parseInt(tweetIdStr.slice(-12)) || Date.now(),
+                id: tweetIdStr,
                 id_str: tweetIdStr,
                 text: legacy.full_text || legacy.text || "",
                 source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
                 truncated: false,
-                in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
+                in_reply_to_status_id: legacy.in_reply_to_status_id_str || null,
                 in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-                in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
+                in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
                 user_id: userId,
@@ -630,7 +640,7 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   if (!found) {
     found = {
       created_at: new Date().toUTCString(),
-      id: parseInt(tweetId) || Date.now(),
+      id: tweetId,
       id_str: tweetId,
       text: "Detailed post loaded from Windows Phone bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
@@ -669,7 +679,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
   const newTweet = sanitizeTweet({
     created_at: new Date().toUTCString(),
-    id: Date.now(),
+    id: Date.now().toString(),
     id_str: Date.now().toString(),
     text: tweetText,
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
