@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Global Rate Limit & Access Headers required by Windows Phone client state machine
+// Force identity encoding and prevent compression mismatches that crash WP HTTP clients
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -22,11 +22,10 @@ app.use((req, res, next) => {
   res.setHeader('X-Rate-Limit-Reset', String(nowSec + 900));
   res.setHeader('X-Access-Level', 'read-write');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.removeHeader('Transfer-Encoding'); // Force explicit content-length via standard JSON stringify
   
-  console.log(`[XitterBridge DEBUG] ${req.method} ${req.originalUrl || req.url}`);
-  if (Object.keys(req.query).length > 0) {
-    console.log(`  Query Params:`, JSON.stringify(req.query));
-  }
+  console.log(`[XitterBridge] ${req.method} ${req.originalUrl || req.url}`);
   next();
 });
 
@@ -70,7 +69,11 @@ const defaultUser = {
   following: false,
   follow_request_sent: false,
   notifications: false,
-  translator_type: "none"
+  translator_type: "none",
+  entities: {
+    description: { urls: [] },
+    url: { urls: [] }
+  }
 };
 
 let localTimeline = [];
@@ -183,7 +186,8 @@ function sanitizeUser(u) {
     following: false,
     follow_request_sent: false,
     notifications: false,
-    translator_type: "none"
+    translator_type: "none",
+    entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
   };
 }
 
@@ -486,7 +490,8 @@ async function backgroundScrape() {
                   profile_image_url_https: avatar,
                   profile_banner_url: forceHttp(userLegacy?.profile_banner_url),
                   default_profile: userLegacy?.default_profile || false,
-                  default_profile_image: userLegacy?.default_profile_image || false
+                  default_profile_image: userLegacy?.default_profile_image || false,
+                  entities: { description: { urls: [] }, url: { urls: [] } }
                 },
                 entities: entities,
                 extended_entities: extendedEntities,
@@ -661,11 +666,11 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
     } catch (e) {}
   }
 
-  return res.status(200).json(timeline);
+  return res.status(200).send(JSON.stringify(timeline));
 });
 
-app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
+app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).send(JSON.stringify([])));
+app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).send(JSON.stringify(localTimeline.map(t => sanitizeTweet(t)))));
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
@@ -686,7 +691,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// HARDENED CONVERSATION THREAD ENDPOINT (INCLUDES globalObjects DICTIONARY MAPPING)
+// ULTIMATE CONVERSATION ENDPOINT (SUPPORTS PURE ARRAYS, GRAPH OBJECTS, AND WRAPPERS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -715,7 +720,8 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
 
-  return res.status(200).json({
+  // If the client requests an array format or graph format, provide the composite object
+  return res.status(200).send(JSON.stringify({
     statuses: statuses,
     conversation: statuses,
     descendants: replies.map(r => sanitizeTweet(r)),
@@ -723,7 +729,7 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
       tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
       users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
     }
-  });
+  }));
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -815,7 +821,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// FULLY HARDENED SEARCH ENDPOINT WITH EMBEDDED globalObjects TO PREVENT BLANK WHITE XAML SCREENS
+// BULLETPROOF SEARCH ENDPOINT WITH EXPLICIT STRINGIFIED JSON FOR XAML BINDING
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
@@ -835,7 +841,7 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user;
   });
 
-  return res.status(200).json({
+  const responseObject = {
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
@@ -852,7 +858,9 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
       tweets: finalStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
       users: uniqueUsers
     }
-  });
+  };
+
+  return res.status(200).send(JSON.stringify(responseObject));
 });
 
 app.post('/1.1/statuses/update.json', (req, res) => {
