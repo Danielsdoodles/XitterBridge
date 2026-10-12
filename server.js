@@ -56,13 +56,117 @@ function generateUniqueUserId(screenName) {
   return Math.abs(hash) + 800000000;
 }
 
-function safeString(val, fallback = null) {
-  if (!val) return fallback;
+// Guaranteed primitive string converter to prevent C# Dictionary-to-String cast exceptions
+function cleanStr(val) {
+  if (val === null || val === undefined) return null;
   if (typeof val === 'string') return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return String(val);
   if (typeof val === 'object') {
-    return val.expanded_url || val.url || val.string_value || fallback;
+    if (typeof val.expanded_url === 'string') return val.expanded_url;
+    if (typeof val.url === 'string') return val.url;
+    if (typeof val.display_url === 'string') return val.display_url;
+    if (typeof val.string_value === 'string') return val.string_value;
+    if (typeof val.text === 'string') return val.text;
+    if (Array.isArray(val) && val.length > 0) return cleanStr(val[0]);
+    for (const k of Object.keys(val)) {
+      if (typeof val[k] === 'string') return val[k];
+    }
+    return null;
   }
-  return String(val);
+  return null;
+}
+
+function sanitizeMedia(m) {
+  if (!m || typeof m !== 'object') return m;
+  return {
+    id: Number(m.id || Date.now()),
+    id_str: cleanStr(m.id_str) || String(m.id || Date.now()),
+    media_url: cleanStr(m.media_url) || '',
+    media_url_https: cleanStr(m.media_url_https) || cleanStr(m.media_url) || '',
+    url: cleanStr(m.url) || '',
+    display_url: cleanStr(m.display_url) || '',
+    expanded_url: cleanStr(m.expanded_url) || '',
+    type: cleanStr(m.type) || 'photo',
+    indices: Array.isArray(m.indices) ? m.indices : [0, 0],
+    sizes: m.sizes || {
+      thumb: { w: 150, h: 150, resize: 'crop' },
+      small: { w: 680, h: 680, resize: 'fit' },
+      medium: { w: 1200, h: 1200, resize: 'fit' },
+      large: { w: 2048, h: 2048, resize: 'fit' }
+    }
+  };
+}
+
+function sanitizeUser(u) {
+  if (!u || typeof u !== 'object') return defaultUser;
+  return {
+    id: Number(u.id || 12345678),
+    id_str: cleanStr(u.id_str) || '12345678',
+    name: cleanStr(u.name) || 'Daniel',
+    screen_name: cleanStr(u.screen_name) || 'danieldoodl5802',
+    location: cleanStr(u.location),
+    description: cleanStr(u.description),
+    url: cleanStr(u.url),
+    protected: !!u.protected,
+    verified: !!u.verified,
+    followers_count: Number(u.followers_count ?? 100),
+    friends_count: Number(u.friends_count ?? 100),
+    listed_count: Number(u.listed_count ?? 0),
+    created_at: cleanStr(u.created_at) || "Wed Oct 10 00:00:00 +0000 2026",
+    favourites_count: Number(u.favourites_count ?? 100),
+    statuses_count: Number(u.statuses_count ?? 100),
+    profile_image_url: cleanStr(u.profile_image_url)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
+    profile_image_url_https: cleanStr(u.profile_image_url_https)?.replace('https://', 'http://') || 'http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png',
+    profile_banner_url: cleanStr(u.profile_banner_url),
+    default_profile: !!u.default_profile,
+    default_profile_image: !!u.default_profile_image
+  };
+}
+
+function sanitizeTweet(t) {
+  if (!t || typeof t !== 'object') return t;
+  
+  let entities = t.entities && typeof t.entities === 'object' ? t.entities : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+  if (Array.isArray(entities.urls)) {
+    entities.urls = entities.urls.map(u => ({
+      url: cleanStr(u.url) || '',
+      expanded_url: cleanStr(u.expanded_url) || '',
+      display_url: cleanStr(u.display_url) || '',
+      indices: Array.isArray(u.indices) ? u.indices : [0, 0]
+    }));
+  }
+  if (Array.isArray(entities.media)) {
+    entities.media = entities.media.map(m => sanitizeMedia(m));
+  }
+
+  let extendedEntities = t.extended_entities && typeof t.extended_entities === 'object' ? t.extended_entities : undefined;
+  if (extendedEntities && Array.isArray(extendedEntities.media)) {
+    extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
+  }
+
+  return {
+    created_at: cleanStr(t.created_at) || new Date().toUTCString(),
+    id: Number(t.id || Date.now()),
+    id_str: cleanStr(t.id_str) || String(t.id || Date.now()),
+    text: cleanStr(t.text) || '',
+    source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    truncated: !!t.truncated,
+    in_reply_to_status_id: t.in_reply_to_status_id ? Number(t.in_reply_to_status_id) : null,
+    in_reply_to_status_id_str: cleanStr(t.in_reply_to_status_id_str),
+    in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
+    in_reply_to_user_id_str: cleanStr(t.in_reply_to_user_id_str),
+    in_reply_to_screen_name: cleanStr(t.in_reply_to_screen_name),
+    user_id: Number(t.user_id || t.user?.id || 12345678),
+    user_id_str: cleanStr(t.user_id_str || t.user?.id_str) || '12345678',
+    user: sanitizeUser(t.user),
+    entities: entities,
+    extended_entities: extendedEntities,
+    favorited: !!t.favorited,
+    retweeted: !!t.retweeted,
+    retweet_count: Number(t.retweet_count ?? 0),
+    favorite_count: Number(t.favorite_count ?? 0),
+    lang: cleanStr(t.lang) || 'en'
+  };
 }
 
 async function saveTokensToWorker(authToken, ct0Token) {
@@ -101,7 +205,10 @@ async function getCachedTimelineFromWorker() {
 
   try {
     const response = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
-    if (response.ok) return await response.json();
+    if (response.ok) {
+      const data = await response.json();
+      return Array.isArray(data) ? data.map(t => sanitizeTweet(t)) : [];
+    }
   } catch (e) {}
   return [];
 }
@@ -127,7 +234,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 500))
+      body: JSON.stringify(merged.slice(0, 500).map(t => sanitizeTweet(t)))
     });
   } catch (e) {}
 }
@@ -223,9 +330,9 @@ async function backgroundScrape() {
                 userLegacy = findUser(obj) || userLegacy;
               }
 
-              const screenName = safeString(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : null, 'danieldoodl5802');
-              const name = safeString(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : null, screenName);
-              const avatar = safeString(userLegacy?.profile_image_url_https, defaultUser.profile_image_url_https);
+              const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : 'danieldoodl5802');
+              const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
+              const avatar = cleanStr(userLegacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
               const userIdStr = restId || userId.toString();
 
@@ -240,7 +347,7 @@ async function backgroundScrape() {
                   }
                 }
                 if (cardImgUrl) {
-                  cardImgUrl = safeString(cardImgUrl);
+                  cardImgUrl = cleanStr(cardImgUrl);
                   if (cardImgUrl) {
                     if (cardImgUrl.startsWith('//')) cardImgUrl = 'https:' + cardImgUrl;
                     cardImgUrl = cardImgUrl.split('?')[0] + '?format=jpg&name=large';
@@ -271,7 +378,7 @@ async function backgroundScrape() {
 
               if (extendedEntities && extendedEntities.media) {
                 extendedEntities.media = extendedEntities.media.map(m => {
-                  let mUrl = safeString(m.media_url_https || m.media_url, '');
+                  let mUrl = cleanStr(m.media_url_https || m.media_url) || '';
                   if (mUrl.startsWith('//')) mUrl = 'https:' + mUrl;
                   mUrl = mUrl.split('?')[0] + '?format=jpg&name=large';
                   const httpUrl = mUrl.replace('https://', 'http://');
@@ -281,10 +388,10 @@ async function backgroundScrape() {
                     indices: m.indices || [0, 0],
                     media_url: httpUrl,
                     media_url_https: httpUrl,
-                    url: safeString(m.url, ''),
-                    display_url: safeString(m.display_url, ''),
-                    expanded_url: safeString(m.expanded_url, ''),
-                    type: safeString(m.type, 'photo'),
+                    url: cleanStr(m.url) || '',
+                    display_url: cleanStr(m.display_url) || '',
+                    expanded_url: cleanStr(m.expanded_url) || '',
+                    type: cleanStr(m.type) || 'photo',
                     sizes: m.sizes || {
                       thumb: { w: 150, h: 150, resize: 'crop' },
                       small: { w: 680, h: 680, resize: 'fit' },
@@ -301,18 +408,18 @@ async function backgroundScrape() {
               const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? obj.unviewed_favorite_count ?? obj.card?.binding_values?.favorite_count ?? 0);
               const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? obj.card?.binding_values?.retweet_count ?? 0);
 
-              parsedTweets.push({
-                created_at: safeString(legacy.created_at, new Date().toUTCString()),
+              const rawTweet = {
+                created_at: legacy.created_at || new Date().toUTCString(),
                 id: parseInt(tweetIdStr.slice(-12)) || Date.now(),
                 id_str: tweetIdStr,
-                text: safeString(legacy.full_text || legacy.text, ''),
+                text: legacy.full_text || legacy.text || "",
                 source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
                 truncated: false,
                 in_reply_to_status_id: legacy.in_reply_to_status_id_str ? parseInt(legacy.in_reply_to_status_id_str) : null,
-                in_reply_to_status_id_str: safeString(legacy.in_reply_to_status_id_str),
+                in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str ? parseInt(legacy.in_reply_to_user_id_str) : null,
-                in_reply_to_user_id_str: safeString(legacy.in_reply_to_user_id_str),
-                in_reply_to_screen_name: safeString(legacy.in_reply_to_screen_name),
+                in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
                 user_id: userId,
                 user_id_str: userIdStr,
                 user: {
@@ -320,31 +427,33 @@ async function backgroundScrape() {
                   id_str: userIdStr,
                   name: name,
                   screen_name: screenName,
-                  location: safeString(userLegacy?.location, ''),
-                  description: safeString(userLegacy?.description, ''),
-                  url: safeString(userLegacy?.url, null),
-                  protected: !!userLegacy?.protected,
-                  verified: !!userLegacy?.verified,
-                  followers_count: Number(userLegacy?.followers_count ?? 100),
-                  friends_count: Number(userLegacy?.friends_count ?? 100),
-                  listed_count: Number(userLegacy?.listed_count ?? 0),
-                  created_at: safeString(userLegacy?.created_at, "Wed Oct 10 00:00:00 +0000 2026"),
-                  favourites_count: Number(userLegacy?.favourites_count ?? 100),
-                  statuses_count: Number(userLegacy?.statuses_count ?? 100),
+                  location: userLegacy?.location || "",
+                  description: userLegacy?.description || "",
+                  url: userLegacy?.url || null,
+                  protected: userLegacy?.protected || false,
+                  verified: userLegacy?.verified || false,
+                  followers_count: userLegacy?.followers_count || 100,
+                  friends_count: userLegacy?.friends_count || 100,
+                  listed_count: userLegacy?.listed_count || 0,
+                  created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
+                  favourites_count: userLegacy?.favourites_count || 100,
+                  statuses_count: userLegacy?.statuses_count || 100,
                   profile_image_url: avatar.replace('https://', 'http://'),
                   profile_image_url_https: avatar.replace('https://', 'http://'),
-                  profile_banner_url: safeString(userLegacy?.profile_banner_url, null),
-                  default_profile: !!userLegacy?.default_profile,
-                  default_profile_image: !!userLegacy?.default_profile_image
+                  profile_banner_url: userLegacy?.profile_banner_url || null,
+                  default_profile: userLegacy?.default_profile || false,
+                  default_profile_image: userLegacy?.default_profile_image || false
                 },
                 entities: entities,
                 extended_entities: extendedEntities,
-                favorited: !!legacy.favorited,
-                retweeted: !!legacy.retweeted,
+                favorited: legacy.favorited || false,
+                retweeted: legacy.retweeted || false,
                 retweet_count: retCount,
                 favorite_count: favCount,
-                lang: safeString(legacy.lang, 'en')
-              });
+                lang: legacy.lang || "en"
+              };
+
+              parsedTweets.push(sanitizeTweet(rawTweet));
             }
 
             for (const key of Object.keys(obj)) {
@@ -409,7 +518,7 @@ app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
-app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(defaultUser));
+app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(sanitizeUser(defaultUser)));
 
 app.get('/1.1/users/show.json', async (req, res) => {
   const screenName = req.query.screen_name;
@@ -422,21 +531,21 @@ app.get('/1.1/users/show.json', async (req, res) => {
   );
 
   if (matchedTweet && matchedTweet.user) {
-    return res.status(200).json(matchedTweet.user);
+    return res.status(200).json(sanitizeUser(matchedTweet.user));
   }
 
   if (screenName && screenName !== 'twitter_user') {
     const uid = generateUniqueUserId(screenName);
-    return res.status(200).json({
+    return res.status(200).json(sanitizeUser({
       ...defaultUser,
       id: uid,
       id_str: uid.toString(),
       name: screenName,
       screen_name: screenName
-    });
+    }));
   }
 
-  return res.status(200).json(defaultUser);
+  return res.status(200).json(sanitizeUser(defaultUser));
 });
 
 app.get('/1.1/users/lookup.json', async (req, res) => {
@@ -450,30 +559,30 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
     for (const name of requestedNames) {
       const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name);
       if (match && match.user) {
-        matchedUsers.push(match.user);
+        matchedUsers.push(sanitizeUser(match.user));
       } else {
         const uid = generateUniqueUserId(name);
-        matchedUsers.push({
+        matchedUsers.push(sanitizeUser({
           ...defaultUser,
           id: uid,
           id_str: uid.toString(),
           name: name,
           screen_name: name
-        });
+        }));
       }
     }
     return res.status(200).json(matchedUsers);
   }
 
-  const users = cachedTweets.map(t => t.user).filter(Boolean);
-  return res.status(200).json(users.length > 0 ? users : [defaultUser]);
+  const users = cachedTweets.map(t => sanitizeUser(t.user)).filter(Boolean);
+  return res.status(200).json(users.length > 0 ? users : [sanitizeUser(defaultUser)]);
 });
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
 
-  let timeline = [...localTimeline, ...cachedTweets];
+  let timeline = [...localTimeline, ...cachedTweets].map(t => sanitizeTweet(t));
   
   const uniqueMap = new Map();
   timeline.forEach(t => uniqueMap.set(t.id_str || t.id, t));
@@ -510,7 +619,7 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 });
 
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
-app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
+app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
@@ -535,7 +644,7 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
     };
   }
 
-  return res.status(200).json(found);
+  return res.status(200).json(sanitizeTweet(found));
 });
 
 app.get('/1.1/search/tweets.json', async (req, res) => {
@@ -548,7 +657,7 @@ app.get('/1.1/search/tweets.json', async (req, res) => {
   }
 
   return res.status(200).json({
-    statuses: results.map(t => ({
+    statuses: results.map(t => sanitizeTweet({
       ...t,
       in_reply_to_status_id_str: t.id_str
     })),
@@ -558,7 +667,7 @@ app.get('/1.1/search/tweets.json', async (req, res) => {
 
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
-  const newTweet = {
+  const newTweet = sanitizeTweet({
     created_at: new Date().toUTCString(),
     id: Date.now(),
     id_str: Date.now().toString(),
@@ -571,7 +680,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
     favorited: false,
     retweeted: false
-  };
+  });
   localTimeline.unshift(newTweet);
   return res.status(200).json(newTweet);
 });
@@ -582,8 +691,8 @@ app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
+app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [sanitizeUser(defaultUser)], next_cursor: 0 }));
+app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [sanitizeUser(defaultUser)], next_cursor: 0 }));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
