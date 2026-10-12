@@ -181,7 +181,6 @@ async function backgroundScrape() {
 
                 if (!legacy) return;
 
-                // Fail-safe deep extraction across all possible X GraphQL schemas
                 const userResults = 
                   tweetResult?.core?.user_results?.result || 
                   tweetResult?.tweet?.core?.user_results?.result ||
@@ -197,7 +196,6 @@ async function backgroundScrape() {
                 const authorUserIdStr = authorRestId || authorUserId.toString();
                 const authorAvatar = userLegacy.profile_image_url_https || defaultUser.profile_image_url_https;
 
-                // Normalize media entities and extended_entities for images with HTTP fallbacks for legacy TLS
                 let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
                 let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
@@ -283,14 +281,16 @@ async function backgroundScrape() {
     });
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 15000 });
 
     console.log('[Puppeteer] Page loaded. Waiting for feed to render...');
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
     console.log('[Puppeteer] Scrolling down to trigger timeline stream...');
-    await page.evaluate(() => window.scrollBy(0, 800));
-    await new Promise((resolve) => setTimeout(resolve, 6000));
+    try {
+      await page.evaluate(() => window.scrollBy(0, 800));
+    } catch (e) {}
+    await new Promise((resolve) => setTimeout(resolve, 4000));
 
     await browser.close();
 
@@ -398,7 +398,7 @@ app.get('/1.1/search/tweets.json', (req, res) => res.status(200).json({ statuses
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
-app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultUser], next_cursor: 0 }));
+app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: [defaultResult || [defaultUser], next_cursor: 0 }]));
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
