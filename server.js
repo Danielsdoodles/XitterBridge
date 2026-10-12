@@ -118,7 +118,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 250))
+      body: JSON.stringify(merged.slice(0, 300))
     });
   } catch (e) {}
 }
@@ -168,16 +168,17 @@ async function backgroundScrape() {
     );
 
     console.log('[Puppeteer] Navigating to x.com/home...');
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    // Scroll down to load more content
-    try {
-      await page.evaluate(() => window.scrollBy(0, 1200));
-    } catch (e) {}
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    // Scroll multiple times to load 40+ unique tweets into DOM
+    for (let i = 0; i < 4; i++) {
+      try {
+        await page.evaluate(() => window.scrollBy(0, 1500));
+      } catch (e) {}
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+    }
 
-    // Robust DOM scraping of actual timeline tweets and media
     const scrapedTweets = await page.evaluate(() => {
       const articles = document.querySelectorAll('article[data-testid="tweet"]');
       const results = [];
@@ -190,6 +191,17 @@ async function backgroundScrape() {
           let name = 'Twitter User';
           let screenName = 'twitter_user';
           let avatarUrl = 'https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png';
+          let tweetIdStr = (Date.now() + idx).toString();
+
+          // Extract real Twitter status ID from permalink
+          const timeLink = article.querySelector('a[href*="/status/"]');
+          if (timeLink) {
+            const href = timeLink.getAttribute('href');
+            const match = href.match(/\/status\/(\d+)/);
+            if (match) {
+              tweetIdStr = match[1];
+            }
+          }
 
           const userCell = article.querySelector('[data-testid="User-Name"]');
           if (userCell) {
@@ -211,13 +223,18 @@ async function backgroundScrape() {
           const mediaImgs = article.querySelectorAll('img[src*="media"]');
           const mediaList = [];
           mediaImgs.forEach((img, mi) => {
-            const mUrl = img.src;
+            let mUrl = img.src;
             if (mUrl && !mUrl.includes('profile_images')) {
+              mUrl = mUrl.split('?')[0] + '?format=jpg&name=medium';
+              const httpUrl = mUrl.replace('https://', 'http://');
               mediaList.push({
                 id: Date.now() + mi,
                 id_str: (Date.now() + mi).toString(),
-                media_url: mUrl.replace('https://', 'http://'),
-                media_url_https: mUrl.replace('https://', 'http://'), // Force HTTP for Windows Phone SSL compatibility
+                media_url: httpUrl,
+                media_url_https: httpUrl,
+                url: 'http://t.co/' + Math.random().toString(36).substring(7),
+                display_url: 'pic.x.com/' + Math.random().toString(36).substring(7),
+                expanded_url: 'https://x.com/' + screenName + '/status/' + tweetIdStr,
                 type: 'photo',
                 sizes: {
                   thumb: { w: 150, h: 150, resize: 'crop' },
@@ -229,19 +246,9 @@ async function backgroundScrape() {
             }
           });
 
-          // Generate stable ID based on text/author combo or timestamp
-          const uniqueString = screenName + text.substring(0, 20);
-          let hash = 0;
-          for (let i = 0; i < uniqueString.length; i++) {
-            hash = (hash << 5) - hash + uniqueString.charCodeAt(i);
-            hash |= 0;
-          }
-          const baseId = Math.abs(hash) + 1800000000000000000n;
-          const tweetIdStr = baseId.toString();
-
           results.push({
             created_at: new Date().toUTCString(),
-            id: Number(baseId % 900000000000000000n),
+            id: parseInt(tweetIdStr.slice(-12)) || Date.now() + idx,
             id_str: tweetIdStr,
             text: text,
             source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
@@ -310,12 +317,9 @@ async function backgroundScrape() {
       });
 
       await appendCachedTimelineToWorker(formatted);
-      console.log(`[Puppeteer DOM Scraper] Successfully cached ${formatted.length} tweets with correct authors & images.`);
-    } else {
-      console.log('[Puppeteer DOM Scraper] 0 tweets found in DOM.');
+      console.log(`[Puppeteer DOM Scraper] Successfully cached ${formatted.length} unique tweets.`);
     }
   } catch (err) {
-    console.error('[Puppeteer Error]', err.message);
     if (browser) {
       try { await browser.close(); } catch (e) {}
     }
@@ -410,7 +414,7 @@ app.get('/1.1/users/lookup.json', async (req, res) => {
   return res.status(200).json(users.length > 0 ? users : [defaultUser]);
 });
 
-// Fully fixed home timeline with proper pagination and deduplication
+// Home timeline with strict since_id and max_id pagination for true infinite scrolling
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
@@ -454,7 +458,7 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline));
 
-// Fixed status show endpoint so clicking tweets and images loads the exact record
+// Robust status show lookup for image expansion and detail viewing
 app.get('/1.1/statuses/show/:id.json', async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -465,12 +469,11 @@ app.get('/1.1/statuses/show/:id.json', async (req, res) => {
     return res.status(200).json(found);
   }
 
-  // Fallback builder if tweet ID isn't found in cache yet
   return res.status(200).json({
     created_at: new Date().toUTCString(),
     id: parseInt(tweetId) || Date.now(),
     id_str: tweetId,
-    text: "Loaded from Windows Phone bridge",
+    text: "Media item loaded from Windows Phone bridge",
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     user: defaultUser,
