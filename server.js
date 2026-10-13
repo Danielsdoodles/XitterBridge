@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -72,9 +72,7 @@ const defaultUser = {
 };
 
 let localTimeline = [];
-// Global User Registry Map to remember every author scraped from X
 const globalUserRegistry = new Map();
-
 let isScraping = false;
 let lastScrapeTime = 0;
 
@@ -195,16 +193,10 @@ function sanitizeMedia(m) {
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return defaultUser;
   
-  const userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
-  
-  // Check global registry first if we have an ID
-  if (userIdStr && globalUserRegistry.has(userIdStr)) {
-    return globalUserRegistry.get(userIdStr);
-  }
-
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
-  
+  let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
+
   if (!rawScreen || rawScreen === 'twitter_user') {
     rawScreen = 'danieldoodl5802';
   }
@@ -245,7 +237,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
@@ -310,7 +302,6 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
-  // Resolve author using exact user object passed from scraper
   const author = sanitizeUser(t.user);
 
   return {
@@ -489,27 +480,6 @@ async function backgroundScrape() {
           function recursiveSearch(obj) {
             if (!obj || typeof obj !== 'object') return;
 
-            // 1. Harvest user definitions anywhere in the JSON graph
-            if (obj.__typename === 'User' && (obj.legacy || obj.screen_name)) {
-              const uData = obj.legacy || obj;
-              const rId = obj.rest_id || obj.id_str || uData.id_str;
-              if (rId && uData.screen_name) {
-                sanitizeUser({
-                  id_str: rId,
-                  id: Number(rId) || 12345678,
-                  name: uData.name,
-                  screen_name: uData.screen_name,
-                  profile_image_url_https: uData.profile_image_url_https || uData.profile_image_url,
-                  profile_banner_url: uData.profile_banner_url,
-                  description: uData.description,
-                  verified: uData.verified,
-                  followers_count: uData.followers_count,
-                  friends_count: uData.friends_count
-                });
-              }
-            }
-
-            // 2. Harvest Tweet legacies
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               
@@ -546,25 +516,28 @@ async function backgroundScrape() {
                 userLegacy = findUser(obj) || userLegacy;
               }
 
-              const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : 'danieldoodl5802');
+              const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : null);
               const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
-              const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url) || defaultUser.profile_image_url_https;
-              const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
-              const userIdStr = restId || String(userId);
+              const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url);
+              const userId = restId ? parseInt(restId) : null;
+              const userIdStr = restId || (userId ? String(userId) : null);
 
-              const tweetAuthor = sanitizeUser({
-                id: userId,
-                id_str: userIdStr,
-                name: name,
-                screen_name: screenName,
-                profile_image_url_https: avatar,
-                profile_image_url: avatar,
-                profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
-                description: userLegacy?.description || "",
-                verified: userLegacy?.verified || false,
-                followers_count: userLegacy?.followers_count || 100,
-                friends_count: userLegacy?.friends_count || 100
-              });
+              let authorObj = null;
+              if (screenName && userIdStr) {
+                authorObj = sanitizeUser({
+                  id: userId,
+                  id_str: userIdStr,
+                  name: name || screenName,
+                  screen_name: screenName,
+                  profile_image_url_https: avatar,
+                  profile_image_url: avatar,
+                  profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
+                  description: userLegacy?.description || "",
+                  verified: userLegacy?.verified || false,
+                  followers_count: userLegacy?.followers_count || 100,
+                  friends_count: userLegacy?.friends_count || 100
+                });
+              }
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -591,9 +564,9 @@ async function backgroundScrape() {
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                user_id: tweetAuthor.id,
-                user_id_str: tweetAuthor.id_str,
-                user: tweetAuthor,
+                user_id: authorObj ? authorObj.id : 12345678,
+                user_id_str: authorObj ? authorObj.id_str : "12345678",
+                user: authorObj || defaultUser,
                 entities: entities,
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
