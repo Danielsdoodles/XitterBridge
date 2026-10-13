@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -294,7 +294,6 @@ function sanitizeTweet(t) {
 
   let author = sanitizeUser(t.user);
   if (!author || author.screen_name === 'danieldoodl5802') {
-    // If no valid user object, derive a pseudo-author based on tweet ID hash so timelines aren't all Daniel
     const hashNum = Math.abs(Number(safeId) || 123456789) % 5;
     const mockAccounts = [
       { name: "Windows Phone", screen_name: "windowsphone", avatar: "https://pbs.twimg.com/profile_images/1/windowsphone_normal.png" },
@@ -492,58 +491,63 @@ async function backgroundScrape() {
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               
-              let userLegacy = null;
-              let restId = null;
-
-              const possibleUserRes = [
+              let uObj = null;
+              const paths = [
+                obj.core?.user_results?.result?.legacy,
                 obj.core?.user_results?.result,
+                obj.tweet_results?.result?.core?.user_results?.result?.legacy,
                 obj.tweet_results?.result?.core?.user_results?.result,
+                obj.user_results?.result?.legacy,
                 obj.user_results?.result,
+                obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
                 obj.retweeted_status_result?.result?.core?.user_results?.result
               ];
 
-              for (const uRes of possibleUserRes) {
-                if (uRes) {
-                  userLegacy = uRes.legacy || uRes;
-                  restId = uRes.rest_id || uRes.id_str;
+              for (const p of paths) {
+                if (p && (p.screen_name || p.name)) {
+                  uObj = p;
                   break;
                 }
               }
 
-              if (!userLegacy || !userLegacy.screen_name || userLegacy.screen_name === 'twitter_user') {
-                function findUser(n) {
+              if (!uObj || !uObj.screen_name || uObj.screen_name === 'twitter_user') {
+                function searchForUser(n) {
                   if (!n || typeof n !== 'object') return null;
                   if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https)) return n;
                   for (const k of Object.keys(n)) {
                     if (typeof n[k] === 'object' && n[k] !== null) {
-                      const res = findUser(n[k]);
-                      if (res) return res;
+                      const found = searchForUser(n[k]);
+                      if (found) return found;
                     }
                   }
                   return null;
                 }
-                userLegacy = findUser(obj) || userLegacy;
+                uObj = searchForUser(obj);
               }
 
-              const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : null);
-              const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
-              const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url);
+              const screenName = cleanStr(uObj?.screen_name && uObj.screen_name !== 'twitter_user' ? uObj.screen_name : null);
+              const name = cleanStr(uObj?.name && uObj.name !== 'twitter_user' ? uObj.name : screenName);
+              const avatar = fixUrl(uObj?.profile_image_url_https || uObj?.profile_image_url);
+              const restId = cleanStr(uObj?.id_str || obj.core?.user_results?.result?.rest_id || obj.user_id_str);
               const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : 12345678);
               const userIdStr = restId || String(userId);
 
-              const tweetAuthor = sanitizeUser({
-                id: userId,
-                id_str: userIdStr,
-                name: name || screenName,
-                screen_name: screenName,
-                profile_image_url_https: avatar,
-                profile_image_url: avatar,
-                profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
-                description: userLegacy?.description || "",
-                verified: userLegacy?.verified || false,
-                followers_count: userLegacy?.followers_count || 100,
-                friends_count: userLegacy?.friends_count || 100
-              });
+              let tweetAuthor = null;
+              if (screenName) {
+                tweetAuthor = sanitizeUser({
+                  id: userId,
+                  id_str: userIdStr,
+                  name: name || screenName,
+                  screen_name: screenName,
+                  profile_image_url_https: avatar,
+                  profile_image_url: avatar,
+                  profile_banner_url: fixUrl(uObj?.profile_banner_url),
+                  description: uObj?.description || "",
+                  verified: uObj?.verified || false,
+                  followers_count: uObj?.followers_count || 100,
+                  friends_count: uObj?.friends_count || 100
+                });
+              }
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -570,9 +574,9 @@ async function backgroundScrape() {
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                user_id: tweetAuthor.id,
-                user_id_str: tweetAuthor.id_str,
-                user: tweetAuthor,
+                user_id: tweetAuthor ? tweetAuthor.id : 12345678,
+                user_id_str: tweetAuthor ? tweetAuthor.id_str : "12345678",
+                user: tweetAuthor || defaultUser,
                 entities: entities,
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
