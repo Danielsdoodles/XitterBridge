@@ -892,7 +892,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
+app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
   const qLower = query.toLowerCase();
