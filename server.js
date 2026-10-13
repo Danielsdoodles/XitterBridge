@@ -191,18 +191,13 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
-  if (!u || typeof u !== 'object') return defaultUser;
+  if (!u || typeof u !== 'object') return null;
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
-  if (!rawScreen || rawScreen === 'twitter_user') {
-    rawScreen = 'danieldoodl5802';
-  }
-  if (!rawName || rawName === 'twitter_user') {
-    rawName = rawScreen === 'danieldoodl5802' ? 'Daniel' : rawScreen;
-  }
+  if (!rawScreen || rawScreen === 'twitter_user') return null;
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
   const banner = fixUrl(u.profile_banner_url);
@@ -211,7 +206,7 @@ function sanitizeUser(u) {
   const sanitized = {
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
-    name: rawName,
+    name: rawName || rawScreen,
     screen_name: rawScreen,
     location: cleanStr(u.location) || "",
     description: cleanStr(u.description) || "",
@@ -252,10 +247,8 @@ function sanitizeUser(u) {
     entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
   };
 
-  if (finalIdStr) {
-    globalUserRegistry.set(finalIdStr, sanitized);
-  }
-
+  globalUserRegistry.set(finalIdStr, sanitized);
+  globalUserRegistry.set(rawScreen.toLowerCase(), sanitized);
   return sanitized;
 }
 
@@ -302,7 +295,17 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
-  const author = sanitizeUser(t.user);
+  // STRICT AUTHOR PRESERVATION: Never overwrite an author if already correctly parsed
+  let author = null;
+  if (t.user && typeof t.user === 'object' && t.user.screen_name && t.user.screen_name !== 'twitter_user') {
+    author = sanitizeUser(t.user);
+  }
+  if (!author && t.user_id_str && globalUserRegistry.has(t.user_id_str)) {
+    author = globalUserRegistry.get(t.user_id_str);
+  }
+  if (!author) {
+    author = defaultUser;
+  }
 
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
@@ -864,7 +867,7 @@ app.get(['/1.1/search/universal.json', '/1/search/universal.json', '/1.1/discove
   
   const matching = query !== '' ? allTweets.filter(t => t.text?.toLowerCase().includes(query)) : allTweets;
   const statuses = (matching.length > 0 ? matching : allTweets).slice(0, 15).map(t => sanitizeTweet(t));
-  const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
+  const users = allTweets.map(t => sanitizeUser(t.user)).filter(Boolean).slice(0, 5);
 
   return res.status(200).json({
     modules: [
@@ -885,7 +888,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  const users = allTweets.map(t => sanitizeUser(t.user)).slice(0, 5);
+  const users = allTweets.map(t => sanitizeUser(t.user)).filter(Boolean).slice(0, 5);
   const matchingStatuses = allTweets.filter(t => query === '' || t.text?.toLowerCase().includes(query)).slice(0, 5);
 
   return res.status(200).json({
