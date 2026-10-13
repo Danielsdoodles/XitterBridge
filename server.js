@@ -115,6 +115,19 @@ function fixUrl(url) {
   return str;
 }
 
+// Automatically strip pic.x.com and media t.co links from tweet text body
+function sanitizeTweetText(text) {
+  if (!text) return '';
+  return text
+    .replace(/https?:\/\/pic\.x\.com\/[a-zA-Z0-9]+/g, '')
+    .replace(/https?:\/\/pic\.twitter\.com\/[a-zA-Z0-9]+/g, '')
+    .replace(/https?:\/\/t\.co\/[a-zA-Z0-9]+(?=\s|$)/g, (match) => {
+      // Keep non-media links if needed, but strip trailing media links
+      return '';
+    })
+    .trim();
+}
+
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return m;
   const mUrl = fixUrl(m.media_url_https || m.media_url);
@@ -136,7 +149,7 @@ function sanitizeMedia(m) {
       duration_millis: 5000,
       variants: [{
         bitrate: 2176000,
-        content_type: m.type === 'animated_gif' ? 'video/mp4' : 'video/mp4',
+        content_type: 'video/mp4',
         url: mUrl.replace(/\.[^/.]+$/, ".mp4")
       }]
     };
@@ -243,15 +256,16 @@ function sanitizeTweet(t) {
   }
 
   const langVal = cleanStr(t.lang) || 'en';
-  const textVal = cleanStr(t.text) || cleanStr(t.full_text) || '';
+  const rawText = cleanStr(t.text) || cleanStr(t.full_text) || '';
+  const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
     id: safeId,
     id_str: idStr,
-    text: textVal,
-    full_text: textVal,
+    text: cleanedText,
+    full_text: cleanedText,
     source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false,
     in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
