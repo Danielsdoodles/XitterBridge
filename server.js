@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -72,6 +72,9 @@ const defaultUser = {
 };
 
 let localTimeline = [];
+// Global User Registry Map to remember every author scraped from X
+const globalUserRegistry = new Map();
+
 let isScraping = false;
 let lastScrapeTime = 0;
 
@@ -192,6 +195,13 @@ function sanitizeMedia(m) {
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return defaultUser;
   
+  const userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
+  
+  // Check global registry first if we have an ID
+  if (userIdStr && globalUserRegistry.has(userIdStr)) {
+    return globalUserRegistry.get(userIdStr);
+  }
+
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
   
@@ -204,11 +214,11 @@ function sanitizeUser(u) {
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
   const banner = fixUrl(u.profile_banner_url);
-  const userIdStr = cleanStr(u.id_str || u.rest_id) || String(u.id || generateUniqueUserId(rawScreen));
+  const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
-  return {
-    id: Number(u.id || userIdStr),
-    id_str: userIdStr,
+  const sanitized = {
+    id: Number(finalIdStr) || 12345678,
+    id_str: finalIdStr,
     name: rawName,
     screen_name: rawScreen,
     location: cleanStr(u.location) || "",
@@ -235,7 +245,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
@@ -249,6 +259,12 @@ function sanitizeUser(u) {
     translator_type: "none",
     entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
   };
+
+  if (finalIdStr) {
+    globalUserRegistry.set(finalIdStr, sanitized);
+  }
+
+  return sanitized;
 }
 
 function sanitizeTweet(t) {
@@ -294,6 +310,7 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
+  // Resolve author using exact user object passed from scraper
   const author = sanitizeUser(t.user);
 
   return {
@@ -472,6 +489,27 @@ async function backgroundScrape() {
           function recursiveSearch(obj) {
             if (!obj || typeof obj !== 'object') return;
 
+            // 1. Harvest user definitions anywhere in the JSON graph
+            if (obj.__typename === 'User' && (obj.legacy || obj.screen_name)) {
+              const uData = obj.legacy || obj;
+              const rId = obj.rest_id || obj.id_str || uData.id_str;
+              if (rId && uData.screen_name) {
+                sanitizeUser({
+                  id_str: rId,
+                  id: Number(rId) || 12345678,
+                  name: uData.name,
+                  screen_name: uData.screen_name,
+                  profile_image_url_https: uData.profile_image_url_https || uData.profile_image_url,
+                  profile_banner_url: uData.profile_banner_url,
+                  description: uData.description,
+                  verified: uData.verified,
+                  followers_count: uData.followers_count,
+                  friends_count: uData.friends_count
+                });
+              }
+            }
+
+            // 2. Harvest Tweet legacies
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               
@@ -512,7 +550,21 @@ async function backgroundScrape() {
               const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
               const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url) || defaultUser.profile_image_url_https;
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
-              const userIdStr = restId || userId.toString();
+              const userIdStr = restId || String(userId);
+
+              const tweetAuthor = sanitizeUser({
+                id: userId,
+                id_str: userIdStr,
+                name: name,
+                screen_name: screenName,
+                profile_image_url_https: avatar,
+                profile_image_url: avatar,
+                profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
+                description: userLegacy?.description || "",
+                verified: userLegacy?.verified || false,
+                followers_count: userLegacy?.followers_count || 100,
+                friends_count: userLegacy?.friends_count || 100
+              });
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -539,31 +591,9 @@ async function backgroundScrape() {
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                user_id: userId,
-                user_id_str: userIdStr,
-                user: {
-                  id: userId,
-                  id_str: userIdStr,
-                  name: name,
-                  screen_name: screenName,
-                  location: userLegacy?.location || "",
-                  description: userLegacy?.description || "",
-                  url: userLegacy?.url || null,
-                  protected: userLegacy?.protected || false,
-                  verified: userLegacy?.verified || false,
-                  followers_count: userLegacy?.followers_count || 100,
-                  friends_count: userLegacy?.friends_count || 100,
-                  listed_count: userLegacy?.listed_count || 0,
-                  created_at: userLegacy?.created_at || "Wed Oct 10 00:00:00 +0000 2026",
-                  favourites_count: userLegacy?.favourites_count || 100,
-                  statuses_count: userLegacy?.statuses_count || 100,
-                  profile_image_url: avatar,
-                  profile_image_url_https: avatar,
-                  profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
-                  default_profile: userLegacy?.default_profile || false,
-                  default_profile_image: userLegacy?.default_profile_image || false,
-                  entities: { description: { urls: [] }, url: { urls: [] } }
-                },
+                user_id: tweetAuthor.id,
+                user_id_str: tweetAuthor.id_str,
+                user: tweetAuthor,
                 entities: entities,
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
@@ -892,7 +922,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json'], async (req, res) => {
+app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
   const qLower = query.toLowerCase();
