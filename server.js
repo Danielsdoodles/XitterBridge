@@ -14,7 +14,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Force identity encoding and prevent compression mismatches that crash WP HTTP clients
+// Strict headers required by Windows Phone HTTP transport layer
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -22,10 +22,12 @@ app.use((req, res, next) => {
   res.setHeader('X-Rate-Limit-Reset', String(nowSec + 900));
   res.setHeader('X-Access-Level', 'read-write');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.removeHeader('Transfer-Encoding'); // Force explicit content-length via standard JSON stringify
+  res.setHeader('Cache-Control', 'no-cache');
   
-  console.log(`[XitterBridge] ${req.method} ${req.originalUrl || req.url}`);
+  console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
+  if (Object.keys(req.query).length > 0) {
+    console.log(`  Query:`, JSON.stringify(req.query));
+  }
   next();
 });
 
@@ -70,10 +72,7 @@ const defaultUser = {
   follow_request_sent: false,
   notifications: false,
   translator_type: "none",
-  entities: {
-    description: { urls: [] },
-    url: { urls: [] }
-  }
+  entities: { description: { urls: [] }, url: { urls: [] } }
 };
 
 let localTimeline = [];
@@ -666,11 +665,11 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
     } catch (e) {}
   }
 
-  return res.status(200).send(JSON.stringify(timeline));
+  return res.status(200).json(timeline);
 });
 
-app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).send(JSON.stringify([])));
-app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).send(JSON.stringify(localTimeline.map(t => sanitizeTweet(t)))));
+app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
+app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
@@ -691,7 +690,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// ULTIMATE CONVERSATION ENDPOINT (SUPPORTS PURE ARRAYS, GRAPH OBJECTS, AND WRAPPERS)
+// ULTIMATE CONVERSATION THREAD (RETURNS BOTH FULL TWEET OBJECT ARRAYS AND GRAPH MAPPINGS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -719,9 +718,10 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
   });
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
+  const statusIds = statuses.map(s => s.id_str);
 
-  // If the client requests an array format or graph format, provide the composite object
-  return res.status(200).send(JSON.stringify({
+  return res.status(200).json({
+    ids: statusIds,
     statuses: statuses,
     conversation: statuses,
     descendants: replies.map(r => sanitizeTweet(r)),
@@ -729,7 +729,7 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
       tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
       users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
     }
-  }));
+  });
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
@@ -821,7 +821,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// BULLETPROOF SEARCH ENDPOINT WITH EXPLICIT STRINGIFIED JSON FOR XAML BINDING
+// ULTIMATE SEARCH ENDPOINT (INJECTS METADATA, IDS, AND GLOBAL OBJECTS TO ELIMINATE WHITE SCREENS)
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
@@ -841,7 +841,8 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
     if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user;
   });
 
-  const responseObject = {
+  return res.status(200).json({
+    ids: finalStatuses.map(s => s.id_str),
     statuses: finalStatuses,
     search_metadata: {
       completed_in: 0.025,
@@ -858,9 +859,7 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
       tweets: finalStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
       users: uniqueUsers
     }
-  };
-
-  return res.status(200).send(JSON.stringify(responseObject));
+  });
 });
 
 app.post('/1.1/statuses/update.json', (req, res) => {
