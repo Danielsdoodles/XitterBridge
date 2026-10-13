@@ -295,17 +295,17 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
+  // Author resolution priority check
   let author = null;
-  if (t.user && typeof t.user === 'object' && t.user.screen_name && t.user.screen_name !== 'twitter_user') {
+  const uidStr = cleanStr(t.user_id_str || t.user?.id_str);
+
+  if (uidStr && globalUserRegistry.has(uidStr)) {
+    author = globalUserRegistry.get(uidStr);
+  } else if (t.user && typeof t.user === 'object' && t.user.screen_name && t.user.screen_name !== 'twitter_user') {
     author = sanitizeUser(t.user);
-  }
-  if (!author && t.user_id_str && globalUserRegistry.has(t.user_id_str)) {
-    author = globalUserRegistry.get(t.user_id_str);
-  }
-  if (!author && t.user && t.user.name && t.user.name !== 'Daniel') {
-    author = sanitizeUser(t.user);
-  }
-  if (!author) {
+  } else if (t.user?.screen_name && globalUserRegistry.has(t.user.screen_name.toLowerCase())) {
+    author = globalUserRegistry.get(t.user.screen_name.toLowerCase());
+  } else {
     author = defaultUser;
   }
 
@@ -485,6 +485,27 @@ async function backgroundScrape() {
           function recursiveSearch(obj) {
             if (!obj || typeof obj !== 'object') return;
 
+            // 1. HARVEST USERS FIRST: Catch any User object anywhere in graph and cache it
+            if (obj.__typename === 'User' || obj.screen_name || obj.legacy?.screen_name) {
+              const uObj = obj.legacy || obj;
+              const rId = obj.rest_id || obj.id_str || uObj.id_str;
+              if (uObj.screen_name && uObj.screen_name !== 'twitter_user') {
+                sanitizeUser({
+                  id_str: rId,
+                  id: rId ? Number(rId) : undefined,
+                  name: uObj.name,
+                  screen_name: uObj.screen_name,
+                  profile_image_url_https: uObj.profile_image_url_https || uObj.profile_image_url,
+                  profile_banner_url: uObj.profile_banner_url,
+                  description: uObj.description,
+                  verified: uObj.verified,
+                  followers_count: uObj.followers_count,
+                  friends_count: uObj.friends_count
+                });
+              }
+            }
+
+            // 2. HARVEST TWEETS
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               
@@ -524,11 +545,11 @@ async function backgroundScrape() {
               const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : null);
               const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
               const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url);
-              const userId = restId ? parseInt(restId) : null;
-              const userIdStr = restId || (userId ? String(userId) : null);
+              const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : 12345678);
+              const userIdStr = restId || String(userId);
 
               let authorObj = null;
-              if (screenName && userIdStr) {
+              if (screenName) {
                 authorObj = sanitizeUser({
                   id: userId,
                   id_str: userIdStr,
@@ -900,7 +921,7 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
+app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
   const qLower = query.toLowerCase();
