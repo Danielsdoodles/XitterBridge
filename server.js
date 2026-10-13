@@ -295,13 +295,15 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
-  // STRICT AUTHOR PRESERVATION: Never overwrite an author if already correctly parsed
   let author = null;
   if (t.user && typeof t.user === 'object' && t.user.screen_name && t.user.screen_name !== 'twitter_user') {
     author = sanitizeUser(t.user);
   }
   if (!author && t.user_id_str && globalUserRegistry.has(t.user_id_str)) {
     author = globalUserRegistry.get(t.user_id_str);
+  }
+  if (!author && t.user && t.user.name && t.user.name !== 'Daniel') {
+    author = sanitizeUser(t.user);
   }
   if (!author) {
     author = defaultUser;
