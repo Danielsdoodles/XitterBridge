@@ -115,23 +115,39 @@ function fixUrl(url) {
   return str;
 }
 
-// Automatically strip pic.x.com and media t.co links from tweet text body
+// Force Twitter CDN image URLs to JPG format for Windows Phone decoder compatibility
+function forceJpgUrl(url) {
+  if (!url) return '';
+  let fixed = fixUrl(url);
+  if (fixed.includes('pbs.twimg.com/media/')) {
+    // Strip existing format queries and force jpg
+    fixed = fixed.split('?')[0];
+    if (!fixed.includes('.')) fixed += '.jpg';
+    else fixed = fixed.replace(/\.(webp|png|jpeg)$/i, '.jpg');
+    return fixed + '?format=jpg&name=large';
+  }
+  return fixed;
+}
+
 function sanitizeTweetText(text) {
   if (!text) return '';
   return text
     .replace(/https?:\/\/pic\.x\.com\/[a-zA-Z0-9]+/g, '')
     .replace(/https?:\/\/pic\.twitter\.com\/[a-zA-Z0-9]+/g, '')
-    .replace(/https?:\/\/t\.co\/[a-zA-Z0-9]+(?=\s|$)/g, (match) => {
-      // Keep non-media links if needed, but strip trailing media links
-      return '';
-    })
+    .replace(/https?:\/\/t\.co\/[a-zA-Z0-9]+(?=\s|$)/g, '')
     .trim();
 }
 
 function sanitizeMedia(m) {
-  if (!m || typeof m !== 'object') return m;
-  const mUrl = fixUrl(m.media_url_https || m.media_url);
+  if (!m || typeof m !== 'object') return null;
   
+  let rawUrl = cleanStr(m.media_url_https || m.media_url || m.url || '');
+  if (!rawUrl) return null;
+
+  const forcedJpg = forceJpgUrl(rawUrl);
+  const httpsUrl = forcedJpg.replace(/^http:\/\//i, 'https://');
+  const httpUrl = forcedJpg.replace(/^https:\/\//i, 'http://');
+
   let videoInfo = m.video_info || m.videoInfo;
   if (videoInfo && Array.isArray(videoInfo.variants)) {
     videoInfo = {
@@ -140,7 +156,7 @@ function sanitizeMedia(m) {
       variants: videoInfo.variants.map(v => ({
         bitrate: Number(v.bitrate || 2176000),
         content_type: cleanStr(v.content_type) || 'video/mp4',
-        url: fixUrl(v.url)
+        url: cleanStr(v.url) ? cleanStr(v.url).replace(/^http:\/\//i, 'https://') : ''
       }))
     };
   } else if (m.type === 'video' || m.type === 'animated_gif') {
@@ -150,7 +166,7 @@ function sanitizeMedia(m) {
       variants: [{
         bitrate: 2176000,
         content_type: 'video/mp4',
-        url: mUrl.replace(/\.[^/.]+$/, ".mp4")
+        url: httpsUrl.replace(/\.[^/.]+$/, ".mp4")
       }]
     };
   }
@@ -158,18 +174,18 @@ function sanitizeMedia(m) {
   return {
     id: Number(m.id || Date.now()),
     id_str: cleanStr(m.id_str) || String(m.id || Date.now()),
-    media_url: mUrl,
-    media_url_https: mUrl,
-    url: cleanStr(m.url) || '',
-    display_url: cleanStr(m.display_url) || '',
-    expanded_url: fixUrl(m.expanded_url) || '',
+    media_url: httpUrl,
+    media_url_https: httpsUrl,
+    url: cleanStr(m.url) || httpsUrl,
+    display_url: cleanStr(m.display_url) || 'pic.twitter.com',
+    expanded_url: cleanStr(m.expanded_url) || httpsUrl,
     type: cleanStr(m.type) || 'photo',
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
-    sizes: m.sizes || {
-      thumb: { w: 150, h: 150, resize: 'crop' },
-      small: { w: 680, h: 680, resize: 'fit' },
-      medium: { w: 1200, h: 1200, resize: 'fit' },
-      large: { w: 2048, h: 2048, resize: 'fit' }
+    sizes: {
+      thumb: { w: m.sizes?.thumb?.w || 150, h: m.sizes?.thumb?.h || 150, resize: 'crop' },
+      small: { w: m.sizes?.small?.w || 680, h: m.sizes?.small?.h || 680, resize: 'fit' },
+      medium: { w: m.sizes?.medium?.w || 1200, h: m.sizes?.medium?.h || 1200, resize: 'fit' },
+      large: { w: m.sizes?.large?.w || 2048, h: m.sizes?.large?.h || 2048, resize: 'fit' }
     },
     video_info: videoInfo
   };
@@ -236,6 +252,15 @@ function sanitizeTweet(t) {
     }
   } catch (e) {}
 
+  let rawMediaList = [];
+  if (t.extended_entities && Array.isArray(t.extended_entities.media)) {
+    rawMediaList = t.extended_entities.media;
+  } else if (t.entities && Array.isArray(t.entities.media)) {
+    rawMediaList = t.entities.media;
+  }
+
+  const sanitizedMedia = rawMediaList.map(m => sanitizeMedia(m)).filter(Boolean);
+
   let entities = t.entities && typeof t.entities === 'object' ? t.entities : {};
   entities.hashtags = Array.isArray(entities.hashtags) ? entities.hashtags : [];
   entities.symbols = Array.isArray(entities.symbols) ? entities.symbols : [];
@@ -246,14 +271,12 @@ function sanitizeTweet(t) {
     display_url: cleanStr(u.display_url) || '',
     indices: Array.isArray(u.indices) ? u.indices : [0, 0]
   })) : [];
-  if (Array.isArray(entities.media)) {
-    entities.media = entities.media.map(m => sanitizeMedia(m));
+  
+  if (sanitizedMedia.length > 0) {
+    entities.media = sanitizedMedia;
   }
 
-  let extendedEntities = t.extended_entities && typeof t.extended_entities === 'object' ? t.extended_entities : (entities.media ? { media: entities.media } : undefined);
-  if (extendedEntities && Array.isArray(extendedEntities.media)) {
-    extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
-  }
+  let extendedEntities = sanitizedMedia.length > 0 ? { media: sanitizedMedia } : undefined;
 
   const langVal = cleanStr(t.lang) || 'en';
   const rawText = cleanStr(t.text) || cleanStr(t.full_text) || '';
@@ -481,7 +504,7 @@ async function backgroundScrape() {
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
 
               if (extendedEntities && extendedEntities.media) {
-                extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
+                extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m)).filter(Boolean);
                 entities.media = extendedEntities.media;
               }
 
