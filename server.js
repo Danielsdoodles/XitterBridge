@@ -115,12 +115,10 @@ function fixUrl(url) {
   return str;
 }
 
-// Force Twitter CDN image URLs to JPG format for Windows Phone decoder compatibility
 function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/media/')) {
-    // Strip existing format queries and force jpg
     fixed = fixed.split('?')[0];
     if (!fixed.includes('.')) fixed += '.jpg';
     else fixed = fixed.replace(/\.(webp|png|jpeg)$/i, '.jpg');
@@ -193,13 +191,26 @@ function sanitizeMedia(m) {
 
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return defaultUser;
+  
+  let rawScreen = cleanStr(u.screen_name || u.screenName || '');
+  let rawName = cleanStr(u.name || '');
+  
+  if (!rawScreen || rawScreen === 'twitter_user') {
+    rawScreen = 'danieldoodl5802';
+  }
+  if (!rawName || rawName === 'twitter_user') {
+    rawName = rawScreen === 'danieldoodl5802' ? 'Daniel' : rawScreen;
+  }
+
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
   const banner = fixUrl(u.profile_banner_url);
+  const userIdStr = cleanStr(u.id_str || u.rest_id) || String(u.id || generateUniqueUserId(rawScreen));
+
   return {
-    id: Number(u.id || 12345678),
-    id_str: cleanStr(u.id_str) || '12345678',
-    name: cleanStr(u.name) || 'Daniel',
-    screen_name: cleanStr(u.screen_name) || 'danieldoodl5802',
+    id: Number(u.id || userIdStr),
+    id_str: userIdStr,
+    name: rawName,
+    screen_name: rawScreen,
     location: cleanStr(u.location) || "",
     description: cleanStr(u.description) || "",
     url: cleanStr(u.url) || null,
@@ -283,6 +294,8 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
+  const author = sanitizeUser(t.user);
+
   return {
     created_at: cleanStr(t.created_at) || new Date().toUTCString(),
     id: safeId,
@@ -296,9 +309,9 @@ function sanitizeTweet(t) {
     in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
     in_reply_to_user_id_str: cleanStr(t.in_reply_to_user_id_str),
     in_reply_to_screen_name: cleanStr(t.in_reply_to_screen_name),
-    user_id: Number(t.user_id || t.user?.id || 12345678),
-    user_id_str: cleanStr(t.user_id_str || t.user?.id_str) || '12345678',
-    user: sanitizeUser(t.user),
+    user_id: author.id,
+    user_id_str: author.id_str,
+    user: author,
     geo: null,
     coordinates: null,
     place: null,
@@ -468,7 +481,8 @@ async function backgroundScrape() {
               const possibleUserRes = [
                 obj.core?.user_results?.result,
                 obj.tweet_results?.result?.core?.user_results?.result,
-                obj.user_results?.result
+                obj.user_results?.result,
+                obj.retweeted_status_result?.result?.core?.user_results?.result
               ];
 
               for (const uRes of possibleUserRes) {
