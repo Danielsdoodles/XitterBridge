@@ -14,7 +14,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Strict headers required by Windows Phone HTTP transport layer
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -25,9 +24,6 @@ app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-cache');
   
   console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
-  if (Object.keys(req.query).length > 0) {
-    console.log(`  Query:`, JSON.stringify(req.query));
-  }
   next();
 });
 
@@ -48,8 +44,8 @@ const defaultUser = {
   favourites_count: 42,
   statuses_count: 10,
   profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-  profile_image_url_https: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-  profile_banner_url: "http://pbs.twimg.com/profile_banners/12345678/1600000000/web",
+  profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+  profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
   default_profile: true,
   default_profile_image: true,
   utc_offset: null,
@@ -111,25 +107,49 @@ function cleanStr(val) {
   return null;
 }
 
-function forceHttp(url) {
+function fixUrl(url) {
   if (!url) return '';
   let str = cleanStr(url);
   if (!str) return '';
-  if (str.startsWith('//')) str = 'http:' + str;
-  return str.replace('https://', 'http://');
+  if (str.startsWith('//')) str = 'https:' + str;
+  return str;
 }
 
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return m;
-  const mediaUrl = forceHttp(m.media_url_https || m.media_url);
+  const mUrl = fixUrl(m.media_url_https || m.media_url);
+  
+  let videoInfo = m.video_info || m.videoInfo;
+  if (videoInfo && Array.isArray(videoInfo.variants)) {
+    videoInfo = {
+      aspect_ratio: videoInfo.aspect_ratio || [16, 9],
+      duration_millis: videoInfo.duration_millis || 5000,
+      variants: videoInfo.variants.map(v => ({
+        bitrate: Number(v.bitrate || 2176000),
+        content_type: cleanStr(v.content_type) || 'video/mp4',
+        url: fixUrl(v.url)
+      }))
+    };
+  } else if (m.type === 'video' || m.type === 'animated_gif') {
+    videoInfo = {
+      aspect_ratio: [16, 9],
+      duration_millis: 5000,
+      variants: [{
+        bitrate: 2176000,
+        content_type: m.type === 'animated_gif' ? 'video/mp4' : 'video/mp4',
+        url: mUrl.replace(/\.[^/.]+$/, ".mp4")
+      }]
+    };
+  }
+
   return {
     id: Number(m.id || Date.now()),
     id_str: cleanStr(m.id_str) || String(m.id || Date.now()),
-    media_url: mediaUrl,
-    media_url_https: mediaUrl,
+    media_url: mUrl,
+    media_url_https: mUrl,
     url: cleanStr(m.url) || '',
     display_url: cleanStr(m.display_url) || '',
-    expanded_url: forceHttp(m.expanded_url) || '',
+    expanded_url: fixUrl(m.expanded_url) || '',
     type: cleanStr(m.type) || 'photo',
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
     sizes: m.sizes || {
@@ -137,14 +157,15 @@ function sanitizeMedia(m) {
       small: { w: 680, h: 680, resize: 'fit' },
       medium: { w: 1200, h: 1200, resize: 'fit' },
       large: { w: 2048, h: 2048, resize: 'fit' }
-    }
+    },
+    video_info: videoInfo
   };
 }
 
 function sanitizeUser(u) {
   if (!u || typeof u !== 'object') return defaultUser;
-  const avatar = forceHttp(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url;
-  const banner = forceHttp(u.profile_banner_url);
+  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
+  const banner = fixUrl(u.profile_banner_url);
   return {
     id: Number(u.id || 12345678),
     id_str: cleanStr(u.id_str) || '12345678',
@@ -208,7 +229,7 @@ function sanitizeTweet(t) {
   entities.user_mentions = Array.isArray(entities.user_mentions) ? entities.user_mentions : [];
   entities.urls = Array.isArray(entities.urls) ? entities.urls.map(u => ({
     url: cleanStr(u.url) || '',
-    expanded_url: forceHttp(u.expanded_url) || '',
+    expanded_url: fixUrl(u.expanded_url) || '',
     display_url: cleanStr(u.display_url) || '',
     indices: Array.isArray(u.indices) ? u.indices : [0, 0]
   })) : [];
@@ -216,7 +237,7 @@ function sanitizeTweet(t) {
     entities.media = entities.media.map(m => sanitizeMedia(m));
   }
 
-  let extendedEntities = t.extended_entities && typeof t.extended_entities === 'object' ? t.extended_entities : undefined;
+  let extendedEntities = t.extended_entities && typeof t.extended_entities === 'object' ? t.extended_entities : (entities.media ? { media: entities.media } : undefined);
   if (extendedEntities && Array.isArray(extendedEntities.media)) {
     extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m));
   }
@@ -438,7 +459,7 @@ async function backgroundScrape() {
 
               const screenName = cleanStr(userLegacy?.screen_name && userLegacy.screen_name !== 'twitter_user' ? userLegacy.screen_name : 'danieldoodl5802');
               const name = cleanStr(userLegacy?.name && userLegacy.name !== 'twitter_user' ? userLegacy.name : screenName);
-              const avatar = forceHttp(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url) || defaultUser.profile_image_url;
+              const avatar = fixUrl(userLegacy?.profile_image_url_https || userLegacy?.profile_image_url) || defaultUser.profile_image_url_https;
               const userId = restId ? parseInt(restId) : generateUniqueUserId(screenName);
               const userIdStr = restId || userId.toString();
 
@@ -487,7 +508,7 @@ async function backgroundScrape() {
                   statuses_count: userLegacy?.statuses_count || 100,
                   profile_image_url: avatar,
                   profile_image_url_https: avatar,
-                  profile_banner_url: forceHttp(userLegacy?.profile_banner_url),
+                  profile_banner_url: fixUrl(userLegacy?.profile_banner_url),
                   default_profile: userLegacy?.default_profile || false,
                   default_profile_image: userLegacy?.default_profile_image || false,
                   entities: { description: { urls: [] }, url: { urls: [] } }
@@ -690,7 +711,6 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// ULTIMATE CONVERSATION THREAD (RETURNS BOTH FULL TWEET OBJECT ARRAYS AND GRAPH MAPPINGS)
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = req.query.id || req.params.id || '';
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -821,7 +841,6 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-// ULTIMATE SEARCH ENDPOINT (INJECTS METADATA, IDS, AND GLOBAL OBJECTS TO ELIMINATE WHITE SCREENS)
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim();
