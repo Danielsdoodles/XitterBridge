@@ -140,11 +140,15 @@ function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return null;
   
   const mediaRes = m.media_results?.result || {};
+  const mediaLegacy = mediaRes.legacy || {};
+  
   let rawUrl = cleanStr(
     m.media_url_https || 
     m.media_url || 
     m.url || 
     mediaRes.media_url_https || 
+    mediaLegacy.media_url_https || 
+    mediaLegacy.media_url || 
     mediaRes.original_info?.url || 
     ''
   );
@@ -154,7 +158,7 @@ function sanitizeMedia(m) {
   const httpsUrl = forcedJpg.replace(/^http:\/\//i, 'https://');
   const httpUrl = forcedJpg.replace(/^https:\/\//i, 'http://');
 
-  let videoInfo = m.video_info || m.videoInfo || mediaRes.video_info || mediaRes.videoInfo;
+  let videoInfo = m.video_info || m.videoInfo || mediaLegacy.video_info || mediaRes.video_info;
   if (videoInfo && Array.isArray(videoInfo.variants)) {
     videoInfo = {
       aspect_ratio: videoInfo.aspect_ratio || [16, 9],
@@ -165,7 +169,7 @@ function sanitizeMedia(m) {
         url: cleanStr(v.url) ? cleanStr(v.url).replace(/^http:\/\//i, 'https://') : ''
       })).filter(v => v.url)
     };
-  } else if (m.type === 'video' || m.type === 'animated_gif' || mediaRes.__typename === 'Video' || mediaRes.__typename === 'AnimatedGif') {
+  } else if (m.type === 'video' || m.type === 'animated_gif' || mediaRes.__typename === 'Video' || mediaRes.__typename === 'AnimatedGif' || mediaLegacy.type === 'video') {
     videoInfo = {
       aspect_ratio: [16, 9],
       duration_millis: 5000,
@@ -185,13 +189,13 @@ function sanitizeMedia(m) {
     url: cleanStr(m.url) || httpsUrl,
     display_url: cleanStr(m.display_url) || 'pic.twitter.com',
     expanded_url: cleanStr(m.expanded_url) || httpsUrl,
-    type: cleanStr(m.type || mediaRes.__typename?.toLowerCase() || 'photo'),
+    type: cleanStr(m.type || mediaLegacy.type || mediaRes.__typename?.toLowerCase() || 'photo'),
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
     sizes: {
-      thumb: { w: m.sizes?.thumb?.w || 150, h: m.sizes?.thumb?.h || 150, resize: 'crop' },
-      small: { w: m.sizes?.small?.w || 680, h: m.sizes?.small?.h || 680, resize: 'fit' },
-      medium: { w: m.sizes?.medium?.w || 1200, h: m.sizes?.medium?.h || 1200, resize: 'fit' },
-      large: { w: m.sizes?.large?.w || 2048, h: m.sizes?.large?.h || 2048, resize: 'fit' }
+      thumb: { w: m.sizes?.thumb?.w || mediaLegacy.sizes?.thumb?.w || 150, h: m.sizes?.thumb?.h || mediaLegacy.sizes?.thumb?.h || 150, resize: 'crop' },
+      small: { w: m.sizes?.small?.w || mediaLegacy.sizes?.small?.w || 680, h: m.sizes?.small?.h || mediaLegacy.sizes?.small?.h || 680, resize: 'fit' },
+      medium: { w: m.sizes?.medium?.w || mediaLegacy.sizes?.medium?.w || 1200, h: m.sizes?.medium?.h || mediaLegacy.sizes?.medium?.h || 1200, resize: 'fit' },
+      large: { w: m.sizes?.large?.w || mediaLegacy.sizes?.large?.w || 2048, h: m.sizes?.large?.h || mediaLegacy.sizes?.large?.h || 2048, resize: 'fit' }
     },
     video_info: videoInfo
   };
@@ -241,7 +245,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
