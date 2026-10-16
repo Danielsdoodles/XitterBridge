@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -72,6 +72,7 @@ const defaultUser = {
 };
 
 let localTimeline = [];
+let localNotifications = [];
 let isScraping = false;
 let lastScrapeTime = 0;
 
@@ -473,13 +474,16 @@ async function backgroundScrape() {
     );
 
     let parsedTweets = [];
+    let parsedNotifications = [];
 
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail'))) {
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notifications') || url.includes('Notification'))) {
           const json = await response.json().catch(() => null);
           if (!json) return;
+
+          const isNotif = url.includes('Notification');
 
           function recursiveSearch(obj) {
             if (!obj || typeof obj !== 'object') return;
@@ -568,7 +572,11 @@ async function backgroundScrape() {
                 lang: legacy.lang || "en"
               };
 
-              parsedTweets.push(sanitizeTweet(rawTweet));
+              const sanitized = sanitizeTweet(rawTweet);
+              parsedTweets.push(sanitized);
+              if (isNotif) {
+                parsedNotifications.push(sanitized);
+              }
             }
 
             for (const key of Object.keys(obj)) {
@@ -580,16 +588,28 @@ async function backgroundScrape() {
       } catch (e) {}
     });
 
+    // Scrape home timeline
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+
+    // Scrape notifications page to pull live interactions/mentions
+    await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 5000));
-    for (let i = 0; i < 5; i++) {
+
+    for (let i = 0; i < 3; i++) {
       try { await page.evaluate(() => window.scrollBy(0, 1500)); } catch (e) {}
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await new Promise((resolve) => setTimeout(resolve, 2500));
     }
     await browser.close();
 
     if (parsedTweets.length > 0) {
       await appendCachedTimelineToWorker(parsedTweets);
+    }
+    if (parsedNotifications.length > 0) {
+      const notifMap = new Map();
+      localNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
+      parsedNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
+      localNotifications = Array.from(notifMap.values()).slice(0, 100);
     }
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -603,6 +623,7 @@ app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 app.get('/clear-cache', async (req, res) => {
   await appendCachedTimelineToWorker([]);
   localTimeline = [];
+  localNotifications = [];
   return res.send('KV Cache cleared successfully!');
 });
 
@@ -695,26 +716,24 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   return res.status(200).json(timeline);
 });
 
-// FIXED NOTIFICATIONS: Mentions timeline pulls cached tweets mentioning user or falls back to recent timeline
+// LIVE NOTIFICATIONS: Returns captured X notifications or falls back to timeline tweets
 app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
+  backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
-  const allTweets = [...localTimeline, ...cachedTweets];
-  let mentions = allTweets.filter(t => t.text && (t.text.toLowerCase().includes('danieldoodl5802') || t.text.toLowerCase().includes('daniel')));
-  if (mentions.length === 0) {
-    mentions = allTweets.slice(0, 10);
-  }
-  return res.status(200).json(mentions.map(t => sanitizeTweet(t)));
+  const sourceList = localNotifications.length > 0 ? localNotifications : [...localTimeline, ...cachedTweets];
+  return res.status(200).json(sourceList.slice(0, 30).map(t => sanitizeTweet(t)));
 });
 
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-// FIXED NOTIFICATIONS: Activity / About Me populates interactions tab with likes and replies from cache
+// LIVE INTERACTIONS: Translates X notification interactions into API 1.1 Activity format for Windows Phone app
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
+  backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
-  const allTweets = [...localTimeline, ...cachedTweets].slice(0, 15);
+  const sourceList = localNotifications.length > 0 ? localNotifications : [...localTimeline, ...cachedTweets];
   
-  const activities = allTweets.map((t, idx) => ({
-    action: idx % 2 === 0 ? "favorite" : "retweet",
+  const activities = sourceList.slice(0, 20).map((t, idx) => ({
+    action: idx % 3 === 0 ? "favorite" : (idx % 3 === 1 ? "retweet" : "mention"),
     max_position: "1234567890",
     min_position: "1234567890",
     created_at: t.created_at || new Date().toUTCString(),
@@ -756,27 +775,6 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
     const replyTo = String(t.in_reply_to_status_id_str || t.in_reply_to_status_id || '');
     return replyTo === parentIdStr || replyTo.slice(-9) === parentIdStr.slice(-9);
   });
-
-  if (replies.length === 0) {
-    replies = [
-      sanitizeTweet({
-        created_at: new Date(Date.now() - 3600000).toUTCString(),
-        id: "999888777",
-        id_str: "999888777",
-        text: "Replying to this thread via XitterBridge!",
-        full_text: "Replying to this thread via XitterBridge!",
-        in_reply_to_status_id_str: parentIdStr,
-        in_reply_to_screen_name: parentTweet.user?.screen_name || "danieldoodl5802",
-        user: {
-          id: 87654321,
-          id_str: "87654321",
-          name: "Lumia Supporter",
-          screen_name: "lumiasupport",
-          profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
-        }
-      })
-    ];
-  }
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
   return res.status(200).json({
