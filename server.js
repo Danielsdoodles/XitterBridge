@@ -427,7 +427,7 @@ function getSeedDirectMessages() {
   return [
     formatDirectMessage(
       "100020003",
-      "Welcome to Direct Messages on Lumia! Send messages from here to sync.",
+      "Welcome to Direct Messages on Lumia!",
       other,
       defaultUser,
       new Date()
@@ -646,40 +646,6 @@ async function backgroundScrape() {
           }
           recursiveSearch(json);
         }
-
-        if (url.includes('dm_conversations') || url.includes('DMConversation') || url.includes('direct_messages') || url.includes('useDMInboxQuery') || url.includes('DMInbox')) {
-          function extractDMs(obj) {
-            if (!obj || typeof obj !== 'object') return;
-            if (obj.message_data && (obj.message_data.text || obj.message_data.full_text)) {
-              const text = obj.message_data.text || obj.message_data.full_text;
-              const senderId = cleanStr(obj.sender_id || obj.message_data.sender_id);
-              const msgId = cleanStr(obj.id || obj.message_id || Date.now().toString());
-              const timeVal = obj.time || obj.created_timestamp || Date.now();
-              const dt = new Date(Number(timeVal) || Date.now());
-
-              const isMe = senderId === defaultUser.id_str || senderId === String(defaultUser.id);
-              const otherUser = sanitizeUser({
-                id: isMe ? 87654321 : (Number(senderId) || 87654321),
-                id_str: isMe ? "87654321" : (senderId || "87654321"),
-                name: isMe ? "X Conversation" : "X Contact",
-                screen_name: isMe ? "xcontact" : "xcontact"
-              });
-
-              parsedDMs.push(formatDirectMessage(
-                msgId,
-                text,
-                isMe ? defaultUser : otherUser,
-                isMe ? otherUser : defaultUser,
-                dt
-              ));
-            }
-
-            for (const k of Object.keys(obj)) {
-              if (typeof obj[k] === 'object' && obj[k] !== null) extractDMs(obj[k]);
-            }
-          }
-          extractDMs(json);
-        }
       } catch (e) {}
     });
 
@@ -688,9 +654,6 @@ async function backgroundScrape() {
 
     await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 4000));
-
-    await page.goto('https://x.com/i/chat', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     await browser.close();
 
@@ -702,12 +665,6 @@ async function backgroundScrape() {
       localNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
       parsedNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
       localNotifications = Array.from(notifMap.values()).slice(0, 100);
-    }
-    if (parsedDMs.length > 0) {
-      const dmMap = new Map();
-      localDirectMessages.forEach(d => dmMap.set(d.id_str || d.id, d));
-      parsedDMs.forEach(d => dmMap.set(d.id_str || d.id, d));
-      localDirectMessages = Array.from(dmMap.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     }
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -726,9 +683,13 @@ app.get('/clear-cache', async (req, res) => {
   return res.send('KV Cache cleared successfully!');
 });
 
+// OAuth Redirect updated to point to your Cloudflare Worker WebAuth instance
+app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
+  const oauthToken = req.query.oauth_token || '';
+  return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
+});
+
 app.all('/oauth/request_token', (req, res) => res.send('oauth_token=mock_req_token&oauth_token_secret=mock_req_secret&oauth_callback_confirmed=true'));
-app.all('/oauth/authorize', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
-app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><p><b>1234567</b></p></body></html>`));
 
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
@@ -1008,25 +969,22 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-// COMPREHENSIVE DIRECT MESSAGES ENDPOINT ROUTING
+// Direct Message endpoints routing
 function getActiveDirectMessages() {
   return localDirectMessages.length > 0 ? localDirectMessages : getSeedDirectMessages();
 }
 
 app.get(['/1.1/direct_messages.json', '/1/direct_messages.json'], (req, res) => {
-  backgroundScrape();
   return res.status(200).json(getActiveDirectMessages());
 });
 
 app.get(['/1.1/direct_messages/sent.json', '/1/direct_messages/sent.json'], (req, res) => {
-  backgroundScrape();
   const active = getActiveDirectMessages();
   const sent = active.filter(d => d.sender_id_str === defaultUser.id_str);
   return res.status(200).json(sent.length > 0 ? sent : active);
 });
 
 app.get(['/1.1/direct_messages/conversations.json', '/1/direct_messages/conversations/list.json', '/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
-  backgroundScrape();
   const active = getActiveDirectMessages();
   const targetUserId = req.query.user_id || req.query.screen_name;
   if (!targetUserId) return res.status(200).json(active);
@@ -1042,7 +1000,6 @@ app.get(['/1.1/direct_messages/conversations.json', '/1/direct_messages/conversa
 });
 
 app.get(['/1.1/direct_messages/events/list.json', '/1/direct_messages/events/list.json'], (req, res) => {
-  backgroundScrape();
   const active = getActiveDirectMessages();
   const events = active.map(d => ({
     type: "message_create",
