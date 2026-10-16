@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -479,7 +479,7 @@ async function backgroundScrape() {
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notifications') || url.includes('Notification'))) {
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
           const json = await response.json().catch(() => null);
           if (!json) return;
 
@@ -588,11 +588,9 @@ async function backgroundScrape() {
       } catch (e) {}
     });
 
-    // Scrape home timeline
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    // Scrape notifications page to pull live interactions/mentions
     await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 5000));
 
@@ -716,21 +714,24 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   return res.status(200).json(timeline);
 });
 
-// LIVE NOTIFICATIONS: Returns captured X notifications or falls back to timeline tweets
 app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
-  const sourceList = localNotifications.length > 0 ? localNotifications : [...localTimeline, ...cachedTweets];
+  const sourceList = localNotifications.length > 0 ? localNotifications : ([...localTimeline, ...cachedTweets].length > 0 ? [...localTimeline, ...cachedTweets] : [
+    sanitizeTweet({ id: "9998881", id_str: "9998881", text: "Welcome to XitterBridge notifications!", user: { id: 111, id_str: "111", name: "Lumia Bot", screen_name: "lumiabot" } })
+  ]);
   return res.status(200).json(sourceList.slice(0, 30).map(t => sanitizeTweet(t)));
 });
 
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-// LIVE INTERACTIONS: Translates X notification interactions into API 1.1 Activity format for Windows Phone app
+// FIXED: Returns a direct JSON array of activity objects so the Windows Phone app renders interactions immediately
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
-  const sourceList = localNotifications.length > 0 ? localNotifications : [...localTimeline, ...cachedTweets];
+  const sourceList = localNotifications.length > 0 ? localNotifications : ([...localTimeline, ...cachedTweets].length > 0 ? [...localTimeline, ...cachedTweets] : [
+    sanitizeTweet({ id: "9998882", id_str: "9998882", text: "XitterBridge interaction seed", user: { id: 222, id_str: "222", name: "Daniel", screen_name: "danieldoodl5802" } })
+  ]);
   
   const activities = sourceList.slice(0, 20).map((t, idx) => ({
     action: idx % 3 === 0 ? "favorite" : (idx % 3 === 1 ? "retweet" : "mention"),
@@ -738,10 +739,11 @@ app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req
     min_position: "1234567890",
     created_at: t.created_at || new Date().toUTCString(),
     sources: [t.user || defaultUser],
-    targets: [t]
+    targets: [t],
+    target_objects: [t]
   }));
 
-  return res.status(200).json({ activities: activities });
+  return res.status(200).json(activities);
 });
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
