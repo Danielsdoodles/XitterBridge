@@ -75,7 +75,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -160,16 +160,15 @@ function sanitizeTweetText(text) {
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return null;
   
-  const mediaRes = m.media_results?.result || {};
-  const mediaLegacy = mediaRes.legacy || {};
+  const mediaRes = m.media_results?.result || m.media_results || {};
+  const mediaLegacy = mediaRes.legacy || m.legacy || m;
   
   let rawUrl = cleanStr(
+    mediaLegacy.media_url_https || 
+    mediaLegacy.media_url || 
     m.media_url_https || 
     m.media_url || 
     m.url || 
-    mediaRes.media_url_https || 
-    mediaLegacy.media_url_https || 
-    mediaLegacy.media_url || 
     mediaRes.original_info?.url || 
     ''
   );
@@ -303,7 +302,7 @@ function sanitizeTweet(t) {
 
   const sanitizedMedia = rawMediaList.map(m => sanitizeMedia(m)).filter(Boolean);
 
-  let entities = t.entities && typeof t.entities === 'object' ? t.entities : {};
+  let entities = t.entities && typeof t.entities === 'object' ? JSON.parse(JSON.stringify(t.entities)) : {};
   entities.hashtags = Array.isArray(entities.hashtags) ? entities.hashtags : [];
   entities.symbols = Array.isArray(entities.symbols) ? entities.symbols : [];
   entities.user_mentions = Array.isArray(entities.user_mentions) ? entities.user_mentions : [];
@@ -393,6 +392,47 @@ function findTweetById(allTweets, idInput) {
     String(t.id_str).slice(-9) === cleanId.slice(-9) ||
     String(t.id).slice(-9) === cleanId.slice(-9)
   );
+}
+
+function formatDirectMessage(id, text, sender, recipient, createdAt) {
+  const safeSender = sanitizeUser(sender || defaultUser);
+  const safeRecipient = sanitizeUser(recipient || defaultUser);
+  const msgIdStr = String(id || Date.now());
+
+  return {
+    id: Number(msgIdStr.slice(-9)) || 123456,
+    id_str: msgIdStr,
+    text: text,
+    sender_id: safeSender.id,
+    sender_id_str: safeSender.id_str,
+    sender_screen_name: safeSender.screen_name,
+    sender: safeSender,
+    recipient_id: safeRecipient.id,
+    recipient_id_str: safeRecipient.id_str,
+    recipient_screen_name: safeRecipient.screen_name,
+    recipient: safeRecipient,
+    created_at: formatTwitterDate(createdAt),
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }
+  };
+}
+
+function getSeedDirectMessages() {
+  const other = sanitizeUser({
+    id: 87654321,
+    id_str: "87654321",
+    name: "Lumia Support",
+    screen_name: "lumiasupport"
+  });
+
+  return [
+    formatDirectMessage(
+      "100020003",
+      "Welcome to Direct Messages on Lumia! Send messages from here to sync.",
+      other,
+      defaultUser,
+      new Date()
+    )
+  ];
 }
 
 async function saveTokensToWorker(authToken, ct0Token) {
@@ -503,7 +543,6 @@ async function backgroundScrape() {
         const json = await response.json().catch(() => null);
         if (!json) return;
 
-        // Scrape Timeline and Notifications
         if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
           const isNotif = url.includes('Notification');
 
@@ -608,8 +647,7 @@ async function backgroundScrape() {
           recursiveSearch(json);
         }
 
-        // Scrape Live Direct Messages
-        if (url.includes('dm_conversations') || url.includes('DMConversation') || url.includes('direct_messages')) {
+        if (url.includes('dm_conversations') || url.includes('DMConversation') || url.includes('direct_messages') || url.includes('useDMInboxQuery') || url.includes('DMInbox')) {
           function extractDMs(obj) {
             if (!obj || typeof obj !== 'object') return;
             if (obj.message_data && (obj.message_data.text || obj.message_data.full_text)) {
@@ -651,8 +689,8 @@ async function backgroundScrape() {
     await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    await page.goto('https://x.com/messages', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await page.goto('https://x.com/i/chat', { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     await browser.close();
 
@@ -970,59 +1008,43 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-// FULL DIRECT MESSAGES HANDLERS
-
-function formatDirectMessage(id, text, sender, recipient, createdAt) {
-  const safeSender = sanitizeUser(sender || defaultUser);
-  const safeRecipient = sanitizeUser(recipient || defaultUser);
-  const msgIdStr = String(id || Date.now());
-
-  return {
-    id: Number(msgIdStr.slice(-9)) || 123456,
-    id_str: msgIdStr,
-    text: text,
-    sender_id: safeSender.id,
-    sender_id_str: safeSender.id_str,
-    sender_screen_name: safeSender.screen_name,
-    sender: safeSender,
-    recipient_id: safeRecipient.id,
-    recipient_id_str: safeRecipient.id_str,
-    recipient_screen_name: safeRecipient.screen_name,
-    recipient: safeRecipient,
-    created_at: formatTwitterDate(createdAt),
-    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }
-  };
+// COMPREHENSIVE DIRECT MESSAGES ENDPOINT ROUTING
+function getActiveDirectMessages() {
+  return localDirectMessages.length > 0 ? localDirectMessages : getSeedDirectMessages();
 }
 
 app.get(['/1.1/direct_messages.json', '/1/direct_messages.json'], (req, res) => {
   backgroundScrape();
-  return res.status(200).json(localDirectMessages);
+  return res.status(200).json(getActiveDirectMessages());
 });
 
 app.get(['/1.1/direct_messages/sent.json', '/1/direct_messages/sent.json'], (req, res) => {
   backgroundScrape();
-  const sent = localDirectMessages.filter(d => d.sender_id_str === defaultUser.id_str);
-  return res.status(200).json(sent);
+  const active = getActiveDirectMessages();
+  const sent = active.filter(d => d.sender_id_str === defaultUser.id_str);
+  return res.status(200).json(sent.length > 0 ? sent : active);
 });
 
-app.get(['/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
+app.get(['/1.1/direct_messages/conversations.json', '/1/direct_messages/conversations/list.json', '/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
   backgroundScrape();
+  const active = getActiveDirectMessages();
   const targetUserId = req.query.user_id || req.query.screen_name;
-  if (!targetUserId) return res.status(200).json(localDirectMessages);
+  if (!targetUserId) return res.status(200).json(active);
   
-  const conversation = localDirectMessages.filter(d => 
+  const conversation = active.filter(d => 
     d.sender_id_str === String(targetUserId) || 
     d.recipient_id_str === String(targetUserId) ||
     d.sender_screen_name.toLowerCase() === String(targetUserId).toLowerCase() ||
     d.recipient_screen_name.toLowerCase() === String(targetUserId).toLowerCase()
   );
 
-  return res.status(200).json(conversation);
+  return res.status(200).json(conversation.length > 0 ? conversation : active);
 });
 
 app.get(['/1.1/direct_messages/events/list.json', '/1/direct_messages/events/list.json'], (req, res) => {
   backgroundScrape();
-  const events = localDirectMessages.map(d => ({
+  const active = getActiveDirectMessages();
+  const events = active.map(d => ({
     type: "message_create",
     id: d.id_str,
     created_timestamp: String(new Date(d.created_at).getTime() || Date.now()),
