@@ -121,7 +121,7 @@ function forceJpgUrl(url) {
   if (fixed.includes('pbs.twimg.com/media/')) {
     fixed = fixed.split('?')[0];
     if (!fixed.includes('.')) fixed += '.jpg';
-    else fixed = fixed.replace(/\.(webp|png|jpeg)$/i, '.jpg');
+    else fixed = fixed.replace(/\.(webp|png|jpeg|avif)$/i, '.jpg');
     return fixed + '?format=jpg&name=large';
   }
   return fixed;
@@ -139,14 +139,22 @@ function sanitizeTweetText(text) {
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return null;
   
-  let rawUrl = cleanStr(m.media_url_https || m.media_url || m.url || '');
+  const mediaRes = m.media_results?.result || {};
+  let rawUrl = cleanStr(
+    m.media_url_https || 
+    m.media_url || 
+    m.url || 
+    mediaRes.media_url_https || 
+    mediaRes.original_info?.url || 
+    ''
+  );
   if (!rawUrl) return null;
 
   const forcedJpg = forceJpgUrl(rawUrl);
   const httpsUrl = forcedJpg.replace(/^http:\/\//i, 'https://');
   const httpUrl = forcedJpg.replace(/^https:\/\//i, 'http://');
 
-  let videoInfo = m.video_info || m.videoInfo;
+  let videoInfo = m.video_info || m.videoInfo || mediaRes.video_info || mediaRes.videoInfo;
   if (videoInfo && Array.isArray(videoInfo.variants)) {
     videoInfo = {
       aspect_ratio: videoInfo.aspect_ratio || [16, 9],
@@ -155,9 +163,9 @@ function sanitizeMedia(m) {
         bitrate: Number(v.bitrate || 2176000),
         content_type: cleanStr(v.content_type) || 'video/mp4',
         url: cleanStr(v.url) ? cleanStr(v.url).replace(/^http:\/\//i, 'https://') : ''
-      }))
+      })).filter(v => v.url)
     };
-  } else if (m.type === 'video' || m.type === 'animated_gif') {
+  } else if (m.type === 'video' || m.type === 'animated_gif' || mediaRes.__typename === 'Video' || mediaRes.__typename === 'AnimatedGif') {
     videoInfo = {
       aspect_ratio: [16, 9],
       duration_millis: 5000,
@@ -170,14 +178,14 @@ function sanitizeMedia(m) {
   }
 
   return {
-    id: Number(m.id || Date.now()),
-    id_str: cleanStr(m.id_str) || String(m.id || Date.now()),
+    id: Number(m.id || mediaRes.rest_id || Date.now()),
+    id_str: cleanStr(m.id_str || mediaRes.rest_id || String(m.id || Date.now())),
     media_url: httpUrl,
     media_url_https: httpsUrl,
     url: cleanStr(m.url) || httpsUrl,
     display_url: cleanStr(m.display_url) || 'pic.twitter.com',
     expanded_url: cleanStr(m.expanded_url) || httpsUrl,
-    type: cleanStr(m.type) || 'photo',
+    type: cleanStr(m.type || mediaRes.__typename?.toLowerCase() || 'photo'),
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
     sizes: {
       thumb: { w: m.sizes?.thumb?.w || 150, h: m.sizes?.thumb?.h || 150, resize: 'crop' },
@@ -233,7 +241,7 @@ function sanitizeUser(u) {
     is_translator: false,
     profile_background_color: "C0DEED",
     profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
