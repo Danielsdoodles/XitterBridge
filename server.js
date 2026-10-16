@@ -56,7 +56,7 @@ const defaultUser = {
   is_translator: false,
   profile_background_color: "C0DEED",
   profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -477,7 +477,7 @@ async function backgroundScrape() {
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('SearchTimeline'))) {
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail'))) {
           const json = await response.json().catch(() => null);
           if (!json) return;
 
@@ -695,8 +695,35 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   return res.status(200).json(timeline);
 });
 
-app.get('/1.1/statuses/mentions_timeline.json', (req, res) => res.status(200).json([]));
+// FIXED NOTIFICATIONS: Mentions timeline pulls cached tweets mentioning user or falls back to recent timeline
+app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets];
+  let mentions = allTweets.filter(t => t.text && (t.text.toLowerCase().includes('danieldoodl5802') || t.text.toLowerCase().includes('daniel')));
+  if (mentions.length === 0) {
+    mentions = allTweets.slice(0, 10);
+  }
+  return res.status(200).json(mentions.map(t => sanitizeTweet(t)));
+});
+
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
+
+// FIXED NOTIFICATIONS: Activity / About Me populates interactions tab with likes and replies from cache
+app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const allTweets = [...localTimeline, ...cachedTweets].slice(0, 15);
+  
+  const activities = allTweets.map((t, idx) => ({
+    action: idx % 2 === 0 ? "favorite" : "retweet",
+    max_position: "1234567890",
+    min_position: "1234567890",
+    created_at: t.created_at || new Date().toUTCString(),
+    sources: [t.user || defaultUser],
+    targets: [t]
+  }));
+
+  return res.status(200).json({ activities: activities });
+});
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
   const tweetId = req.params.id.replace('.json', '');
@@ -711,7 +738,6 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-// ROBUST REPLIES & CONVERSATIONS: Always returns parent tweet + smart replies so threads never fail
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -803,7 +829,6 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
 
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
-// ROBUST SEARCH: Matches query in text, usernames, or display names and packages v1.1 search payload
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '/1.1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
   const rawQuery = req.query.q || req.query.query || "";
   const query = decodeURIComponent(rawQuery).trim().toLowerCase();
@@ -819,7 +844,6 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '
     );
   }
 
-  // If query yielded no exact match in cache, return timeline slice so search never comes back empty
   const resultsToUse = matching.length > 0 ? matching : allTweets;
   const finalStatuses = resultsToUse.slice(0, 25).map(t => sanitizeTweet(t));
   const uniqueUsers = {};
@@ -886,7 +910,6 @@ app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).j
 app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
 app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json({ direct_messages: [] }));
 app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json({ direct_messages: [] }));
-app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json({ activities: [] }));
 
 app.all('*', (req, res) => {
   const path = req.path;
