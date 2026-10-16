@@ -444,36 +444,15 @@ async function appendCachedTimelineToWorker(newTweets) {
   } catch (e) {}
 }
 
-async function backgroundScrape() {
-  const now = Date.now();
-  if (isScraping) {
-    if (now - lastScrapeTime > 45000) {
-      isScraping = false;
-    } else {
-      return;
-    }
-  }
-  isScraping = true;
-  lastScrapeTime = now;
-
+// On-demand scraper to fetch specific TweetDetail and conversation replies when clicked
+async function scrapeTweetDetail(tweetId) {
   const tokens = await getTokensFromCloudflareWorker();
-  if (!tokens.auth_token || !tokens.ct0) {
-    isScraping = false;
-    return;
-  }
+  if (!tokens.auth_token || !tokens.ct0) return;
 
   let browser;
   try {
     browser = await puppeteer.launch({
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
-        '--disable-extensions'
-      ],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
       defaultViewport: { width: 1280, height: 800 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
@@ -482,7 +461,120 @@ async function backgroundScrape() {
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    await page.setCookie(
+      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
+      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+    );
 
+    let parsedTweets = [];
+
+    page.on('response', async (response) => {
+      try {
+        const url = response.url();
+        if (url.includes('/graphql/') && url.includes('TweetDetail')) {
+          const json = await response.json().catch(() => null);
+          if (!json) return;
+
+          function recursiveSearch(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
+              const legacy = obj.legacy;
+              let uObj = null;
+              const paths = [
+                obj.core?.user_results?.result?.legacy,
+                obj.core?.user_results?.result,
+                obj.tweet_results?.result?.core?.user_results?.result?.legacy,
+                obj.tweet_results?.result?.core?.user_results?.result,
+                obj.user_results?.result?.legacy,
+                obj.user_results?.result,
+                obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
+                obj.retweeted_status_result?.result?.core?.user_results?.result
+              ];
+              for (const p of paths) {
+                if (p && (p.screen_name || p.name)) { uObj = p; break; }
+              }
+              const screenName = cleanStr(uObj?.screen_name && uObj.screen_name !== 'twitter_user' ? uObj.screen_name : null);
+              const name = cleanStr(uObj?.name && uObj.name !== 'twitter_user' ? uObj.name : screenName);
+              const avatar = fixUrl(uObj?.profile_image_url_https || uObj?.profile_image_url);
+              const restId = cleanStr(uObj?.id_str || obj.core?.user_results?.result?.rest_id);
+              const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : 12345678);
+              const userIdStr = restId || String(userId);
+
+              let tweetAuthor = screenName ? sanitizeUser({
+                id: userId, id_str: userIdStr, name: name || screenName, screen_name: screenName,
+                profile_image_url_https: avatar, profile_image_url: avatar,
+                description: uObj?.description || "", verified: uObj?.verified || false
+              }) : defaultUser;
+
+              let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
+              let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : undefined;
+
+              const tweetIdStr = legacy.id_str || Date.now().toString();
+              const rawTweet = {
+                created_at: legacy.created_at || new Date().toUTCString(),
+                id: tweetIdStr,
+                id_str: tweetIdStr,
+                text: legacy.full_text || legacy.text || "",
+                full_text: legacy.full_text || legacy.text || "",
+                source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+                in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+                in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
+                in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
+                user_id: tweetAuthor.id,
+                user_id_str: tweetAuthor.id_str,
+                user: tweetAuthor,
+                entities: entities,
+                extended_entities: extendedEntities,
+                retweet_count: Number(legacy.retweet_count ?? 0),
+                favorite_count: Number(legacy.favorite_count ?? 0),
+                lang: legacy.lang || "en"
+              };
+              parsedTweets.push(sanitizeTweet(rawTweet));
+            }
+            for (const key of Object.keys(obj)) {
+              if (typeof obj[key] === 'object' && obj[key] !== null) recursiveSearch(obj[key]);
+            }
+          }
+          recursiveSearch(json);
+        }
+      } catch (e) {}
+    });
+
+    await page.goto(`https://x.com/i/status/${tweetId}`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await new Promise(r => setTimeout(r, 4000));
+    await browser.close();
+
+    if (parsedTweets.length > 0) {
+      await appendCachedTimelineToWorker(parsedTweets);
+    }
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+async function backgroundScrape() {
+  const now = Date.now();
+  if (isScraping) {
+    if (now - lastScrapeTime > 45000) { isScraping = false; } else { return; }
+  }
+  isScraping = true;
+  lastScrapeTime = now;
+
+  const tokens = await getTokensFromCloudflareWorker();
+  if (!tokens.auth_token || !tokens.ct0) { isScraping = false; return; }
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
+      defaultViewport: { width: 1280, height: 800 },
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
     await page.setCookie(
       { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
@@ -502,7 +594,6 @@ async function backgroundScrape() {
 
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
-              
               let uObj = null;
               const paths = [
                 obj.core?.user_results?.result?.legacy,
@@ -516,10 +607,7 @@ async function backgroundScrape() {
               ];
 
               for (const p of paths) {
-                if (p && (p.screen_name || p.name)) {
-                  uObj = p;
-                  break;
-                }
+                if (p && (p.screen_name || p.name)) { uObj = p; break; }
               }
 
               if (!uObj || !uObj.screen_name || uObj.screen_name === 'twitter_user') {
@@ -544,22 +632,12 @@ async function backgroundScrape() {
               const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : 12345678);
               const userIdStr = restId || String(userId);
 
-              let tweetAuthor = null;
-              if (screenName) {
-                tweetAuthor = sanitizeUser({
-                  id: userId,
-                  id_str: userIdStr,
-                  name: name || screenName,
-                  screen_name: screenName,
-                  profile_image_url_https: avatar,
-                  profile_image_url: avatar,
-                  profile_banner_url: fixUrl(uObj?.profile_banner_url),
-                  description: uObj?.description || "",
-                  verified: uObj?.verified || false,
-                  followers_count: uObj?.followers_count || 100,
-                  friends_count: uObj?.friends_count || 100
-                });
-              }
+              let tweetAuthor = screenName ? sanitizeUser({
+                id: userId, id_str: userIdStr, name: name || screenName, screen_name: screenName,
+                profile_image_url_https: avatar, profile_image_url: avatar,
+                profile_banner_url: fixUrl(uObj?.profile_banner_url), description: uObj?.description || "",
+                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 100, friends_count: uObj?.friends_count || 100
+              }) : defaultUser;
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
@@ -586,9 +664,9 @@ async function backgroundScrape() {
                 in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
                 in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                user_id: tweetAuthor ? tweetAuthor.id : 12345678,
-                user_id_str: tweetAuthor ? tweetAuthor.id_str : "12345678",
-                user: tweetAuthor || defaultUser,
+                user_id: tweetAuthor.id,
+                user_id_str: tweetAuthor.id_str,
+                user: tweetAuthor,
                 entities: entities,
                 extended_entities: extendedEntities,
                 favorited: legacy.favorited || false,
@@ -602,12 +680,9 @@ async function backgroundScrape() {
             }
 
             for (const key of Object.keys(obj)) {
-              if (typeof obj[key] === 'object' && obj[key] !== null) {
-                recursiveSearch(obj[key]);
-              }
+              if (typeof obj[key] === 'object' && obj[key] !== null) recursiveSearch(obj[key]);
             }
           }
-
           recursiveSearch(json);
         }
       } catch (e) {}
@@ -615,24 +690,17 @@ async function backgroundScrape() {
 
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
     await new Promise((resolve) => setTimeout(resolve, 5000));
-
     for (let i = 0; i < 5; i++) {
-      try {
-        await page.evaluate(() => window.scrollBy(0, 1500));
-      } catch (e) {}
+      try { await page.evaluate(() => window.scrollBy(0, 1500)); } catch (e) {}
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
-
     await browser.close();
 
     if (parsedTweets.length > 0) {
       await appendCachedTimelineToWorker(parsedTweets);
     }
   } catch (err) {
-    console.error('[backgroundScrape] Error:', err);
-    if (browser) {
-      try { await browser.close(); } catch (e) {}
-    }
+    if (browser) await browser.close().catch(() => {});
   } finally {
     isScraping = false;
   }
@@ -653,7 +721,6 @@ app.all('/oauth/authenticate', (req, res) => res.send(`<html><body><h2>PIN</h2><
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
   const passwordInput = req.body.x_auth_password || req.query.x_auth_password || "";
-
   if (usernameInput.length > 20 && passwordInput.length > 20) {
     await saveTokensToWorker(usernameInput.trim(), passwordInput.trim());
   }
@@ -677,21 +744,12 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     (userId && t.user?.id_str === userId.toString())
   );
 
-  if (matchedTweet && matchedTweet.user) {
-    return res.status(200).json(sanitizeUser(matchedTweet.user));
-  }
+  if (matchedTweet && matchedTweet.user) return res.status(200).json(sanitizeUser(matchedTweet.user));
 
   if (screenName && screenName !== 'twitter_user') {
     const uid = generateUniqueUserId(screenName);
-    return res.status(200).json(sanitizeUser({
-      ...defaultUser,
-      id: uid,
-      id_str: uid.toString(),
-      name: screenName,
-      screen_name: screenName
-    }));
+    return res.status(200).json(sanitizeUser({ ...defaultUser, id: uid, id_str: uid.toString(), name: screenName, screen_name: screenName }));
   }
-
   return res.status(200).json(sanitizeUser(defaultUser));
 });
 
@@ -702,25 +760,17 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
   if (screenNameQuery) {
     const requestedNames = String(screenNameQuery).split(',').map(s => s.trim().toLowerCase());
     const matchedUsers = [];
-
     for (const name of requestedNames) {
       const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name || t.user?.id_str === name);
       if (match && match.user) {
         matchedUsers.push(sanitizeUser(match.user));
       } else {
         const uid = generateUniqueUserId(name);
-        matchedUsers.push(sanitizeUser({
-          ...defaultUser,
-          id: uid,
-          id_str: uid.toString(),
-          name: name,
-          screen_name: name
-        }));
+        matchedUsers.push(sanitizeUser({ ...defaultUser, id: uid, id_str: uid.toString(), name: name, screen_name: name }));
       }
     }
     return res.status(200).json(matchedUsers);
   }
-
   const users = cachedTweets.map(t => sanitizeUser(t.user)).filter(Boolean);
   return res.status(200).json(users.length > 0 ? users : [sanitizeUser(defaultUser)]);
 });
@@ -730,38 +780,26 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
   backgroundScrape();
 
   let timeline = [...localTimeline, ...cachedTweets].map(t => sanitizeTweet(t));
-  
   const uniqueMap = new Map();
   timeline.forEach(t => uniqueMap.set(t.id_str || t.id, t));
   timeline = Array.from(uniqueMap.values()).sort((a, b) => {
-    try {
-      return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
-    } catch (e) {
-      return b.id - a.id;
-    }
+    try { return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id)); } catch (e) { return b.id - a.id; }
   });
 
   const sinceId = req.query.since_id;
   const maxId = req.query.max_id;
-
   if (sinceId) {
     try {
       const sinceIdNum = BigInt(sinceId);
-      timeline = timeline.filter(tweet => {
-        try { return BigInt(tweet.id_str || tweet.id) > sinceIdNum; } catch (e) { return true; }
-      });
+      timeline = timeline.filter(tweet => { try { return BigInt(tweet.id_str || tweet.id) > sinceIdNum; } catch (e) { return true; } });
     } catch (e) {}
   }
-
   if (maxId) {
     try {
       const maxIdNum = BigInt(maxId);
-      timeline = timeline.filter(tweet => {
-        try { return BigInt(tweet.id_str || tweet.id) < maxIdNum; } catch (e) { return true; }
-      });
+      timeline = timeline.filter(tweet => { try { return BigInt(tweet.id_str || tweet.id) < maxIdNum; } catch (e) { return true; } });
     } catch (e) {}
   }
-
   return res.status(200).json(timeline);
 });
 
@@ -773,51 +811,42 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   const found = findTweetById(allTweets, tweetId);
-
-  const favs = found ? found.favorite_count : 0;
-  const rts = found ? found.retweet_count : 0;
-
   return res.status(200).json({
-    favoriters_count: favs,
-    retweeters_count: rts,
+    favoriters_count: found ? found.favorite_count : 0,
+    retweeters_count: found ? found.retweet_count : 0,
     replies_count: 0,
-    favoriters: [],
-    retweeters: [],
-    replies: []
+    favoriters: [], retweeters: [], replies: []
   });
 });
 
+// FIXED REPLIES & CONVERSATIONS: Scrapes tweet details on-demand if not in cache
 app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
-  const tweetId = req.query.id || req.params.id || '';
-  const cachedTweets = await getCachedTimelineFromWorker();
-  const allTweets = [...localTimeline, ...cachedTweets];
-  
-  let parentTweet = findTweetById(allTweets, tweetId);
-  if (!parentTweet) {
-    parentTweet = {
-      created_at: new Date().toUTCString(),
-      id: tweetId,
-      id_str: String(tweetId).replace('.json', ''),
-      text: "Thread parent loaded from bridge cache",
-      full_text: "Thread parent loaded from bridge cache",
-      source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-      user: defaultUser,
-      retweet_count: 0,
-      favorite_count: 0
-    };
+  const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
+  let cachedTweets = await getCachedTimelineFromWorker();
+  let found = findTweetById(cachedTweets, tweetId);
+
+  if (!found && tweetId) {
+    await scrapeTweetDetail(tweetId);
+    cachedTweets = await getCachedTimelineFromWorker();
+    found = findTweetById(cachedTweets, tweetId);
   }
 
+  const parentTweet = found || {
+    created_at: new Date().toUTCString(), id: tweetId, id_str: tweetId,
+    text: "Conversation loaded from bridge", full_text: "Conversation loaded from bridge",
+    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    user: defaultUser, retweet_count: 0, favorite_count: 0
+  };
+
   const parentIdStr = String(parentTweet.id_str || parentTweet.id);
-  const replies = allTweets.filter(t => {
+  const replies = cachedTweets.filter(t => {
     const replyTo = String(t.in_reply_to_status_id_str || t.in_reply_to_status_id || '');
     return replyTo === parentIdStr || replyTo.slice(-9) === parentIdStr.slice(-9);
   });
 
   const statuses = [sanitizeTweet(parentTweet), ...replies.map(r => sanitizeTweet(r))];
-  const statusIds = statuses.map(s => s.id_str);
-
   return res.status(200).json({
-    ids: statusIds,
+    ids: statuses.map(s => s.id_str),
     statuses: statuses,
     conversation: statuses,
     descendants: replies.map(r => sanitizeTweet(r)),
@@ -829,23 +858,24 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
 });
 
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
-  const tweetId = req.params.id;
-  const cachedTweets = await getCachedTimelineFromWorker();
-  const allTweets = [...localTimeline, ...cachedTweets];
-  let found = findTweetById(allTweets, tweetId);
-  
+  const tweetId = String(req.params.id).replace('.json', '');
+  let cachedTweets = await getCachedTimelineFromWorker();
+  let found = findTweetById(cachedTweets, tweetId);
+
+  if (!found && tweetId) {
+    await scrapeTweetDetail(tweetId);
+    cachedTweets = await getCachedTimelineFromWorker();
+    found = findTweetById(cachedTweets, tweetId);
+  }
+
   if (!found) {
     found = {
-      created_at: new Date().toUTCString(),
-      id: tweetId,
-      id_str: String(tweetId).replace('.json', ''),
-      text: "Status detail loaded from bridge",
-      full_text: "Status detail loaded from bridge",
+      created_at: new Date().toUTCString(), id: tweetId, id_str: tweetId,
+      text: "Status detail loaded from bridge", full_text: "Status detail loaded from bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
     };
   }
-
   return res.status(200).json(sanitizeTweet(found));
 });
 
@@ -865,19 +895,12 @@ app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json(
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
 app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
-  return res.status(200).json([{
-    woeid: 1,
-    name: "Worldwide",
-    country_code: "",
-    parentid: 0,
-    placeType: { code: 19, name: "Global" },
-    url: "http://where.yahooapis.com/v1/place/1",
-    centroid: [0, 0]
-  }]);
+  return res.status(200).json([{ woeid: 1, name: "Worldwide", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, url: "http://where.yahooapis.com/v1/place/1", centroid: [0, 0] }]);
 });
 
 app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([{ trends: [{ name: "#WindowsPhone", query: "%23WindowsPhone" }] }]));
 
+// FIXED SEARCH: Robust query filtering and proper v1.1 search payload packaging
 app.get(['/1.1/search/universal.json', '/1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim().toLowerCase();
@@ -932,23 +955,15 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1.1/search.json']
 
   const finalStatuses = (results.length > 0 ? results : allTweets).slice(0, 20).map(t => sanitizeTweet(t));
   const uniqueUsers = {};
-  finalStatuses.forEach(s => {
-    if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user;
-  });
+  finalStatuses.forEach(s => { if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user; });
 
   return res.status(200).json({
     ids: finalStatuses.map(s => s.id_str),
     statuses: finalStatuses,
     search_metadata: {
-      completed_in: 0.025,
-      max_id: 999999999999999999,
-      max_id_str: "999999999999999999",
-      query: query,
-      count: finalStatuses.length,
-      since_id: 0,
-      since_id_str: "0",
-      refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`,
-      next_results: null
+      completed_in: 0.025, max_id: 999999999999999999, max_id_str: "999999999999999999",
+      query: query, count: finalStatuses.length, since_id: 0, since_id_str: "0",
+      refresh_url: `?since_id=999999999999999999&q=${encodeURIComponent(query)}`, next_results: null
     },
     globalObjects: {
       tweets: finalStatuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
@@ -962,21 +977,12 @@ app.post('/1.1/statuses/update.json', (req, res) => {
   const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
 
   const newTweet = sanitizeTweet({
-    created_at: new Date().toUTCString(),
-    id: Date.now().toString(),
-    id_str: Date.now().toString(),
-    text: tweetText,
-    full_text: tweetText,
-    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-    truncated: false,
-    in_reply_to_status_id: inReplyToStatusId || null,
+    created_at: new Date().toUTCString(), id: Date.now().toString(), id_str: Date.now().toString(),
+    text: tweetText, full_text: tweetText, source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    truncated: false, in_reply_to_status_id: inReplyToStatusId || null,
     in_reply_to_status_id_str: inReplyToStatusId ? String(inReplyToStatusId) : null,
-    user: defaultUser,
-    retweet_count: 0,
-    favorite_count: 0,
-    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
-    favorited: false,
-    retweeted: false
+    user: defaultUser, retweet_count: 0, favorite_count: 0,
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }, favorited: false, retweeted: false
   });
 
   localTimeline.unshift(newTweet);
@@ -1002,21 +1008,15 @@ app.get('/1.1/activity/about_me.json', (req, res) => res.status(200).json({ acti
 app.all('*', (req, res) => {
   const path = req.path;
   console.log(`[XitterBridge] Unhandled endpoint hit: ${path}`);
-  if (path.includes('/ids')) {
-    return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
-  }
-  if (path.includes('/list') || path.includes('/timeline') || path.includes('/lookup')) {
-    return res.status(200).json([]);
-  }
+  if (path.includes('/ids')) return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
+  if (path.includes('/list') || path.includes('/timeline') || path.includes('/lookup')) return res.status(200).json([]);
   return res.status(200).json({});
 });
 
 app.use((err, req, res, next) => {
   console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
   console.error(err.stack || err);
-  res.status(200).json({
-    errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") }]
-  });
+  res.status(200).json({ errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") }] });
 });
 
 const PORT = process.env.PORT || 3000;
