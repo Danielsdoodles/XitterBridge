@@ -27,6 +27,25 @@ app.use((req, res, next) => {
   next();
 });
 
+function formatTwitterDate(dateObj) {
+  try {
+    const d = dateObj ? new Date(dateObj) : new Date();
+    if (isNaN(d.getTime())) return "Wed Oct 10 00:00:00 +0000 2026";
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const dayName = days[d.getUTCDay()];
+    const monthName = months[d.getUTCMonth()];
+    const dayNum = String(d.getUTCDate()).padStart(2, '0');
+    const hours = String(d.getUTCHours()).padStart(2, '0');
+    const mins = String(d.getUTCMinutes()).padStart(2, '0');
+    const secs = String(d.getUTCSeconds()).padStart(2, '0');
+    const year = d.getUTCFullYear();
+    return `${dayName} ${monthName} ${dayNum} ${hours}:${mins}:${secs} +0000 ${year}`;
+  } catch (e) {
+    return "Wed Oct 10 00:00:00 +0000 2026";
+  }
+}
+
 const defaultUser = {
   id: 12345678,
   id_str: "12345678",
@@ -40,7 +59,7 @@ const defaultUser = {
   followers_count: 150,
   friends_count: 150,
   listed_count: 5,
-  created_at: "Wed Oct 10 00:00:00 +0000 2026",
+  created_at: formatTwitterDate(),
   favourites_count: 42,
   statuses_count: 10,
   profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
@@ -231,7 +250,7 @@ function sanitizeUser(u) {
     followers_count: Number(u.followers_count ?? 100),
     friends_count: Number(u.friends_count ?? 100),
     listed_count: Number(u.listed_count ?? 0),
-    created_at: cleanStr(u.created_at) || "Wed Oct 10 00:00:00 +0000 2026",
+    created_at: formatTwitterDate(u.created_at),
     favourites_count: Number(u.favourites_count ?? 100),
     statuses_count: Number(u.statuses_count ?? 100),
     profile_image_url: avatar,
@@ -327,7 +346,7 @@ function sanitizeTweet(t) {
   }
 
   return {
-    created_at: cleanStr(t.created_at) || new Date().toUTCString(),
+    created_at: formatTwitterDate(t.created_at),
     id: safeId,
     id_str: idStr,
     text: cleanedText,
@@ -476,14 +495,16 @@ async function backgroundScrape() {
 
     let parsedTweets = [];
     let parsedNotifications = [];
+    let parsedDMs = [];
 
     page.on('response', async (response) => {
       try {
         const url = response.url();
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
-          const json = await response.json().catch(() => null);
-          if (!json) return;
+        const json = await response.json().catch(() => null);
+        if (!json) return;
 
+        // Scrape Timeline and Notifications
+        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
           const isNotif = url.includes('Notification');
 
           function recursiveSearch(obj) {
@@ -549,7 +570,7 @@ async function backgroundScrape() {
               const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? 0);
 
               const rawTweet = {
-                created_at: legacy.created_at || new Date().toUTCString(),
+                created_at: formatTwitterDate(legacy.created_at),
                 id: tweetIdStr,
                 id_str: tweetIdStr,
                 text: legacy.full_text || legacy.text || "",
@@ -586,6 +607,41 @@ async function backgroundScrape() {
           }
           recursiveSearch(json);
         }
+
+        // Scrape Live Direct Messages
+        if (url.includes('dm_conversations') || url.includes('DMConversation') || url.includes('direct_messages')) {
+          function extractDMs(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            if (obj.message_data && (obj.message_data.text || obj.message_data.full_text)) {
+              const text = obj.message_data.text || obj.message_data.full_text;
+              const senderId = cleanStr(obj.sender_id || obj.message_data.sender_id);
+              const msgId = cleanStr(obj.id || obj.message_id || Date.now().toString());
+              const timeVal = obj.time || obj.created_timestamp || Date.now();
+              const dt = new Date(Number(timeVal) || Date.now());
+
+              const isMe = senderId === defaultUser.id_str || senderId === String(defaultUser.id);
+              const otherUser = sanitizeUser({
+                id: isMe ? 87654321 : (Number(senderId) || 87654321),
+                id_str: isMe ? "87654321" : (senderId || "87654321"),
+                name: isMe ? "X Conversation" : "X Contact",
+                screen_name: isMe ? "xcontact" : "xcontact"
+              });
+
+              parsedDMs.push(formatDirectMessage(
+                msgId,
+                text,
+                isMe ? defaultUser : otherUser,
+                isMe ? otherUser : defaultUser,
+                dt
+              ));
+            }
+
+            for (const k of Object.keys(obj)) {
+              if (typeof obj[k] === 'object' && obj[k] !== null) extractDMs(obj[k]);
+            }
+          }
+          extractDMs(json);
+        }
       } catch (e) {}
     });
 
@@ -593,12 +649,11 @@ async function backgroundScrape() {
     await new Promise((resolve) => setTimeout(resolve, 4000));
 
     await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await new Promise((resolve) => setTimeout(resolve, 4000));
 
-    for (let i = 0; i < 3; i++) {
-      try { await page.evaluate(() => window.scrollBy(0, 1500)); } catch (e) {}
-      await new Promise((resolve) => setTimeout(resolve, 2500));
-    }
+    await page.goto('https://x.com/messages', { waitUntil: 'domcontentloaded', timeout: 25000 });
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+
     await browser.close();
 
     if (parsedTweets.length > 0) {
@@ -609,6 +664,12 @@ async function backgroundScrape() {
       localNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
       parsedNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
       localNotifications = Array.from(notifMap.values()).slice(0, 100);
+    }
+    if (parsedDMs.length > 0) {
+      const dmMap = new Map();
+      localDirectMessages.forEach(d => dmMap.set(d.id_str || d.id, d));
+      parsedDMs.forEach(d => dmMap.set(d.id_str || d.id, d));
+      localDirectMessages = Array.from(dmMap.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     }
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -727,7 +788,6 @@ app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
 
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-// FIX ACTIVITY LOGS: Includes multiple sources to prevent "-1 others" formatting on client
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -741,7 +801,7 @@ app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req
     action: idx % 3 === 0 ? "favorite" : (idx % 3 === 1 ? "retweet" : "mention"),
     max_position: "1234567890",
     min_position: "1234567890",
-    created_at: t.created_at || new Date().toUTCString(),
+    created_at: formatTwitterDate(t.created_at),
     sources: [t.user || defaultUser, secondUser],
     targets: [t],
     target_objects: [t]
@@ -770,7 +830,7 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
   let found = findTweetById(allTweets, tweetId);
 
   const parentTweet = found || {
-    created_at: new Date().toUTCString(), id: tweetId, id_str: tweetId,
+    created_at: formatTwitterDate(), id: tweetId, id_str: tweetId,
     text: "Tweet conversation loaded", full_text: "Tweet conversation loaded",
     source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     user: defaultUser, retweet_count: 0, favorite_count: 0
@@ -803,7 +863,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
   
   if (!found) {
     found = {
-      created_at: new Date().toUTCString(), id: tweetId, id_str: tweetId,
+      created_at: formatTwitterDate(), id: tweetId, id_str: tweetId,
       text: "Status detail loaded from bridge", full_text: "Status detail loaded from bridge",
       source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
       user: defaultUser
@@ -888,7 +948,7 @@ app.post('/1.1/statuses/update.json', (req, res) => {
   const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
 
   const newTweet = sanitizeTweet({
-    created_at: new Date().toUTCString(), id: Date.now().toString(), id_str: Date.now().toString(),
+    created_at: formatTwitterDate(), id: Date.now().toString(), id_str: Date.now().toString(),
     text: tweetText, full_text: tweetText, source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false, in_reply_to_status_id: inReplyToStatusId || null,
     in_reply_to_status_id_str: inReplyToStatusId ? String(inReplyToStatusId) : null,
@@ -910,7 +970,7 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-// DIRECT MESSAGES ENDPOINTS (v1.1 Legacy & Event Endpoints)
+// FULL DIRECT MESSAGES HANDLERS
 
 function formatDirectMessage(id, text, sender, recipient, createdAt) {
   const safeSender = sanitizeUser(sender || defaultUser);
@@ -929,41 +989,40 @@ function formatDirectMessage(id, text, sender, recipient, createdAt) {
     recipient_id_str: safeRecipient.id_str,
     recipient_screen_name: safeRecipient.screen_name,
     recipient: safeRecipient,
-    created_at: createdAt || new Date().toUTCString(),
+    created_at: formatTwitterDate(createdAt),
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }
   };
 }
 
-// Seed default welcome DM if array is empty
-function getDMList() {
-  if (localDirectMessages.length === 0) {
-    const welcomeDM = formatDirectMessage(
-      "100020003",
-      "Welcome to Direct Messages on Lumia! Messages sent from here will sync locally.",
-      { id: 87654321, id_str: "87654321", name: "Lumia Support", screen_name: "lumiasupport" },
-      defaultUser,
-      new Date().toUTCString()
-    );
-    localDirectMessages.push(welcomeDM);
-  }
-  return localDirectMessages;
-}
-
-// 1. Legacy GET `/1.1/direct_messages.json` (Received DMs)
 app.get(['/1.1/direct_messages.json', '/1/direct_messages.json'], (req, res) => {
-  return res.status(200).json(getDMList());
+  backgroundScrape();
+  return res.status(200).json(localDirectMessages);
 });
 
-// 2. Legacy GET `/1.1/direct_messages/sent.json` (Sent DMs)
 app.get(['/1.1/direct_messages/sent.json', '/1/direct_messages/sent.json'], (req, res) => {
-  const sent = getDMList().filter(d => d.sender_id_str === defaultUser.id_str);
-  return res.status(200).json(sent.length > 0 ? sent : getDMList());
+  backgroundScrape();
+  const sent = localDirectMessages.filter(d => d.sender_id_str === defaultUser.id_str);
+  return res.status(200).json(sent);
 });
 
-// 3. Event API GET `/1.1/direct_messages/events/list.json`
+app.get(['/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
+  backgroundScrape();
+  const targetUserId = req.query.user_id || req.query.screen_name;
+  if (!targetUserId) return res.status(200).json(localDirectMessages);
+  
+  const conversation = localDirectMessages.filter(d => 
+    d.sender_id_str === String(targetUserId) || 
+    d.recipient_id_str === String(targetUserId) ||
+    d.sender_screen_name.toLowerCase() === String(targetUserId).toLowerCase() ||
+    d.recipient_screen_name.toLowerCase() === String(targetUserId).toLowerCase()
+  );
+
+  return res.status(200).json(conversation);
+});
+
 app.get(['/1.1/direct_messages/events/list.json', '/1/direct_messages/events/list.json'], (req, res) => {
-  const dms = getDMList();
-  const events = dms.map(d => ({
+  backgroundScrape();
+  const events = localDirectMessages.map(d => ({
     type: "message_create",
     id: d.id_str,
     created_timestamp: String(new Date(d.created_at).getTime() || Date.now()),
@@ -980,7 +1039,6 @@ app.get(['/1.1/direct_messages/events/list.json', '/1/direct_messages/events/lis
   return res.status(200).json({ events: events, next_cursor: null });
 });
 
-// 4. Send Message Endpoint (POST `/1.1/direct_messages/new.json` & `/1.1/direct_messages/events/new.json`)
 app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json', '/1/direct_messages/new.json'], (req, res) => {
   const text = req.body?.text || req.body?.status || req.body?.event?.message_create?.message_data?.text || "Hello from Lumia!";
   const recipientScreen = req.body?.screen_name || req.body?.user_id || "lumiasupport";
@@ -997,12 +1055,11 @@ app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json
     text,
     defaultUser,
     recipientUser,
-    new Date().toUTCString()
+    new Date()
   );
 
   localDirectMessages.unshift(newDM);
 
-  // Return both legacy and event payload structures so whichever method client expects parses cleanly
   return res.status(200).json({
     event: {
       type: "message_create",
