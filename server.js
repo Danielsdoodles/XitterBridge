@@ -73,6 +73,7 @@ const defaultUser = {
 
 let localTimeline = [];
 let localNotifications = [];
+let localDirectMessages = [];
 let isScraping = false;
 let lastScrapeTime = 0;
 
@@ -622,6 +623,7 @@ app.get('/clear-cache', async (req, res) => {
   await appendCachedTimelineToWorker([]);
   localTimeline = [];
   localNotifications = [];
+  localDirectMessages = [];
   return res.send('KV Cache cleared successfully!');
 });
 
@@ -725,7 +727,7 @@ app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
 
 app.get('/1.1/statuses/user_timeline.json', (req, res) => res.status(200).json(localTimeline.map(t => sanitizeTweet(t))));
 
-// FIXED: Returns a direct JSON array of activity objects so the Windows Phone app renders interactions immediately
+// FIX ACTIVITY LOGS: Includes multiple sources to prevent "-1 others" formatting on client
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -733,12 +735,14 @@ app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req
     sanitizeTweet({ id: "9998882", id_str: "9998882", text: "XitterBridge interaction seed", user: { id: 222, id_str: "222", name: "Daniel", screen_name: "danieldoodl5802" } })
   ]);
   
+  const secondUser = sanitizeUser({ id: 87654321, id_str: "87654321", name: "Lumia Support", screen_name: "lumiasupport" });
+
   const activities = sourceList.slice(0, 20).map((t, idx) => ({
     action: idx % 3 === 0 ? "favorite" : (idx % 3 === 1 ? "retweet" : "mention"),
     max_position: "1234567890",
     min_position: "1234567890",
     created_at: t.created_at || new Date().toUTCString(),
-    sources: [t.user || defaultUser],
+    sources: [t.user || defaultUser, secondUser],
     targets: [t],
     target_objects: [t]
   }));
@@ -906,10 +910,113 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-app.get('/1.1/direct_messages/events/list.json', (req, res) => res.status(200).json({ events: [] }));
-app.post('/1.1/direct_messages/events/new.json', (req, res) => res.status(200).json({ event: { type: "message_create", id: "12345" } }));
-app.get('/1.1/direct_messages.json', (req, res) => res.status(200).json({ direct_messages: [] }));
-app.get('/1.1/direct_messages/sent.json', (req, res) => res.status(200).json({ direct_messages: [] }));
+// DIRECT MESSAGES ENDPOINTS (v1.1 Legacy & Event Endpoints)
+
+function formatDirectMessage(id, text, sender, recipient, createdAt) {
+  const safeSender = sanitizeUser(sender || defaultUser);
+  const safeRecipient = sanitizeUser(recipient || defaultUser);
+  const msgIdStr = String(id || Date.now());
+
+  return {
+    id: Number(msgIdStr.slice(-9)) || 123456,
+    id_str: msgIdStr,
+    text: text,
+    sender_id: safeSender.id,
+    sender_id_str: safeSender.id_str,
+    sender_screen_name: safeSender.screen_name,
+    sender: safeSender,
+    recipient_id: safeRecipient.id,
+    recipient_id_str: safeRecipient.id_str,
+    recipient_screen_name: safeRecipient.screen_name,
+    recipient: safeRecipient,
+    created_at: createdAt || new Date().toUTCString(),
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }
+  };
+}
+
+// Seed default welcome DM if array is empty
+function getDMList() {
+  if (localDirectMessages.length === 0) {
+    const welcomeDM = formatDirectMessage(
+      "100020003",
+      "Welcome to Direct Messages on Lumia! Messages sent from here will sync locally.",
+      { id: 87654321, id_str: "87654321", name: "Lumia Support", screen_name: "lumiasupport" },
+      defaultUser,
+      new Date().toUTCString()
+    );
+    localDirectMessages.push(welcomeDM);
+  }
+  return localDirectMessages;
+}
+
+// 1. Legacy GET `/1.1/direct_messages.json` (Received DMs)
+app.get(['/1.1/direct_messages.json', '/1/direct_messages.json'], (req, res) => {
+  return res.status(200).json(getDMList());
+});
+
+// 2. Legacy GET `/1.1/direct_messages/sent.json` (Sent DMs)
+app.get(['/1.1/direct_messages/sent.json', '/1/direct_messages/sent.json'], (req, res) => {
+  const sent = getDMList().filter(d => d.sender_id_str === defaultUser.id_str);
+  return res.status(200).json(sent.length > 0 ? sent : getDMList());
+});
+
+// 3. Event API GET `/1.1/direct_messages/events/list.json`
+app.get(['/1.1/direct_messages/events/list.json', '/1/direct_messages/events/list.json'], (req, res) => {
+  const dms = getDMList();
+  const events = dms.map(d => ({
+    type: "message_create",
+    id: d.id_str,
+    created_timestamp: String(new Date(d.created_at).getTime() || Date.now()),
+    message_create: {
+      target: { recipient_id: d.recipient_id_str },
+      sender_id: d.sender_id_str,
+      message_data: {
+        text: d.text,
+        entities: d.entities
+      }
+    }
+  }));
+
+  return res.status(200).json({ events: events, next_cursor: null });
+});
+
+// 4. Send Message Endpoint (POST `/1.1/direct_messages/new.json` & `/1.1/direct_messages/events/new.json`)
+app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json', '/1/direct_messages/new.json'], (req, res) => {
+  const text = req.body?.text || req.body?.status || req.body?.event?.message_create?.message_data?.text || "Hello from Lumia!";
+  const recipientScreen = req.body?.screen_name || req.body?.user_id || "lumiasupport";
+
+  const recipientUser = sanitizeUser({
+    id: generateUniqueUserId(recipientScreen),
+    id_str: String(generateUniqueUserId(recipientScreen)),
+    name: recipientScreen,
+    screen_name: recipientScreen
+  });
+
+  const newDM = formatDirectMessage(
+    Date.now().toString(),
+    text,
+    defaultUser,
+    recipientUser,
+    new Date().toUTCString()
+  );
+
+  localDirectMessages.unshift(newDM);
+
+  // Return both legacy and event payload structures so whichever method client expects parses cleanly
+  return res.status(200).json({
+    event: {
+      type: "message_create",
+      id: newDM.id_str,
+      created_timestamp: String(Date.now()),
+      message_create: {
+        target: { recipient_id: recipientUser.id_str },
+        sender_id: defaultUser.id_str,
+        message_data: { text: text }
+      }
+    },
+    ...newDM
+  });
+});
 
 app.all('*', (req, res) => {
   const path = req.path;
