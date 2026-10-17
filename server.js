@@ -93,6 +93,7 @@ const defaultUser = {
 let localTimeline = [];
 let localNotifications = [];
 let localDirectMessages = [];
+let cachedAccountProfile = null;
 let isScraping = false;
 let lastScrapeTime = 0;
 
@@ -222,14 +223,14 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
-  if (!u || typeof u !== 'object') return defaultUser;
+  if (!u || typeof u !== 'object') return cachedAccountProfile || defaultUser;
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
-    return defaultUser;
+    return cachedAccountProfile || defaultUser;
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
@@ -464,6 +465,35 @@ async function getTokensFromCloudflareWorker() {
   return { auth_token: '', ct0: '' };
 }
 
+async function getCachedAccountFromWorker() {
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!workerUrl || !secret) return null;
+
+  try {
+    const response = await fetch(`${workerUrl}/get-account`, { headers: { 'X-Bridge-Secret': secret } });
+    if (response.ok) {
+      const data = await response.json();
+      if (data && data.screen_name) return sanitizeUser(data);
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function updateCachedAccountInWorker(accountObj) {
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!workerUrl || !secret || !accountObj) return;
+
+  try {
+    await fetch(`${workerUrl}/update-account`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
+      body: JSON.stringify(accountObj)
+    });
+  } catch (e) {}
+}
+
 async function getCachedTimelineFromWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -535,13 +565,30 @@ async function backgroundScrape() {
 
     let parsedTweets = [];
     let parsedNotifications = [];
-    let parsedDMs = [];
 
     page.on('response', async (response) => {
       try {
         const url = response.url();
         const json = await response.json().catch(() => null);
         if (!json) return;
+
+        // Parse Account Profile details live
+        if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('UserByScreenName') || url.includes('HomeTimeline'))) {
+          function extractUser(obj) {
+            if (!obj || typeof obj !== 'object') return;
+            if (obj.legacy && obj.legacy.screen_name && obj.legacy.name) {
+              const u = sanitizeUser(obj.legacy);
+              if (u && u.screen_name && u.screen_name !== 'twitter_user') {
+                cachedAccountProfile = u;
+                updateCachedAccountInWorker(u);
+              }
+            }
+            for (const k of Object.keys(obj)) {
+              if (typeof obj[k] === 'object' && obj[k] !== null) extractUser(obj[k]);
+            }
+          }
+          extractUser(json);
+        }
 
         if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
           const isNotif = url.includes('Notification');
@@ -673,6 +720,11 @@ async function backgroundScrape() {
   }
 }
 
+// Initialize cached profile on startup
+getCachedAccountFromWorker().then(acc => {
+  if (acc) cachedAccountProfile = acc;
+});
+
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
 app.get('/clear-cache', async (req, res) => {
@@ -680,10 +732,10 @@ app.get('/clear-cache', async (req, res) => {
   localTimeline = [];
   localNotifications = [];
   localDirectMessages = [];
+  cachedAccountProfile = null;
   return res.send('KV Cache cleared successfully!');
 });
 
-// OAuth Redirect updated to point to your Cloudflare Worker WebAuth instance
 app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   const oauthToken = req.query.oauth_token || '';
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
@@ -701,17 +753,26 @@ app.all('/oauth/access_token', async (req, res) => {
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
-app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: "danieldoodl5802" }));
+app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || defaultUser.screen_name }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
-app.get('/1.1/account/verify_credentials.json', (req, res) => res.status(200).json(sanitizeUser(defaultUser)));
+app.get('/1.1/account/verify_credentials.json', (req, res) => {
+  backgroundScrape();
+  return res.status(200).json(cachedAccountProfile || sanitizeUser(defaultUser));
+});
+
 app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json({ status: "ok" }));
 
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const screenName = req.query.screen_name || req.body?.screen_name;
   const userId = req.query.user_id || req.body?.user_id;
+
+  if ((!screenName || screenName.toLowerCase() === (cachedAccountProfile?.screen_name || defaultUser.screen_name).toLowerCase()) && !userId) {
+    if (!cachedAccountProfile) cachedAccountProfile = await getCachedAccountFromWorker();
+    return res.status(200).json(cachedAccountProfile || sanitizeUser(defaultUser));
+  }
+
   const cachedTweets = await getCachedTimelineFromWorker();
-  
   const matchedTweet = cachedTweets.find(t => 
     (screenName && t.user?.screen_name?.toLowerCase() === screenName.toLowerCase()) ||
     (userId && t.user?.id_str === userId.toString())
@@ -723,7 +784,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     const uid = generateUniqueUserId(screenName);
     return res.status(200).json(sanitizeUser({ ...defaultUser, id: uid, id_str: uid.toString(), name: screenName, screen_name: screenName }));
   }
-  return res.status(200).json(sanitizeUser(defaultUser));
+  return res.status(200).json(cachedAccountProfile || sanitizeUser(defaultUser));
 });
 
 app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => {
@@ -945,13 +1006,14 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
 app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "Posted from Lumia!";
   const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
+  const author = cachedAccountProfile || defaultUser;
 
   const newTweet = sanitizeTweet({
     created_at: formatTwitterDate(), id: Date.now().toString(), id_str: Date.now().toString(),
     text: tweetText, full_text: tweetText, source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
     truncated: false, in_reply_to_status_id: inReplyToStatusId || null,
     in_reply_to_status_id_str: inReplyToStatusId ? String(inReplyToStatusId) : null,
-    user: defaultUser, retweet_count: 0, favorite_count: 0,
+    user: author, retweet_count: 0, favorite_count: 0,
     entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }, favorited: false, retweeted: false
   });
 
@@ -969,7 +1031,6 @@ app.get('/1.1/followers/list.json', (req, res) => res.status(200).json({ users: 
 app.get('/1.1/friends/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 app.get('/1.1/followers/ids.json', (req, res) => res.status(200).json({ ids: [12345678] }));
 
-// Direct Message endpoints routing
 function getActiveDirectMessages() {
   return localDirectMessages.length > 0 ? localDirectMessages : getSeedDirectMessages();
 }
@@ -984,7 +1045,7 @@ app.get(['/1.1/direct_messages/sent.json', '/1/direct_messages/sent.json'], (req
   return res.status(200).json(sent.length > 0 ? sent : active);
 });
 
-app.get(['/1.1/direct_messages/conversations.json', '/1/direct_messages/conversations/list.json', '/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
+app.get(['/1.1/direct_messages/conversations.json', '/1.1/direct_messages/conversations/list.json', '/1.1/direct_messages/conversation.json', '/1/direct_messages/conversation.json'], (req, res) => {
   const active = getActiveDirectMessages();
   const targetUserId = req.query.user_id || req.query.screen_name;
   if (!targetUserId) return res.status(200).json(active);
@@ -1032,7 +1093,7 @@ app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json
   const newDM = formatDirectMessage(
     Date.now().toString(),
     text,
-    defaultUser,
+    cachedAccountProfile || defaultUser,
     recipientUser,
     new Date()
   );
@@ -1046,7 +1107,7 @@ app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json
       created_timestamp: String(Date.now()),
       message_create: {
         target: { recipient_id: recipientUser.id_str },
-        sender_id: defaultUser.id_str,
+        sender_id: (cachedAccountProfile || defaultUser).id_str,
         message_data: { text: text }
       }
     },
