@@ -74,8 +74,8 @@ const defaultUser = {
   contributors_enabled: false,
   is_translator: false,
   profile_background_color: "C0DEED",
-  profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-  profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url: "https://abs.twimg.com/images/themes/theme1/bg.png",
+  profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
   profile_background_tile: false,
   profile_link_color: "1DA1F2",
   profile_sidebar_border_color: "C0DEED",
@@ -255,7 +255,7 @@ function sanitizeUser(u) {
     userStatus = localTimeline.find(t => t.user?.screen_name?.toLowerCase() === rawScreen.toLowerCase()) || localTimeline[0];
   }
 
-  return {
+  const sanitizedObj = {
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
     name: rawName || rawScreen,
@@ -283,8 +283,8 @@ function sanitizeUser(u) {
     contributors_enabled: false,
     is_translator: false,
     profile_background_color: "C0DEED",
-    profile_background_image_url: "http://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "http://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url: "https://abs.twimg.com/images/themes/theme1/bg.png",
+    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
     profile_background_tile: false,
     profile_link_color: "1DA1F2",
     profile_sidebar_border_color: "C0DEED",
@@ -296,9 +296,16 @@ function sanitizeUser(u) {
     follow_request_sent: false,
     notifications: false,
     translator_type: "none",
-    entities: u.entities || { description: { urls: [] }, url: { urls: [] } },
-    status: userStatus ? sanitizeTweet(userStatus) : defaultUser.status
+    entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
   };
+
+  const finalStatus = userStatus ? sanitizeTweet(userStatus) : defaultUser.status;
+  if (finalStatus) {
+    finalStatus.user = sanitizedObj;
+  }
+  sanitizedObj.status = finalStatus;
+
+  return sanitizedObj;
 }
 
 function sanitizeTweet(t) {
@@ -360,7 +367,8 @@ function sanitizeTweet(t) {
       id_str: String(generateUniqueUserId(chosen.screen_name)),
       name: chosen.name,
       screen_name: chosen.screen_name,
-      profile_image_url_https: chosen.avatar
+      profile_image_url_https: chosen.avatar,
+      profile_image_url: chosen.avatar
     });
   }
 
@@ -738,7 +746,6 @@ async function backgroundScrape() {
   }
 }
 
-// Initialize cached profile on startup
 getCachedAccountFromWorker().then(acc => {
   if (acc) cachedAccountProfile = acc;
 });
