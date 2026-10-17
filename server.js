@@ -683,7 +683,8 @@ app.get('/1.1/account/verify_credentials.json', (req, res) => {
 });
 
 app.get('/1.1/account/totals.json', (req, res) => {
-  const acc = cachedAccountProfile || {};
+  backgroundScrape();
+  const acc = cachedAccountProfile || { statuses_count: 0, followers_count: 0, friends_count: 0, favourites_count: 0 };
   return res.status(200).json({
     updates: acc.statuses_count || 0,
     followers: acc.followers_count || 0,
@@ -695,8 +696,10 @@ app.get('/1.1/account/totals.json', (req, res) => {
 });
 
 app.get('/1.1/users/profile_banner.json', (req, res) => {
-  const acc = cachedAccountProfile || {};
-  const bannerUrl = acc.profile_banner_url || "";
+  const screenName = req.query.screen_name || cachedAccountProfile?.screen_name || "";
+  const acc = cachedAccountProfile?.screen_name?.toLowerCase() === screenName.toLowerCase() ? cachedAccountProfile : null;
+  const bannerUrl = acc?.profile_banner_url || "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
+  
   return res.status(200).json({
     sizes: {
       ipad: { w: 600, h: 200, url: bannerUrl },
@@ -725,10 +728,10 @@ app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json(
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const screenName = req.query.screen_name || req.body?.screen_name;
   const userId = req.query.user_id || req.body?.user_id;
+  const currentAcc = cachedAccountProfile || await getCachedAccountFromWorker();
 
-  if ((!screenName || screenName.toLowerCase() === (cachedAccountProfile?.screen_name || "").toLowerCase()) && !userId) {
-    if (!cachedAccountProfile) cachedAccountProfile = await getCachedAccountFromWorker();
-    return res.status(200).json(cachedAccountProfile || { id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
+  if ((!screenName && !userId) || (screenName && currentAcc && screenName.toLowerCase() === currentAcc.screen_name.toLowerCase())) {
+    return res.status(200).json(currentAcc || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" });
   }
 
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -737,13 +740,24 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     (userId && t.user?.id_str === userId.toString())
   );
 
-  if (matchedTweet && matchedTweet.user) return res.status(200).json(sanitizeUser(matchedTweet.user));
+  if (matchedTweet && matchedTweet.user) {
+    return res.status(200).json(sanitizeUser(matchedTweet.user));
+  }
 
   if (screenName) {
     const uid = generateUniqueUserId(screenName);
-    return res.status(200).json(sanitizeUser({ id: uid, id_str: uid.toString(), name: screenName, screen_name: screenName }));
+    return res.status(200).json(sanitizeUser({
+      id: uid,
+      id_str: String(uid),
+      name: screenName,
+      screen_name: screenName,
+      description: "",
+      followers_count: 50,
+      friends_count: 50
+    }));
   }
-  return res.status(200).json({ id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
+
+  return res.status(200).json(currentAcc || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" });
 });
 
 app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => {
@@ -807,12 +821,19 @@ app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
 });
 
 app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
+  const screenName = req.query.screen_name || req.query.screenName;
   const cachedTweets = await getCachedTimelineFromWorker();
-  const acc = cachedAccountProfile;
-  if (!acc) return res.status(200).json([]);
+  const currentAcc = cachedAccountProfile;
+  
+  const targetScreen = screenName || currentAcc?.screen_name || "";
   const allTweets = [...localTimeline, ...cachedTweets].map(t => sanitizeTweet(t));
-  const userTweets = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === acc.screen_name.toLowerCase());
-  return res.status(200).json(userTweets);
+  
+  if (!targetScreen) {
+    return res.status(200).json(allTweets.slice(0, 25));
+  }
+
+  const userTweets = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetScreen.toLowerCase());
+  return res.status(200).json(userTweets.length > 0 ? userTweets : allTweets.slice(0, 15));
 });
 
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
@@ -1001,7 +1022,7 @@ app.all('*', (req, res) => {
 app.use((err, req, res, next) => {
   console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
   console.error(err.stack || err);
-  res.status(200).json({ errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") }] });
+  res.status(200).json({ errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") })];
 });
 
 const PORT = process.env.PORT || 3000;
