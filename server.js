@@ -654,7 +654,6 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// Responds with 200 OK formatted explicitly for Windows Phone OAuth parsing
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = (req.body.x_auth_username || req.query.x_auth_username || "").trim();
   const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
@@ -796,7 +795,15 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
 
 app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
   backgroundScrape();
-  return res.status(200).json(localNotifications.map(t => sanitizeTweet(t)));
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const acc = cachedAccountProfile;
+  let mentions = [];
+  if (acc && acc.screen_name) {
+    const queryTag = `@${acc.screen_name.toLowerCase()}`;
+    mentions = cachedTweets.filter(t => t.text && t.text.toLowerCase().includes(queryTag));
+  }
+  const finalMentions = mentions.length > 0 ? mentions : cachedTweets.slice(0, 15);
+  return res.status(200).json(finalMentions.map(t => sanitizeTweet(t)));
 });
 
 app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
@@ -810,7 +817,21 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
 
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
-  return res.status(200).json([]);
+  const cachedTweets = await getCachedTimelineFromWorker();
+  const sourceList = localNotifications.length > 0 ? localNotifications : cachedTweets.slice(0, 15);
+  const acc = cachedAccountProfile || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" };
+
+  const activities = sourceList.map((t, idx) => ({
+    action: idx % 2 === 0 ? "mention" : "favorite",
+    max_position: String(t.id || Date.now()),
+    min_position: "1234567890",
+    created_at: t.created_at || formatTwitterDate(),
+    sources: [t.user || acc],
+    targets: [t],
+    target_objects: [t]
+  }));
+
+  return res.status(200).json(activities);
 });
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
@@ -826,7 +847,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
