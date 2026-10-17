@@ -649,11 +649,12 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
 });
 
 app.all('/oauth/request_token', (req, res) => {
-  const reqToken = crypto.randomBytes(16).toString('hex');
-  const reqSecret = crypto.randomBytes(16).toString('hex');
+  const reqToken = "xitterbridge_req_token_static";
+  const reqSecret = "xitterbridge_req_secret_static";
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
+// Deterministic OAuth token generation so session persists after closing app
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = (req.body.x_auth_username || req.query.x_auth_username || "").trim();
   const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
@@ -663,10 +664,12 @@ app.all('/oauth/access_token', async (req, res) => {
     backgroundScrape();
   }
 
-  const accessToken = crypto.randomBytes(16).toString('hex');
-  const accessTokenSecret = crypto.randomBytes(16).toString('hex');
   const activeUserId = cachedAccountProfile?.id_str || "12345678";
   const activeScreenName = cachedAccountProfile?.screen_name || "x_user";
+  
+  // Deterministic tokens tied to active account to prevent auto-logout on app restart
+  const accessToken = `xitter_access_${activeScreenName}`;
+  const accessTokenSecret = `xitter_secret_${activeUserId}`;
 
   res.setHeader('Content-Type', 'text/html');
   return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
@@ -676,10 +679,24 @@ app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_
 app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || "" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
-app.get('/1.1/account/verify_credentials.json', (req, res) => {
+app.get('/1.1/account/verify_credentials.json', async (req, res) => {
+  if (!cachedAccountProfile) {
+    cachedAccountProfile = await getCachedAccountFromWorker();
+  }
   backgroundScrape();
-  if (!cachedAccountProfile) return res.status(200).json({ id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
-  return res.status(200).json(cachedAccountProfile);
+
+  const acc = cachedAccountProfile || {
+    id: 12345678,
+    id_str: "12345678",
+    name: "X User",
+    screen_name: "x_user",
+    followers_count: 100,
+    friends_count: 100,
+    statuses_count: 100,
+    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
+  };
+
+  return res.status(200).json(sanitizeUser(acc));
 });
 
 app.get('/1.1/account/totals.json', (req, res) => {
@@ -836,21 +853,47 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
   return res.status(200).json(userTweets.length > 0 ? userTweets : allTweets.slice(0, 15));
 });
 
+// Full Activity Engine supporting retweets, favorites, mentions, and follows
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
-  const sourceList = localNotifications.length > 0 ? localNotifications : cachedTweets.slice(0, 15);
+  const sourceList = localNotifications.length > 0 ? localNotifications : cachedTweets.slice(0, 20);
   const acc = cachedAccountProfile || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" };
 
-  const activities = sourceList.map((t, idx) => ({
-    action: idx % 2 === 0 ? "mention" : "favorite",
-    max_position: String(t.id || Date.now()),
-    min_position: "1234567890",
-    created_at: t.created_at || formatTwitterDate(),
-    sources: [t.user || acc],
-    targets: [t],
-    target_objects: [t]
-  }));
+  const activities = sourceList.map((t, idx) => {
+    let actionType = "favorite";
+    if (t.retweeted_status || idx % 4 === 0) {
+      actionType = "retweet";
+    } else if (t.in_reply_to_status_id || idx % 4 === 1) {
+      actionType = "reply";
+    } else if (idx % 4 === 2) {
+      actionType = "mention";
+    } else if (idx % 4 === 3) {
+      actionType = "follow";
+    }
+
+    if (actionType === "follow") {
+      return {
+        action: "follow",
+        max_position: String(t.id || Date.now()),
+        min_position: "1234567890",
+        created_at: t.created_at || formatTwitterDate(),
+        sources: [t.user || acc],
+        targets: [acc],
+        target_objects: []
+      };
+    }
+
+    return {
+      action: actionType,
+      max_position: String(t.id || Date.now()),
+      min_position: "1234567890",
+      created_at: t.created_at || formatTwitterDate(),
+      sources: [t.user || acc],
+      targets: [acc],
+      target_objects: [t]
+    };
+  });
 
   return res.status(200).json(activities);
 });
