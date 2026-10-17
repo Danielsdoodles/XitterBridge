@@ -62,7 +62,7 @@ const defaultUser = {
   created_at: formatTwitterDate(),
   favourites_count: 42,
   statuses_count: 10,
-  profile_image_url: "http://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+  profile_image_url: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
   profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
   default_profile: true,
@@ -87,7 +87,20 @@ const defaultUser = {
   follow_request_sent: false,
   notifications: false,
   translator_type: "none",
-  entities: { description: { urls: [] }, url: { urls: [] } }
+  entities: { description: { urls: [] }, url: { urls: [] } },
+  status: {
+    created_at: formatTwitterDate(),
+    id: 123456789,
+    id_str: "123456789",
+    text: "Windows Phone preservation project",
+    source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    truncated: false,
+    favorited: false,
+    retweeted: false,
+    retweet_count: 0,
+    favorite_count: 0,
+    lang: "en"
+  }
 };
 
 let localTimeline = [];
@@ -237,6 +250,11 @@ function sanitizeUser(u) {
   const banner = fixUrl(u.profile_banner_url);
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
+  let userStatus = u.status || null;
+  if (!userStatus && localTimeline.length > 0) {
+    userStatus = localTimeline.find(t => t.user?.screen_name?.toLowerCase() === rawScreen.toLowerCase()) || localTimeline[0];
+  }
+
   return {
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
@@ -278,7 +296,8 @@ function sanitizeUser(u) {
     follow_request_sent: false,
     notifications: false,
     translator_type: "none",
-    entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
+    entities: u.entities || { description: { urls: [] }, url: { urls: [] } },
+    status: userStatus ? sanitizeTweet(userStatus) : defaultUser.status
   };
 }
 
@@ -572,7 +591,6 @@ async function backgroundScrape() {
         const json = await response.json().catch(() => null);
         if (!json) return;
 
-        // Parse Account Profile details live
         if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('UserByScreenName') || url.includes('HomeTimeline'))) {
           function extractUser(obj) {
             if (!obj || typeof obj !== 'object') return;
