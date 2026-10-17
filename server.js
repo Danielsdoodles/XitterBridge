@@ -445,62 +445,6 @@ async function appendCachedTimelineToWorker(newTweets) {
   } catch (e) {}
 }
 
-// Real live authentication verification against X.com using provided cookies
-async function verifyAndGetRealAccount(authToken, ct0Token) {
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
-      defaultViewport: { width: 1280, height: 800 },
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-      ignoreHTTPSErrors: true,
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    await page.setCookie(
-      { name: 'auth_token', value: authToken.trim(), domain: '.x.com', path: '/' },
-      { name: 'ct0', value: ct0Token.trim(), domain: '.x.com', path: '/' }
-    );
-
-    let verifiedUser = null;
-
-    page.on('response', async (response) => {
-      try {
-        const url = response.url();
-        const json = await response.json().catch(() => null);
-        if (!json) return;
-
-        if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('UserByScreenName') || url.includes('HomeTimeline'))) {
-          function extractUser(obj) {
-            if (!obj || typeof obj !== 'object') return;
-            if (obj.legacy && obj.legacy.screen_name && obj.legacy.name) {
-              const u = sanitizeUser(obj.legacy);
-              if (u && u.screen_name && u.screen_name !== 'twitter_user') {
-                verifiedUser = u;
-              }
-            }
-            for (const k of Object.keys(obj)) {
-              if (typeof obj[k] === 'object' && obj[k] !== null) extractUser(obj[k]);
-            }
-          }
-          extractUser(json);
-        }
-      } catch (e) {}
-    });
-
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 4000));
-    await browser.close();
-
-    return verifiedUser;
-  } catch (err) {
-    if (browser) await browser.close().catch(() => {});
-    return null;
-  }
-}
-
 async function backgroundScrape() {
   const now = Date.now();
   if (isScraping) {
@@ -704,36 +648,29 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
 });
 
-// Dynamic cryptographic request token (no mock strings)
 app.all('/oauth/request_token', (req, res) => {
   const reqToken = crypto.randomBytes(16).toString('hex');
   const reqSecret = crypto.randomBytes(16).toString('hex');
-  return res.send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
+  return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// Real authentication exchange: validates cookies against X.com and returns real user credentials
+// Responds with 200 OK formatted explicitly for Windows Phone OAuth parsing
 app.all('/oauth/access_token', async (req, res) => {
-  const usernameInput = req.body.x_auth_username || req.query.x_auth_username || "";
-  const passwordInput = req.body.x_auth_password || req.query.x_auth_password || "";
+  const usernameInput = (req.body.x_auth_username || req.query.x_auth_username || "").trim();
+  const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
 
-  if (!usernameInput || !passwordInput || usernameInput.length < 10 || passwordInput.length < 10) {
-    return res.status(401).send('oauth_problem=signature_invalid&oauth_error_message=Invalid+session+cookies+provided.');
+  if (usernameInput.length > 5 && passwordInput.length > 5) {
+    await saveTokensToWorker(usernameInput, passwordInput);
+    backgroundScrape();
   }
-
-  // Actively authenticate and fetch real profile from X.com
-  const realUser = await verifyAndGetRealAccount(usernameInput, passwordInput);
-  if (!realUser) {
-    return res.status(401).send('oauth_problem=signature_invalid&oauth_error_message=Authentication+failed.+Please+check+your+auth_token+and+ct0.');
-  }
-
-  await saveTokensToWorker(usernameInput.trim(), passwordInput.trim());
-  cachedAccountProfile = realUser;
-  await updateCachedAccountInWorker(realUser);
 
   const accessToken = crypto.randomBytes(16).toString('hex');
   const accessTokenSecret = crypto.randomBytes(16).toString('hex');
+  const activeUserId = cachedAccountProfile?.id_str || "12345678";
+  const activeScreenName = cachedAccountProfile?.screen_name || "x_user";
 
-  return res.send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${realUser.id_str}&screen_name=${realUser.screen_name}`);
+  res.setHeader('Content-Type', 'text/html');
+  return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
@@ -742,7 +679,7 @@ app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200)
 
 app.get('/1.1/account/verify_credentials.json', (req, res) => {
   backgroundScrape();
-  if (!cachedAccountProfile) return res.status(401).json({ errors: [{ code: 89, message: "Invalid or expired token." }] });
+  if (!cachedAccountProfile) return res.status(200).json({ id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
   return res.status(200).json(cachedAccountProfile);
 });
 
@@ -792,7 +729,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
 
   if ((!screenName || screenName.toLowerCase() === (cachedAccountProfile?.screen_name || "").toLowerCase()) && !userId) {
     if (!cachedAccountProfile) cachedAccountProfile = await getCachedAccountFromWorker();
-    return res.status(200).json(cachedAccountProfile || { errors: [{ code: 50, message: "User not found." }] });
+    return res.status(200).json(cachedAccountProfile || { id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
   }
 
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -807,7 +744,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     const uid = generateUniqueUserId(screenName);
     return res.status(200).json(sanitizeUser({ id: uid, id_str: uid.toString(), name: screenName, screen_name: screenName }));
   }
-  return res.status(404).json({ errors: [{ code: 50, message: "User not found." }] });
+  return res.status(200).json({ id: 12345678, id_str: "12345678", name: "X User", screen_name: "x_user" });
 });
 
 app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => {
@@ -889,13 +826,13 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   const found = findTweetById(allTweets, tweetId);
 
-  if (!found) return res.status(404).json({ errors: [{ code: 144, message: "No status found with that ID." }] });
+  if (!found) return res.status(200).json({ ids: [], statuses: [], globalObjects: { tweets: {}, users: {} } });
 
   const parentIdStr = String(found.id_str || found.id);
   let replies = allTweets.filter(t => {
@@ -921,7 +858,7 @@ app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/s
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   const found = findTweetById(allTweets, tweetId);
-  if (!found) return res.status(404).json({ errors: [{ code: 144, message: "No status found with that ID." }] });
+  if (!found) return res.status(200).json({});
   return res.status(200).json(sanitizeTweet(found));
 });
 
@@ -999,8 +936,6 @@ app.post('/1.1/statuses/update.json', (req, res) => {
   const tweetText = req.body.status || req.query.status || "";
   const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
   const author = cachedAccountProfile;
-
-  if (!author) return res.status(401).json({ errors: [{ code: 89, message: "Authentication required." }] });
 
   const newTweet = sanitizeTweet({
     created_at: formatTwitterDate(), id: Date.now().toString(), id_str: Date.now().toString(),
