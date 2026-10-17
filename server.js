@@ -1022,7 +1022,7 @@ app.all('*', (req, res) => {
 app.use((err, req, res, next) => {
   console.error(`[XitterBridge CRASH CAUGHT] Endpoint: ${req.method} ${req.url}`);
   console.error(err.stack || err);
-  res.status(200).json({ errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") })];
+  res.status(200).json({ errors: [{ code: 99, message: "Bridge Diagnostic Error: " + (err.message || "Unknown error") }] });
 });
 
 const PORT = process.env.PORT || 3000;
