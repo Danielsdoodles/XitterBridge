@@ -193,24 +193,24 @@ function sanitizeUser(u) {
   const defaultUser = {
     id: 12345678,
     id_str: "12345678",
-    name: "X User",
-    screen_name: "x_user",
-    location: "New Jersey",
-    description: "Connected via XitterBridge",
+    name: "Twitter User",
+    screen_name: "twitter_user",
+    location: "",
+    description: "",
     url: null,
     protected: false,
     verified: false,
-    followers_count: 150,
-    friends_count: 150,
+    followers_count: 100,
+    friends_count: 100,
     listed_count: 0,
     created_at: "Wed Oct 10 00:00:00 +0000 2026",
     favourites_count: 100,
-    statuses_count: 300,
+    statuses_count: 100,
     profile_image_url: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
     profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-    profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
+    profile_banner_url: "",
     default_profile: true,
-    default_profile_image: false,
+    default_profile_image: true,
     utc_offset: null,
     time_zone: null,
     geo_enabled: true,
@@ -235,16 +235,23 @@ function sanitizeUser(u) {
     status: null
   };
 
-  if (!u || typeof u !== 'object') {
-    return cachedAccountProfile || defaultUser;
-  }
+  if (!u || typeof u !== 'object') return defaultUser;
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
-    return cachedAccountProfile || defaultUser;
+    if (userIdStr && userIdStr !== "12345678") {
+      return {
+        ...defaultUser,
+        id: Number(userIdStr) || 12345678,
+        id_str: userIdStr,
+        name: rawName || "Twitter User",
+        screen_name: `user_${userIdStr.slice(-6)}`
+      };
+    }
+    return defaultUser;
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
@@ -252,40 +259,30 @@ function sanitizeUser(u) {
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
   let userStatus = u.status || null;
-  if (!userStatus && localTimeline.length > 0) {
-    userStatus = localTimeline.find(t => t.user?.screen_name?.toLowerCase() === rawScreen.toLowerCase()) || localTimeline[0];
-  }
 
-  const sanitizedObj = {
+  return {
     ...defaultUser,
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
     name: rawName || rawScreen,
     screen_name: rawScreen,
-    location: cleanStr(u.location) || defaultUser.location,
-    description: cleanStr(u.description) || defaultUser.description,
+    location: cleanStr(u.location) || "",
+    description: cleanStr(u.description) || "",
     url: cleanStr(u.url) || null,
     protected: !!u.protected,
     verified: !!u.verified,
-    followers_count: Number(u.followers_count ?? defaultUser.followers_count),
-    friends_count: Number(u.friends_count ?? defaultUser.friends_count),
+    followers_count: Number(u.followers_count ?? 100),
+    friends_count: Number(u.friends_count ?? 100),
     listed_count: Number(u.listed_count ?? 0),
     created_at: formatTwitterDate(u.created_at),
-    favourites_count: Number(u.favourites_count ?? defaultUser.favourites_count),
-    statuses_count: Number(u.statuses_count ?? defaultUser.statuses_count),
+    favourites_count: Number(u.favourites_count ?? 100),
+    statuses_count: Number(u.statuses_count ?? 100),
     profile_image_url: avatar,
     profile_image_url_https: avatar,
     profile_banner_url: banner,
-    entities: u.entities || defaultUser.entities
+    entities: u.entities || defaultUser.entities,
+    status: userStatus ? sanitizeTweet(userStatus) : null
   };
-
-  const finalStatus = userStatus ? sanitizeTweet(userStatus) : null;
-  if (finalStatus) {
-    finalStatus.user = sanitizedObj;
-  }
-  sanitizedObj.status = finalStatus;
-
-  return sanitizedObj;
 }
 
 function sanitizeTweet(t) {
@@ -331,7 +328,7 @@ function sanitizeTweet(t) {
   const cleanedText = sanitizeTweetText(rawText);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
-  let author = t.user ? sanitizeUser(t.user) : cachedAccountProfile;
+  let author = t.user ? sanitizeUser(t.user) : null;
 
   return {
     created_at: formatTwitterDate(t.created_at),
@@ -591,8 +588,8 @@ async function backgroundScrape() {
                 id: userId, id_str: userIdStr, name: name || screenName, screen_name: screenName,
                 profile_image_url_https: avatar, profile_image_url: avatar,
                 profile_banner_url: fixUrl(uObj?.profile_banner_url), description: uObj?.description || "",
-                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 150, friends_count: uObj?.friends_count || 150
-              }) : cachedAccountProfile;
+                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 100, friends_count: uObj?.friends_count || 100
+              }) : sanitizeUser(uObj);
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
