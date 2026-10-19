@@ -330,13 +330,19 @@ function sanitizeTweet(t) {
 
   let author = t.user ? sanitizeUser(t.user) : null;
 
+  // Format actual client source properly
+  let rawSource = cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for iPhone</a>';
+  if (!rawSource.includes('<a')) {
+    rawSource = `<a href="http://twitter.com" rel="nofollow">${rawSource}</a>`;
+  }
+
   return {
     created_at: formatTwitterDate(t.created_at),
     id: safeId,
     id_str: idStr,
     text: cleanedText,
     full_text: cleanedText,
-    source: cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    source: rawSource,
     truncated: false,
     in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
     in_reply_to_status_id_str: replyIdStr,
@@ -566,6 +572,7 @@ async function backgroundScrape() {
                 function searchForUser(n) {
                   if (!n || typeof n !== 'object') return null;
                   if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https || n.rest_id)) return n;
+                  if (n.legacy && n.legacy.screen_name && n.legacy.screen_name !== 'twitter_user') return n.legacy;
                   for (const k of Object.keys(n)) {
                     if (typeof n[k] === 'object' && n[k] !== null) {
                       const found = searchForUser(n[k]);
@@ -609,7 +616,7 @@ async function backgroundScrape() {
                 id_str: tweetIdStr,
                 text: legacy.full_text || legacy.text || "",
                 full_text: legacy.full_text || legacy.text || "",
-                source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+                source: legacy.source || obj.source || '<a href="http://twitter.com" rel="nofollow">Twitter for iPhone</a>',
                 truncated: false,
                 in_reply_to_status_id: legacy.in_reply_to_status_id_str || null,
                 in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
