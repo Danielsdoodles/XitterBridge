@@ -654,22 +654,24 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route to close WebView popup cleanly after authorization
+// Updated OAuth Callback Route: immediately redirects WebView into access_token finalizer to dismiss popup
 app.get('/oauth/callback', (req, res) => {
+  const oauthToken = req.query.oauth_token || '';
+  const finalRedirect = `https://xitterbridge.onrender.com/oauth/access_token?oauth_token=${oauthToken}&oauth_verifier=xitterbridge_verified`;
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(`<!DOCTYPE html>
   <html>
     <head>
       <title>Authorization Successful</title>
+      <meta http-equiv="refresh" content="0;url=${finalRedirect}">
       <script>
-        setTimeout(() => {
-          try { window.close(); } catch(e) {}
-        }, 800);
+        window.location.href = "${finalRedirect}";
       </script>
     </head>
     <body style="background:#fff; color:#111; font-family:sans-serif; text-align:center; padding-top:50px;">
       <h2 style="color:#3b9400;">✓ Authorization Successful</h2>
-      <p>XitterBridge has been successfully linked. You can return to the app.</p>
+      <p>Finalizing login...</p>
     </body>
   </html>`);
 });
@@ -689,7 +691,6 @@ app.all('/oauth/access_token', async (req, res) => {
   const accessToken = `xitter_access_${activeScreenName}`;
   const accessTokenSecret = `xitter_secret_${activeUserId}`;
 
-  // Form-urlencoded Content-Type so app parses parameters correctly without rendering raw text
   res.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=utf-8');
   return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
 });
