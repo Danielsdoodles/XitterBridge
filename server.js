@@ -242,16 +242,14 @@ function sanitizeUser(u) {
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
-    if (userIdStr && userIdStr !== "12345678") {
-      return {
-        ...defaultUser,
-        id: Number(userIdStr) || 12345678,
-        id_str: userIdStr,
-        name: rawName || "Twitter User",
-        screen_name: `user_${userIdStr.slice(-6)}`
-      };
-    }
-    return defaultUser;
+    const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
+    return {
+      ...defaultUser,
+      id: Number(fallbackId) || 12345678,
+      id_str: fallbackId,
+      name: rawName || `User ${fallbackId.slice(-4)}`,
+      screen_name: `user_${fallbackId.slice(-6)}`
+    };
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
@@ -330,7 +328,6 @@ function sanitizeTweet(t) {
 
   let author = t.user ? sanitizeUser(t.user) : null;
 
-  // Format actual client source properly
   let rawSource = cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for iPhone</a>';
   if (!rawSource.includes('<a')) {
     rawSource = `<a href="http://twitter.com" rel="nofollow">${rawSource}</a>`;
@@ -550,6 +547,8 @@ async function backgroundScrape() {
               let uObj = null;
               
               const paths = [
+                obj.user,
+                obj.legacy?.user,
                 obj.core?.user_results?.result?.legacy,
                 obj.core?.user_results?.result,
                 obj.tweet_results?.result?.core?.user_results?.result?.legacy,
@@ -571,8 +570,8 @@ async function backgroundScrape() {
               if (!uObj || !uObj.screen_name || uObj.screen_name === 'twitter_user') {
                 function searchForUser(n) {
                   if (!n || typeof n !== 'object') return null;
-                  if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https || n.rest_id)) return n;
-                  if (n.legacy && n.legacy.screen_name && n.legacy.screen_name !== 'twitter_user') return n.legacy;
+                  if (typeof n.screen_name === 'string' && n.screen_name.length > 0 && n.screen_name !== 'twitter_user') return n;
+                  if (n.legacy && typeof n.legacy.screen_name === 'string' && n.legacy.screen_name !== 'twitter_user') return n.legacy;
                   for (const k of Object.keys(n)) {
                     if (typeof n[k] === 'object' && n[k] !== null) {
                       const found = searchForUser(n[k]);
