@@ -545,6 +545,7 @@ async function backgroundScrape() {
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
               let uObj = null;
+              
               const paths = [
                 obj.core?.user_results?.result?.legacy,
                 obj.core?.user_results?.result,
@@ -553,17 +554,21 @@ async function backgroundScrape() {
                 obj.user_results?.result?.legacy,
                 obj.user_results?.result,
                 obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
-                obj.retweeted_status_result?.result?.core?.user_results?.result
+                obj.retweeted_status_result?.result?.core?.user_results?.result,
+                obj.quoted_status_result?.result?.core?.user_results?.result?.legacy,
+                obj.quoted_status_result?.result?.core?.user_results?.result,
+                obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result?.legacy,
+                obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result
               ];
 
               for (const p of paths) {
-                if (p && (p.screen_name || p.name)) { uObj = p; break; }
+                if (p && p.screen_name && p.screen_name !== 'twitter_user') { uObj = p; break; }
               }
 
               if (!uObj || !uObj.screen_name || uObj.screen_name === 'twitter_user') {
                 function searchForUser(n) {
                   if (!n || typeof n !== 'object') return null;
-                  if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https)) return n;
+                  if (n.screen_name && n.name && n.screen_name !== 'twitter_user' && (n.followers_count !== undefined || n.profile_image_url_https || n.rest_id)) return n;
                   for (const k of Object.keys(n)) {
                     if (typeof n[k] === 'object' && n[k] !== null) {
                       const found = searchForUser(n[k]);
@@ -578,7 +583,7 @@ async function backgroundScrape() {
               const screenName = cleanStr(uObj?.screen_name && uObj.screen_name !== 'twitter_user' ? uObj.screen_name : null);
               const name = cleanStr(uObj?.name && uObj.name !== 'twitter_user' ? uObj.name : screenName);
               const avatar = fixUrl(uObj?.profile_image_url_https || uObj?.profile_image_url);
-              const restId = cleanStr(uObj?.id_str || obj.core?.user_results?.result?.rest_id || obj.user_id_str);
+              const restId = cleanStr(uObj?.id_str || uObj?.rest_id || obj.core?.user_results?.result?.rest_id || obj.user_id_str);
               const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : Date.now());
               const userIdStr = restId || String(userId);
 
@@ -1042,7 +1047,6 @@ app.get('/1.1/trends/place.json', (req, res) => {
   }]);
 });
 
-// Added to prevent Discover crashes when fetching trend locations
 app.get('/1.1/trends/available.json', (req, res) => {
   return res.status(200).json([
     { name: "Worldwide", country: "", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, woeid: 1 },
