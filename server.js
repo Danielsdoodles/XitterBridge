@@ -652,7 +652,6 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
 });
 
-// Capture dynamic app callback requested during OAuth request token step
 app.all('/oauth/request_token', (req, res) => {
   const callback = req.query.oauth_callback || req.body.oauth_callback;
   if (callback) {
@@ -664,15 +663,17 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route: automatically forwards to app's expected callback/protocol so the WebView intercepts and dismisses itself
+// OAuth Callback Route: Appends oauth_verifier so app's WebView intercepts and auto-dismisses popup
 app.get('/oauth/callback', (req, res) => {
   const oauthToken = req.query.oauth_token || 'xitterbridge_req_token_static';
-  const oauthVerifier = req.query.oauth_verifier || 'xitterbridge_verified';
+  const oauthVerifier = req.query.oauth_verifier;
 
-  if (currentOAuthCallback && !currentOAuthCallback.includes('/oauth/callback')) {
-    const finalTarget = `${currentOAuthCallback}${currentOAuthCallback.includes('?') ? '&' : '?'}oauth_token=${oauthToken}&oauth_verifier=${oauthVerifier}`;
-    console.log(`[XitterBridge] Redirecting back to app callback: ${finalTarget}`);
-    return res.redirect(302, finalTarget);
+  if (!oauthVerifier) {
+    const target = currentOAuthCallback || "https://xitterbridge.onrender.com/oauth/callback";
+    const separator = target.includes('?') ? '&' : '?';
+    const redirectUrl = `${target}${separator}oauth_token=${oauthToken}&oauth_verifier=xitterbridge_verified`;
+    console.log(`[XitterBridge] Sending callback with verifier to app: ${redirectUrl}`);
+    return res.redirect(302, redirectUrl);
   }
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -684,7 +685,7 @@ app.get('/oauth/callback', (req, res) => {
       <script>
         setTimeout(() => {
           try { window.close(); } catch(e) {}
-        }, 1000);
+        }, 500);
       </script>
     </head>
     <body style="background:#fff; color:#111; font-family:-apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding-top:60px;">
