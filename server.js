@@ -654,24 +654,23 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// Updated OAuth Callback Route: immediately redirects WebView into access_token finalizer to dismiss popup
+// OAuth Callback Route: displays success message so the app intercepts verifier and dismisses WebView popup
 app.get('/oauth/callback', (req, res) => {
-  const oauthToken = req.query.oauth_token || '';
-  const finalRedirect = `https://xitterbridge.onrender.com/oauth/access_token?oauth_token=${oauthToken}&oauth_verifier=xitterbridge_verified`;
-
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(`<!DOCTYPE html>
   <html>
     <head>
       <title>Authorization Successful</title>
-      <meta http-equiv="refresh" content="0;url=${finalRedirect}">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
       <script>
-        window.location.href = "${finalRedirect}";
+        setTimeout(() => {
+          try { window.close(); } catch(e) {}
+        }, 1000);
       </script>
     </head>
-    <body style="background:#fff; color:#111; font-family:sans-serif; text-align:center; padding-top:50px;">
-      <h2 style="color:#3b9400;">✓ Authorization Successful</h2>
-      <p>Finalizing login...</p>
+    <body style="background:#fff; color:#111; font-family:-apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding-top:60px;">
+      <h2 style="color:#3b9400; font-size:22px;">✓ Authorization Successful</h2>
+      <p style="color:#666; font-size:14px;">XitterBridge has been successfully linked to your account.<br>You can now return to the application.</p>
     </body>
   </html>`);
 });
