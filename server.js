@@ -23,7 +23,6 @@ app.use((req, res, next) => {
   res.setHeader('X-Access-Level', 'read-write');
   res.setHeader('Cache-Control', 'no-cache');
   
-  // Only set application/json for Twitter API endpoints, leaving OAuth HTML pages alone
   if (req.path.startsWith('/1.1/') || req.path.startsWith('/1/')) {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
   }
@@ -56,6 +55,7 @@ let localNotifications = [];
 let cachedAccountProfile = null;
 let isScraping = false;
 let lastScrapeTime = 0;
+let currentOAuthCallback = "https://xitterbridge.onrender.com/oauth/callback";
 
 function generateUniqueUserId(screenName) {
   if (!screenName || screenName === 'twitter_user') return Math.floor(Math.random() * 800000000) + 100000000;
@@ -652,14 +652,29 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
 });
 
+// Capture dynamic app callback requested during OAuth request token step
 app.all('/oauth/request_token', (req, res) => {
+  const callback = req.query.oauth_callback || req.body.oauth_callback;
+  if (callback) {
+    currentOAuthCallback = decodeURIComponent(callback);
+    console.log(`[XitterBridge] Captured app oauth_callback: ${currentOAuthCallback}`);
+  }
   const reqToken = "xitterbridge_req_token_static";
   const reqSecret = "xitterbridge_req_secret_static";
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route: returns proper HTML so app intercepts verifier and dismisses popup
+// OAuth Callback Route: automatically forwards to app's expected callback/protocol so the WebView intercepts and dismisses itself
 app.get('/oauth/callback', (req, res) => {
+  const oauthToken = req.query.oauth_token || 'xitterbridge_req_token_static';
+  const oauthVerifier = req.query.oauth_verifier || 'xitterbridge_verified';
+
+  if (currentOAuthCallback && !currentOAuthCallback.includes('/oauth/callback')) {
+    const finalTarget = `${currentOAuthCallback}${currentOAuthCallback.includes('?') ? '&' : '?'}oauth_token=${oauthToken}&oauth_verifier=${oauthVerifier}`;
+    console.log(`[XitterBridge] Redirecting back to app callback: ${finalTarget}`);
+    return res.redirect(302, finalTarget);
+  }
+
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(`<!DOCTYPE html>
   <html>
