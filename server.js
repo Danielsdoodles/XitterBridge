@@ -15,6 +15,9 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// In-memory cache for resolving bare rest_id -> full user object
+const globalUserMap = new Map();
+
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -242,6 +245,9 @@ function sanitizeUser(u) {
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
+    if (userIdStr && globalUserMap.has(userIdStr)) {
+      return globalUserMap.get(userIdStr);
+    }
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     return {
       ...defaultUser,
@@ -256,7 +262,7 @@ function sanitizeUser(u) {
   const banner = fixUrl(u.profile_banner_url) || defaultUser.profile_banner_url;
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
-  return {
+  const sanitized = {
     ...defaultUser,
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
@@ -278,6 +284,28 @@ function sanitizeUser(u) {
     profile_banner_url: banner,
     entities: u.entities || defaultUser.entities
   };
+
+  if (finalIdStr) globalUserMap.set(finalIdStr, sanitized);
+  if (rawScreen) globalUserMap.set(rawScreen.toLowerCase(), sanitized);
+
+  return sanitized;
+}
+
+function extractAllUsersFromPayload(obj) {
+  if (!obj || typeof obj !== 'object') return;
+  
+  if ((obj.screen_name || obj.screenName) && (obj.name || obj.profile_image_url_https || obj.rest_id)) {
+    sanitizeUser(obj);
+  }
+  if (obj.legacy && obj.legacy.screen_name) {
+    sanitizeUser({ ...obj.legacy, rest_id: obj.rest_id || obj.id_str });
+  }
+  
+  for (const k of Object.keys(obj)) {
+    if (typeof obj[k] === 'object' && obj[k] !== null) {
+      extractAllUsersFromPayload(obj[k]);
+    }
+  }
 }
 
 function extractTweetAuthor(obj) {
@@ -290,81 +318,27 @@ function extractTweetAuthor(obj) {
     obj.tweet_results?.result?.core?.user_results?.result,
     obj.user_results?.result?.legacy,
     obj.user_results?.result,
-    obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
-    obj.retweeted_status_result?.result?.core?.user_results?.result,
-    obj.quoted_status_result?.result?.core?.user_results?.result?.legacy,
-    obj.quoted_status_result?.result?.core?.user_results?.result,
-    obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result?.legacy,
-    obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result,
-    obj.tweet?.core?.user_results?.result?.legacy,
-    obj.tweet?.core?.user_results?.result,
     obj.user,
-    obj.legacy?.user,
-    obj.legacy
+    obj.legacy?.user
   ];
 
   for (const p of candidatePaths) {
     if (p && typeof p === 'object') {
+      const restId = cleanStr(p.id_str || p.rest_id || p.legacy?.id_str);
       const screen = cleanStr(p.screen_name || p.legacy?.screen_name);
+      
       if (screen && screen !== 'twitter_user') {
-        const name = cleanStr(p.name || p.legacy?.name) || screen;
-        const restId = cleanStr(p.id_str || p.rest_id || p.legacy?.id_str);
-        const userId = restId ? parseInt(restId) : generateUniqueUserId(screen);
-        const avatar = fixUrl(p.profile_image_url_https || p.profile_image_url || p.legacy?.profile_image_url_https);
-
-        return {
-          id: Number(userId) || 12345678,
-          id_str: restId || String(userId),
-          name: name,
-          screen_name: screen,
-          profile_image_url_https: avatar,
-          profile_image_url: avatar,
-          profile_banner_url: fixUrl(p.profile_banner_url || p.legacy?.profile_banner_url),
-          description: cleanStr(p.description || p.legacy?.description) || "",
-          verified: !!(p.verified || p.legacy?.verified),
-          followers_count: Number(p.followers_count ?? p.legacy?.followers_count ?? 100),
-          friends_count: Number(p.friends_count ?? p.legacy?.friends_count ?? 100)
-        };
+        return sanitizeUser(p);
+      }
+      if (restId && globalUserMap.has(restId)) {
+        return globalUserMap.get(restId);
       }
     }
   }
 
-  // Deep recursive fallback scan for any valid legacy user block
-  let foundUser = null;
-  function findLegacyUser(node) {
-    if (!node || typeof node !== 'object' || foundUser) return;
-    if (node.screen_name && typeof node.screen_name === 'string' && node.screen_name !== 'twitter_user' && (node.name || node.profile_image_url_https)) {
-      foundUser = node;
-      return;
-    }
-    for (const k of Object.keys(node)) {
-      if (typeof node[k] === 'object' && node[k] !== null) {
-        findLegacyUser(node[k]);
-      }
-    }
-  }
-  findLegacyUser(obj);
-
-  if (foundUser) {
-    const screen = cleanStr(foundUser.screen_name);
-    const name = cleanStr(foundUser.name) || screen;
-    const restId = cleanStr(foundUser.id_str || foundUser.rest_id);
-    const userId = restId ? parseInt(restId) : generateUniqueUserId(screen);
-    const avatar = fixUrl(foundUser.profile_image_url_https || foundUser.profile_image_url);
-
-    return {
-      id: Number(userId) || 12345678,
-      id_str: restId || String(userId),
-      name: name,
-      screen_name: screen,
-      profile_image_url_https: avatar,
-      profile_image_url: avatar,
-      profile_banner_url: fixUrl(foundUser.profile_banner_url),
-      description: cleanStr(foundUser.description) || "",
-      verified: !!foundUser.verified,
-      followers_count: Number(foundUser.followers_count ?? 100),
-      friends_count: Number(foundUser.friends_count ?? 100)
-    };
+  const tweetUserId = cleanStr(obj.legacy?.user_id_str || obj.user_id_str);
+  if (tweetUserId && globalUserMap.has(tweetUserId)) {
+    return globalUserMap.get(tweetUserId);
   }
 
   return null;
@@ -606,22 +580,8 @@ async function backgroundScrape() {
         const json = await response.json().catch(() => null);
         if (!json) return;
 
-        if (url.includes('/graphql/') && (url.includes('Viewer') || url.includes('UserByScreenName') || url.includes('HomeTimeline'))) {
-          function extractUser(obj) {
-            if (!obj || typeof obj !== 'object') return;
-            if (obj.legacy && obj.legacy.screen_name && obj.legacy.name) {
-              const u = sanitizeUser(obj.legacy);
-              if (u && u.screen_name && u.screen_name !== 'twitter_user') {
-                cachedAccountProfile = u;
-                updateCachedAccountInWorker(u);
-              }
-            }
-            for (const k of Object.keys(obj)) {
-              if (typeof obj[k] === 'object' && obj[k] !== null) extractUser(obj[k]);
-            }
-          }
-          extractUser(json);
-        }
+        // First pass: extract and store all user profiles globally
+        extractAllUsersFromPayload(json);
 
         if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
           const isNotif = url.includes('Notification');
@@ -721,7 +681,8 @@ app.get('/clear-cache', async (req, res) => {
   localTimeline = [];
   localNotifications = [];
   cachedAccountProfile = null;
-  return res.send('KV Cache cleared successfully!');
+  globalUserMap.clear();
+  return res.send('KV Cache and User Map cleared successfully!');
 });
 
 app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
@@ -858,6 +819,14 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     return res.status(200).json(currentAcc);
   }
 
+  if (screenName && globalUserMap.has(screenName.toLowerCase())) {
+    return res.status(200).json(globalUserMap.get(screenName.toLowerCase()));
+  }
+
+  if (userId && globalUserMap.has(userId.toString())) {
+    return res.status(200).json(globalUserMap.get(userId.toString()));
+  }
+
   const cachedTweets = await getCachedTimelineFromWorker();
   const matchedTweet = cachedTweets.find(t => 
     (screenName && t.user?.screen_name?.toLowerCase() === screenName.toLowerCase()) ||
@@ -892,6 +861,10 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
     const requestedNames = String(screenNameQuery).split(',').map(s => s.trim().toLowerCase());
     const matchedUsers = [];
     for (const name of requestedNames) {
+      if (globalUserMap.has(name)) {
+        matchedUsers.push(globalUserMap.get(name));
+        continue;
+      }
       const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name || t.user?.id_str === name);
       if (match && match.user) {
         matchedUsers.push(sanitizeUser(match.user));
