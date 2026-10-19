@@ -55,7 +55,14 @@ let localNotifications = [];
 let cachedAccountProfile = null;
 let isScraping = false;
 let lastScrapeTime = 0;
-let currentOAuthCallback = "https://xitterbridge.onrender.com/oauth/callback";
+let currentOAuthCallback = null;
+
+function extractOAuthParam(authHeader, paramName) {
+  if (!authHeader || typeof authHeader !== 'string') return null;
+  const regex = new RegExp(`${paramName}="([^"]+)"`);
+  const match = authHeader.match(regex);
+  return match ? decodeURIComponent(match[1]) : null;
+}
 
 function generateUniqueUserId(screenName) {
   if (!screenName || screenName === 'twitter_user') return Math.floor(Math.random() * 800000000) + 100000000;
@@ -652,27 +659,32 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
 });
 
+// Extract oauth_callback from OAuth Authorization header or query parameters
 app.all('/oauth/request_token', (req, res) => {
-  const callback = req.query.oauth_callback || req.body.oauth_callback;
-  if (callback) {
+  const authHeader = req.headers['authorization'] || '';
+  const callbackFromHeader = extractOAuthParam(authHeader, 'oauth_callback');
+  const callbackFromQuery = req.query.oauth_callback || req.body.oauth_callback;
+  
+  const callback = callbackFromHeader || callbackFromQuery;
+  if (callback && callback !== 'oob') {
     currentOAuthCallback = decodeURIComponent(callback);
     console.log(`[XitterBridge] Captured app oauth_callback: ${currentOAuthCallback}`);
   }
+
   const reqToken = "xitterbridge_req_token_static";
   const reqSecret = "xitterbridge_req_secret_static";
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route: Appends oauth_verifier so app's WebView intercepts and auto-dismisses popup
+// OAuth Callback Route: Redirects back to the app's captured callback protocol scheme
 app.get('/oauth/callback', (req, res) => {
   const oauthToken = req.query.oauth_token || 'xitterbridge_req_token_static';
-  const oauthVerifier = req.query.oauth_verifier;
+  const oauthVerifier = req.query.oauth_verifier || 'xitterbridge_verified';
 
-  if (!oauthVerifier) {
-    const target = currentOAuthCallback || "https://xitterbridge.onrender.com/oauth/callback";
-    const separator = target.includes('?') ? '&' : '?';
-    const redirectUrl = `${target}${separator}oauth_token=${oauthToken}&oauth_verifier=xitterbridge_verified`;
-    console.log(`[XitterBridge] Sending callback with verifier to app: ${redirectUrl}`);
+  if (currentOAuthCallback && !currentOAuthCallback.includes('xitterbridge.onrender.com') && !currentOAuthCallback.includes('localhost')) {
+    const separator = currentOAuthCallback.includes('?') ? '&' : '?';
+    const redirectUrl = `${currentOAuthCallback}${separator}oauth_token=${oauthToken}&oauth_verifier=${oauthVerifier}`;
+    console.log(`[XitterBridge] Redirecting back to app callback protocol: ${redirectUrl}`);
     return res.redirect(302, redirectUrl);
   }
 
