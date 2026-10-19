@@ -21,8 +21,12 @@ app.use((req, res, next) => {
   res.setHeader('X-Rate-Limit-Remaining', '175');
   res.setHeader('X-Rate-Limit-Reset', String(nowSec + 900));
   res.setHeader('X-Access-Level', 'read-write');
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache');
+  
+  // Only set application/json for Twitter API endpoints, leaving OAuth HTML pages alone
+  if (req.path.startsWith('/1.1/') || req.path.startsWith('/1/')) {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  }
   
   console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
   next();
@@ -654,7 +658,7 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route: displays success message so the app intercepts verifier and dismisses WebView popup
+// OAuth Callback Route: returns proper HTML so app intercepts verifier and dismisses popup
 app.get('/oauth/callback', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(`<!DOCTYPE html>
