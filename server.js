@@ -104,6 +104,7 @@ function fixUrl(url) {
   return str;
 }
 
+// Clean image URLs for legacy Windows Phone clients (strip complex query params like ?format=jpg)
 function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
@@ -111,9 +112,9 @@ function forceJpgUrl(url) {
     fixed = fixed.split('?')[0];
     if (!fixed.includes('.')) fixed += '.jpg';
     else fixed = fixed.replace(/\.(webp|png|jpeg|avif)$/i, '.jpg');
-    return fixed + '?format=jpg&name=large';
+    return fixed;
   }
-  return fixed;
+  return fixed.split('?')[0];
 }
 
 function sanitizeTweetText(text) {
@@ -142,9 +143,9 @@ function sanitizeMedia(m) {
   );
   if (!rawUrl) return null;
 
-  const forcedJpg = forceJpgUrl(rawUrl);
-  const httpsUrl = forcedJpg.replace(/^http:\/\//i, 'https://');
-  const httpUrl = forcedJpg.replace(/^https:\/\//i, 'http://');
+  const cleanImageUrl = forceJpgUrl(rawUrl);
+  const httpsUrl = cleanImageUrl.replace(/^http:\/\//i, 'https://');
+  const httpUrl = cleanImageUrl.replace(/^https:\/\//i, 'http://');
 
   let videoInfo = m.video_info || m.videoInfo || mediaLegacy.video_info || mediaRes.video_info;
   if (videoInfo && Array.isArray(videoInfo.variants)) {
@@ -190,14 +191,26 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
-  if (!u || typeof u !== 'object') return cachedAccountProfile;
+  if (!u || typeof u !== 'object') {
+    return cachedAccountProfile || {
+      id: 12345678,
+      id_str: "12345678",
+      name: "X User",
+      screen_name: "x_user",
+      followers_count: 150,
+      friends_count: 150,
+      statuses_count: 300,
+      profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+      profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web"
+    };
+  }
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || '');
   let rawName = cleanStr(u.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
-    return cachedAccountProfile;
+    return cachedAccountProfile || u;
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url);
@@ -219,12 +232,12 @@ function sanitizeUser(u) {
     url: cleanStr(u.url) || null,
     protected: !!u.protected,
     verified: !!u.verified,
-    followers_count: Number(u.followers_count ?? 100),
-    friends_count: Number(u.friends_count ?? 100),
+    followers_count: Number(u.followers_count ?? 150),
+    friends_count: Number(u.friends_count ?? 150),
     listed_count: Number(u.listed_count ?? 0),
     created_at: formatTwitterDate(u.created_at),
     favourites_count: Number(u.favourites_count ?? 100),
-    statuses_count: Number(u.statuses_count ?? 100),
+    statuses_count: Number(u.statuses_count ?? 300),
     profile_image_url: avatar,
     profile_image_url_https: avatar,
     profile_banner_url: banner,
@@ -560,7 +573,7 @@ async function backgroundScrape() {
                 id: userId, id_str: userIdStr, name: name || screenName, screen_name: screenName,
                 profile_image_url_https: avatar, profile_image_url: avatar,
                 profile_banner_url: fixUrl(uObj?.profile_banner_url), description: uObj?.description || "",
-                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 100, friends_count: uObj?.friends_count || 100
+                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 150, friends_count: uObj?.friends_count || 150
               }) : cachedAccountProfile;
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
@@ -659,7 +672,6 @@ app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
 });
 
-// Extract oauth_callback from OAuth Authorization header or query parameters
 app.all('/oauth/request_token', (req, res) => {
   const authHeader = req.headers['authorization'] || '';
   const callbackFromHeader = extractOAuthParam(authHeader, 'oauth_callback');
@@ -676,7 +688,6 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// OAuth Callback Route: Redirects back to the app's captured callback protocol scheme
 app.get('/oauth/callback', (req, res) => {
   const oauthToken = req.query.oauth_token || 'xitterbridge_req_token_static';
   const oauthVerifier = req.query.oauth_verifier || 'xitterbridge_verified';
@@ -735,29 +746,17 @@ app.get('/1.1/account/verify_credentials.json', async (req, res) => {
     cachedAccountProfile = await getCachedAccountFromWorker();
   }
   backgroundScrape();
-
-  const acc = cachedAccountProfile || {
-    id: 12345678,
-    id_str: "12345678",
-    name: "X User",
-    screen_name: "x_user",
-    followers_count: 100,
-    friends_count: 100,
-    statuses_count: 100,
-    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png"
-  };
-
-  return res.status(200).json(sanitizeUser(acc));
+  return res.status(200).json(sanitizeUser(cachedAccountProfile));
 });
 
 app.get('/1.1/account/totals.json', (req, res) => {
   backgroundScrape();
-  const acc = cachedAccountProfile || { statuses_count: 0, followers_count: 0, friends_count: 0, favourites_count: 0 };
+  const acc = cachedAccountProfile || { statuses_count: 300, followers_count: 150, friends_count: 150, favourites_count: 100 };
   return res.status(200).json({
-    updates: acc.statuses_count || 0,
-    followers: acc.followers_count || 0,
-    friends: acc.friends_count || 0,
-    favorites: acc.favourites_count || 0,
+    updates: acc.statuses_count || 300,
+    followers: acc.followers_count || 150,
+    friends: acc.friends_count || 150,
+    favorites: acc.favourites_count || 100,
     saved_searches: 0,
     lists: 0
   });
@@ -796,10 +795,10 @@ app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json(
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const screenName = req.query.screen_name || req.body?.screen_name;
   const userId = req.query.user_id || req.body?.user_id;
-  const currentAcc = cachedAccountProfile || await getCachedAccountFromWorker();
+  const currentAcc = cachedAccountProfile || await getCachedAccountFromWorker() || sanitizeUser(null);
 
   if ((!screenName && !userId) || (screenName && currentAcc && screenName.toLowerCase() === currentAcc.screen_name.toLowerCase())) {
-    return res.status(200).json(currentAcc || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" });
+    return res.status(200).json(currentAcc);
   }
 
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -825,7 +824,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     }));
   }
 
-  return res.status(200).json(currentAcc || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" });
+  return res.status(200).json(currentAcc);
 });
 
 app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => {
@@ -1016,7 +1015,20 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
   return res.status(200).json([{ woeid: 1, name: "Worldwide", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, url: "http://where.yahooapis.com/v1/place/1", centroid: [0, 0] }]);
 });
 
-app.get('/1.1/trends/place.json', (req, res) => res.status(200).json([]));
+// Fixed Trends/Discover endpoint structure expected by legacy apps
+app.get('/1.1/trends/place.json', (req, res) => {
+  return res.status(200).json([{
+    trends: [
+      { name: "#WindowsPhone", query: "%23WindowsPhone", tweet_volume: 15400 },
+      { name: "Nokia Lumia", query: "Nokia+Lumia", tweet_volume: 8200 },
+      { name: "Windows 10 Mobile", query: "Windows+10+Mobile", tweet_volume: 5100 },
+      { name: "XitterBridge", query: "XitterBridge", tweet_volume: 12500 }
+    ],
+    as_of: formatTwitterDate(),
+    created_at: formatTwitterDate(),
+    locations: [{ woeid: 1, name: "Worldwide" }]
+  }]);
+});
 
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '/1.1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
   const rawQuery = req.query.q || req.query.query || "";
