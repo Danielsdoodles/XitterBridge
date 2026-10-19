@@ -256,8 +256,6 @@ function sanitizeUser(u) {
   const banner = fixUrl(u.profile_banner_url) || defaultUser.profile_banner_url;
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
-  let userStatus = u.status || null;
-
   return {
     ...defaultUser,
     id: Number(finalIdStr) || 12345678,
@@ -278,9 +276,58 @@ function sanitizeUser(u) {
     profile_image_url: avatar,
     profile_image_url_https: avatar,
     profile_banner_url: banner,
-    entities: u.entities || defaultUser.entities,
-    status: userStatus ? sanitizeTweet(userStatus) : null
+    entities: u.entities || defaultUser.entities
   };
+}
+
+function extractTweetAuthor(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+
+  const candidatePaths = [
+    obj.core?.user_results?.result?.legacy,
+    obj.core?.user_results?.result,
+    obj.tweet_results?.result?.core?.user_results?.result?.legacy,
+    obj.tweet_results?.result?.core?.user_results?.result,
+    obj.user_results?.result?.legacy,
+    obj.user_results?.result,
+    obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
+    obj.retweeted_status_result?.result?.core?.user_results?.result,
+    obj.quoted_status_result?.result?.core?.user_results?.result?.legacy,
+    obj.quoted_status_result?.result?.core?.user_results?.result,
+    obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result?.legacy,
+    obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result,
+    obj.tweet?.core?.user_results?.result?.legacy,
+    obj.tweet?.core?.user_results?.result,
+    obj.user,
+    obj.legacy?.user
+  ];
+
+  for (const p of candidatePaths) {
+    if (p && typeof p === 'object') {
+      const screen = cleanStr(p.screen_name || p.legacy?.screen_name);
+      if (screen && screen !== 'twitter_user') {
+        const name = cleanStr(p.name || p.legacy?.name) || screen;
+        const restId = cleanStr(p.id_str || p.rest_id || p.legacy?.id_str);
+        const userId = restId ? parseInt(restId) : generateUniqueUserId(screen);
+        const avatar = fixUrl(p.profile_image_url_https || p.profile_image_url || p.legacy?.profile_image_url_https);
+
+        return {
+          id: Number(userId) || 12345678,
+          id_str: restId || String(userId),
+          name: name,
+          screen_name: screen,
+          profile_image_url_https: avatar,
+          profile_image_url: avatar,
+          profile_banner_url: fixUrl(p.profile_banner_url || p.legacy?.profile_banner_url),
+          description: cleanStr(p.description || p.legacy?.description) || "",
+          verified: !!(p.verified || p.legacy?.verified),
+          followers_count: Number(p.followers_count ?? p.legacy?.followers_count ?? 100),
+          friends_count: Number(p.friends_count ?? p.legacy?.friends_count ?? 100)
+        };
+      }
+    }
+  }
+  return null;
 }
 
 function sanitizeTweet(t) {
@@ -544,58 +591,7 @@ async function backgroundScrape() {
 
             if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
               const legacy = obj.legacy;
-              let uObj = null;
-              
-              const paths = [
-                obj.user,
-                obj.legacy?.user,
-                obj.core?.user_results?.result?.legacy,
-                obj.core?.user_results?.result,
-                obj.tweet_results?.result?.core?.user_results?.result?.legacy,
-                obj.tweet_results?.result?.core?.user_results?.result,
-                obj.user_results?.result?.legacy,
-                obj.user_results?.result,
-                obj.retweeted_status_result?.result?.core?.user_results?.result?.legacy,
-                obj.retweeted_status_result?.result?.core?.user_results?.result,
-                obj.quoted_status_result?.result?.core?.user_results?.result?.legacy,
-                obj.quoted_status_result?.result?.core?.user_results?.result,
-                obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result?.legacy,
-                obj.item?.itemContent?.tweet_results?.result?.core?.user_results?.result
-              ];
-
-              for (const p of paths) {
-                if (p && p.screen_name && p.screen_name !== 'twitter_user') { uObj = p; break; }
-              }
-
-              if (!uObj || !uObj.screen_name || uObj.screen_name === 'twitter_user') {
-                function searchForUser(n) {
-                  if (!n || typeof n !== 'object') return null;
-                  if (typeof n.screen_name === 'string' && n.screen_name.length > 0 && n.screen_name !== 'twitter_user') return n;
-                  if (n.legacy && typeof n.legacy.screen_name === 'string' && n.legacy.screen_name !== 'twitter_user') return n.legacy;
-                  for (const k of Object.keys(n)) {
-                    if (typeof n[k] === 'object' && n[k] !== null) {
-                      const found = searchForUser(n[k]);
-                      if (found) return found;
-                    }
-                  }
-                  return null;
-                }
-                uObj = searchForUser(obj);
-              }
-
-              const screenName = cleanStr(uObj?.screen_name && uObj.screen_name !== 'twitter_user' ? uObj.screen_name : null);
-              const name = cleanStr(uObj?.name && uObj.name !== 'twitter_user' ? uObj.name : screenName);
-              const avatar = fixUrl(uObj?.profile_image_url_https || uObj?.profile_image_url);
-              const restId = cleanStr(uObj?.id_str || uObj?.rest_id || obj.core?.user_results?.result?.rest_id || obj.user_id_str);
-              const userId = restId ? parseInt(restId) : (screenName ? generateUniqueUserId(screenName) : Date.now());
-              const userIdStr = restId || String(userId);
-
-              let tweetAuthor = screenName ? sanitizeUser({
-                id: userId, id_str: userIdStr, name: name || screenName, screen_name: screenName,
-                profile_image_url_https: avatar, profile_image_url: avatar,
-                profile_banner_url: fixUrl(uObj?.profile_banner_url), description: uObj?.description || "",
-                verified: uObj?.verified || false, followers_count: uObj?.followers_count || 100, friends_count: uObj?.friends_count || 100
-              }) : sanitizeUser(uObj);
+              const tweetAuthor = extractTweetAuthor(obj) || sanitizeUser(null);
 
               let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
               let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
