@@ -654,7 +654,26 @@ app.all('/oauth/request_token', (req, res) => {
   return res.setHeader('Content-Type', 'text/html').status(200).send(`oauth_token=${reqToken}&oauth_token_secret=${reqSecret}&oauth_callback_confirmed=true`);
 });
 
-// Deterministic OAuth token generation so session persists after closing app
+// OAuth Callback Route to close WebView popup cleanly after authorization
+app.get('/oauth/callback', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!DOCTYPE html>
+  <html>
+    <head>
+      <title>Authorization Successful</title>
+      <script>
+        setTimeout(() => {
+          try { window.close(); } catch(e) {}
+        }, 800);
+      </script>
+    </head>
+    <body style="background:#fff; color:#111; font-family:sans-serif; text-align:center; padding-top:50px;">
+      <h2 style="color:#3b9400;">✓ Authorization Successful</h2>
+      <p>XitterBridge has been successfully linked. You can return to the app.</p>
+    </body>
+  </html>`);
+});
+
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = (req.body.x_auth_username || req.query.x_auth_username || "").trim();
   const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
@@ -667,11 +686,11 @@ app.all('/oauth/access_token', async (req, res) => {
   const activeUserId = cachedAccountProfile?.id_str || "12345678";
   const activeScreenName = cachedAccountProfile?.screen_name || "x_user";
   
-  // Deterministic tokens tied to active account to prevent auto-logout on app restart
   const accessToken = `xitter_access_${activeScreenName}`;
   const accessTokenSecret = `xitter_secret_${activeUserId}`;
 
-  res.setHeader('Content-Type', 'text/html');
+  // Form-urlencoded Content-Type so app parses parameters correctly without rendering raw text
+  res.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=utf-8');
   return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
 });
 
@@ -853,7 +872,6 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
   return res.status(200).json(userTweets.length > 0 ? userTweets : allTweets.slice(0, 15));
 });
 
-// Full Activity Engine supporting retweets, favorites, mentions, and follows
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
   const cachedTweets = await getCachedTimelineFromWorker();
@@ -911,7 +929,7 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1.1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
   const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
