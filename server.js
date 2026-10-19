@@ -299,7 +299,8 @@ function extractTweetAuthor(obj) {
     obj.tweet?.core?.user_results?.result?.legacy,
     obj.tweet?.core?.user_results?.result,
     obj.user,
-    obj.legacy?.user
+    obj.legacy?.user,
+    obj.legacy
   ];
 
   for (const p of candidatePaths) {
@@ -327,6 +328,45 @@ function extractTweetAuthor(obj) {
       }
     }
   }
+
+  // Deep recursive fallback scan for any valid legacy user block
+  let foundUser = null;
+  function findLegacyUser(node) {
+    if (!node || typeof node !== 'object' || foundUser) return;
+    if (node.screen_name && typeof node.screen_name === 'string' && node.screen_name !== 'twitter_user' && (node.name || node.profile_image_url_https)) {
+      foundUser = node;
+      return;
+    }
+    for (const k of Object.keys(node)) {
+      if (typeof node[k] === 'object' && node[k] !== null) {
+        findLegacyUser(node[k]);
+      }
+    }
+  }
+  findLegacyUser(obj);
+
+  if (foundUser) {
+    const screen = cleanStr(foundUser.screen_name);
+    const name = cleanStr(foundUser.name) || screen;
+    const restId = cleanStr(foundUser.id_str || foundUser.rest_id);
+    const userId = restId ? parseInt(restId) : generateUniqueUserId(screen);
+    const avatar = fixUrl(foundUser.profile_image_url_https || foundUser.profile_image_url);
+
+    return {
+      id: Number(userId) || 12345678,
+      id_str: restId || String(userId),
+      name: name,
+      screen_name: screen,
+      profile_image_url_https: avatar,
+      profile_image_url: avatar,
+      profile_banner_url: fixUrl(foundUser.profile_banner_url),
+      description: cleanStr(foundUser.description) || "",
+      verified: !!foundUser.verified,
+      followers_count: Number(foundUser.followers_count ?? 100),
+      friends_count: Number(foundUser.friends_count ?? 100)
+    };
+  }
+
   return null;
 }
 
