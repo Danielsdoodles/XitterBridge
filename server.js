@@ -15,7 +15,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// In-memory cache for resolving bare rest_id -> full user object
+// In-memory cache for resolving rest_id -> full user object
 const globalUserMap = new Map();
 
 app.use((req, res, next) => {
@@ -240,9 +240,9 @@ function sanitizeUser(u) {
 
   if (!u || typeof u !== 'object') return defaultUser;
   
-  let rawScreen = cleanStr(u.screen_name || u.screenName || '');
-  let rawName = cleanStr(u.name || '');
-  let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
+  let rawScreen = cleanStr(u.screen_name || u.screenName || u.legacy?.screen_name || '');
+  let rawName = cleanStr(u.name || u.legacy?.name || '');
+  let userIdStr = cleanStr(u.id_str || u.rest_id || u.id || u.legacy?.id_str);
 
   if (!rawScreen || rawScreen === 'twitter_user') {
     if (userIdStr && globalUserMap.has(userIdStr)) {
@@ -258,8 +258,8 @@ function sanitizeUser(u) {
     };
   }
 
-  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
-  const banner = fixUrl(u.profile_banner_url) || defaultUser.profile_banner_url;
+  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
+  const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || defaultUser.profile_banner_url;
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
   const sanitized = {
@@ -268,21 +268,21 @@ function sanitizeUser(u) {
     id_str: finalIdStr,
     name: rawName || rawScreen,
     screen_name: rawScreen,
-    location: cleanStr(u.location) || "",
-    description: cleanStr(u.description) || "",
-    url: cleanStr(u.url) || null,
-    protected: !!u.protected,
-    verified: !!u.verified,
-    followers_count: Number(u.followers_count ?? 100),
-    friends_count: Number(u.friends_count ?? 100),
-    listed_count: Number(u.listed_count ?? 0),
-    created_at: formatTwitterDate(u.created_at),
-    favourites_count: Number(u.favourites_count ?? 100),
-    statuses_count: Number(u.statuses_count ?? 100),
+    location: cleanStr(u.location || u.legacy?.location) || "",
+    description: cleanStr(u.description || u.legacy?.description) || "",
+    url: cleanStr(u.url || u.legacy?.url) || null,
+    protected: !!(u.protected || u.legacy?.protected),
+    verified: !!(u.verified || u.legacy?.verified),
+    followers_count: Number(u.followers_count ?? u.legacy?.followers_count ?? 100),
+    friends_count: Number(u.friends_count ?? u.legacy?.friends_count ?? 100),
+    listed_count: Number(u.listed_count ?? u.legacy?.listed_count ?? 0),
+    created_at: formatTwitterDate(u.created_at || u.legacy?.created_at),
+    favourites_count: Number(u.favourites_count ?? u.legacy?.favourites_count ?? 100),
+    statuses_count: Number(u.statuses_count ?? u.legacy?.statuses_count ?? 100),
     profile_image_url: avatar,
     profile_image_url_https: avatar,
     profile_banner_url: banner,
-    entities: u.entities || defaultUser.entities
+    entities: u.entities || u.legacy?.entities || defaultUser.entities
   };
 
   if (finalIdStr) globalUserMap.set(finalIdStr, sanitized);
@@ -294,13 +294,19 @@ function sanitizeUser(u) {
 function extractAllUsersFromPayload(obj) {
   if (!obj || typeof obj !== 'object') return;
   
-  if ((obj.screen_name || obj.screenName) && (obj.name || obj.profile_image_url_https || obj.rest_id)) {
+  const screen = cleanStr(obj.screen_name || obj.screenName || obj.legacy?.screen_name);
+  if (screen && screen !== 'twitter_user') {
     sanitizeUser(obj);
   }
-  if (obj.legacy && obj.legacy.screen_name) {
-    sanitizeUser({ ...obj.legacy, rest_id: obj.rest_id || obj.id_str });
+
+  if (obj.user_results?.result) {
+    const uResult = obj.user_results.result;
+    const uLegacy = uResult.legacy || uResult;
+    if (uLegacy.screen_name) {
+      sanitizeUser({ ...uLegacy, rest_id: uResult.rest_id || obj.rest_id });
+    }
   }
-  
+
   for (const k of Object.keys(obj)) {
     if (typeof obj[k] === 'object' && obj[k] !== null) {
       extractAllUsersFromPayload(obj[k]);
@@ -339,6 +345,12 @@ function extractTweetAuthor(obj) {
   const tweetUserId = cleanStr(obj.legacy?.user_id_str || obj.user_id_str);
   if (tweetUserId && globalUserMap.has(tweetUserId)) {
     return globalUserMap.get(tweetUserId);
+  }
+
+  // Backup: Check user_mentions or retweeted_status entities in case user_id isn't in globalUserMap
+  const retweetUser = obj.legacy?.retweeted_status_result?.result?.core?.user_results?.result?.legacy;
+  if (retweetUser && retweetUser.screen_name) {
+    return sanitizeUser(retweetUser);
   }
 
   return null;
@@ -580,7 +592,7 @@ async function backgroundScrape() {
         const json = await response.json().catch(() => null);
         if (!json) return;
 
-        // First pass: extract and store all user profiles globally
+        // Pre-pass: Hydrate global user map from all JSON structures
         extractAllUsersFromPayload(json);
 
         if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
@@ -646,11 +658,12 @@ async function backgroundScrape() {
       } catch (e) {}
     });
 
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    // Wait for network idle to allow asynchronous UserByRestId GraphQL calls to complete
+    await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 35000 }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 25000 });
-    await new Promise((resolve) => setTimeout(resolve, 4000));
+    await page.goto('https://x.com/notifications', { waitUntil: 'networkidle2', timeout: 35000 }).catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
     await browser.close();
 
