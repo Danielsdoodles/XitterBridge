@@ -104,7 +104,6 @@ function fixUrl(url) {
   return str;
 }
 
-// Clean image URLs for legacy Windows Phone clients (strip complex query params like ?format=jpg)
 function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
@@ -191,58 +190,27 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
-  if (!u || typeof u !== 'object') {
-    return cachedAccountProfile || {
-      id: 12345678,
-      id_str: "12345678",
-      name: "X User",
-      screen_name: "x_user",
-      followers_count: 150,
-      friends_count: 150,
-      statuses_count: 300,
-      profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-      profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web"
-    };
-  }
-  
-  let rawScreen = cleanStr(u.screen_name || u.screenName || '');
-  let rawName = cleanStr(u.name || '');
-  let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
-
-  if (!rawScreen || rawScreen === 'twitter_user') {
-    return cachedAccountProfile || u;
-  }
-
-  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url);
-  const banner = fixUrl(u.profile_banner_url);
-  const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
-
-  let userStatus = u.status || null;
-  if (!userStatus && localTimeline.length > 0) {
-    userStatus = localTimeline.find(t => t.user?.screen_name?.toLowerCase() === rawScreen.toLowerCase()) || localTimeline[0];
-  }
-
-  const sanitizedObj = {
-    id: Number(finalIdStr) || 12345678,
-    id_str: finalIdStr,
-    name: rawName || rawScreen,
-    screen_name: rawScreen,
-    location: cleanStr(u.location) || "",
-    description: cleanStr(u.description) || "",
-    url: cleanStr(u.url) || null,
-    protected: !!u.protected,
-    verified: !!u.verified,
-    followers_count: Number(u.followers_count ?? 150),
-    friends_count: Number(u.friends_count ?? 150),
-    listed_count: Number(u.listed_count ?? 0),
-    created_at: formatTwitterDate(u.created_at),
-    favourites_count: Number(u.favourites_count ?? 100),
-    statuses_count: Number(u.statuses_count ?? 300),
-    profile_image_url: avatar,
-    profile_image_url_https: avatar,
-    profile_banner_url: banner,
-    default_profile: !!u.default_profile,
-    default_profile_image: !!u.default_profile_image,
+  const defaultUser = {
+    id: 12345678,
+    id_str: "12345678",
+    name: "X User",
+    screen_name: "x_user",
+    location: "New Jersey",
+    description: "Connected via XitterBridge",
+    url: null,
+    protected: false,
+    verified: false,
+    followers_count: 150,
+    friends_count: 150,
+    listed_count: 0,
+    created_at: "Wed Oct 10 00:00:00 +0000 2026",
+    favourites_count: 100,
+    statuses_count: 300,
+    profile_image_url: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    profile_banner_url: "https://pbs.twimg.com/profile_banners/12345678/1600000000/web",
+    default_profile: true,
+    default_profile_image: false,
     utc_offset: null,
     time_zone: null,
     geo_enabled: true,
@@ -263,7 +231,52 @@ function sanitizeUser(u) {
     follow_request_sent: false,
     notifications: false,
     translator_type: "none",
-    entities: u.entities || { description: { urls: [] }, url: { urls: [] } }
+    entities: { description: { urls: [] }, url: { urls: [] } },
+    status: null
+  };
+
+  if (!u || typeof u !== 'object') {
+    return cachedAccountProfile || defaultUser;
+  }
+  
+  let rawScreen = cleanStr(u.screen_name || u.screenName || '');
+  let rawName = cleanStr(u.name || '');
+  let userIdStr = cleanStr(u.id_str || u.rest_id || u.id);
+
+  if (!rawScreen || rawScreen === 'twitter_user') {
+    return cachedAccountProfile || defaultUser;
+  }
+
+  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url) || defaultUser.profile_image_url_https;
+  const banner = fixUrl(u.profile_banner_url) || defaultUser.profile_banner_url;
+  const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
+
+  let userStatus = u.status || null;
+  if (!userStatus && localTimeline.length > 0) {
+    userStatus = localTimeline.find(t => t.user?.screen_name?.toLowerCase() === rawScreen.toLowerCase()) || localTimeline[0];
+  }
+
+  const sanitizedObj = {
+    ...defaultUser,
+    id: Number(finalIdStr) || 12345678,
+    id_str: finalIdStr,
+    name: rawName || rawScreen,
+    screen_name: rawScreen,
+    location: cleanStr(u.location) || defaultUser.location,
+    description: cleanStr(u.description) || defaultUser.description,
+    url: cleanStr(u.url) || null,
+    protected: !!u.protected,
+    verified: !!u.verified,
+    followers_count: Number(u.followers_count ?? defaultUser.followers_count),
+    friends_count: Number(u.friends_count ?? defaultUser.friends_count),
+    listed_count: Number(u.listed_count ?? 0),
+    created_at: formatTwitterDate(u.created_at),
+    favourites_count: Number(u.favourites_count ?? defaultUser.favourites_count),
+    statuses_count: Number(u.statuses_count ?? defaultUser.statuses_count),
+    profile_image_url: avatar,
+    profile_image_url_https: avatar,
+    profile_banner_url: banner,
+    entities: u.entities || defaultUser.entities
   };
 
   const finalStatus = userStatus ? sanitizeTweet(userStatus) : null;
@@ -738,7 +751,7 @@ app.all('/oauth/access_token', async (req, res) => {
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
-app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || "" }));
+app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || "x_user" }));
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
 app.get('/1.1/account/verify_credentials.json', async (req, res) => {
@@ -784,7 +797,7 @@ app.get('/1.1/friendships/show.json', (req, res) => {
   const acc = cachedAccountProfile || {};
   return res.status(200).json({
     relationship: {
-      source: { id: acc.id || 0, id_str: acc.id_str || "0", screen_name: acc.screen_name || "", following: false, followed_by: false, blocking: false, muting: false },
+      source: { id: acc.id || 0, id_str: acc.id_str || "0", screen_name: acc.screen_name || "x_user", following: false, followed_by: false, blocking: false, muting: false },
       target: { id: 0, id_str: "0", screen_name: target, following: false, followed_by: false, blocking: false }
     }
   });
@@ -1015,7 +1028,6 @@ app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
   return res.status(200).json([{ woeid: 1, name: "Worldwide", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, url: "http://where.yahooapis.com/v1/place/1", centroid: [0, 0] }]);
 });
 
-// Fixed Trends/Discover endpoint structure expected by legacy apps
 app.get('/1.1/trends/place.json', (req, res) => {
   return res.status(200).json([{
     trends: [
@@ -1028,6 +1040,14 @@ app.get('/1.1/trends/place.json', (req, res) => {
     created_at: formatTwitterDate(),
     locations: [{ woeid: 1, name: "Worldwide" }]
   }]);
+});
+
+// Added to prevent Discover crashes when fetching trend locations
+app.get('/1.1/trends/available.json', (req, res) => {
+  return res.status(200).json([
+    { name: "Worldwide", country: "", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, woeid: 1 },
+    { name: "United States", country: "United States", country_code: "US", parentid: 1, placeType: { code: 12, name: "Country" }, woeid: 23424977 }
+  ]);
 });
 
 app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '/1.1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
