@@ -15,7 +15,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// In-memory cache for resolving rest_id -> full user object
 const globalUserMap = new Map();
 
 app.use((req, res, next) => {
@@ -244,17 +243,21 @@ function sanitizeUser(u) {
   let rawName = cleanStr(u.name || u.legacy?.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id || u.legacy?.id_str);
 
-  if (!rawScreen || rawScreen === 'twitter_user') {
-    if (userIdStr && globalUserMap.has(userIdStr)) {
-      return globalUserMap.get(userIdStr);
+  if (userIdStr && globalUserMap.has(userIdStr)) {
+    const cached = globalUserMap.get(userIdStr);
+    if (cached.screen_name && cached.screen_name !== 'twitter_user' && !cached.screen_name.startsWith('user_')) {
+      return cached;
     }
+  }
+
+  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen.startsWith('user_')) {
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     return {
       ...defaultUser,
       id: Number(fallbackId) || 12345678,
       id_str: fallbackId,
-      name: rawName || `User ${fallbackId.slice(-4)}`,
-      screen_name: `user_${fallbackId.slice(-6)}`
+      name: rawName && rawName !== 'Twitter User' ? rawName : `User ${fallbackId.slice(-4)}`,
+      screen_name: rawScreen && !rawScreen.startsWith('user_') ? rawScreen : `user_${fallbackId.slice(-6)}`
     };
   }
 
@@ -295,7 +298,7 @@ function extractAllUsersFromPayload(obj) {
   if (!obj || typeof obj !== 'object') return;
   
   const screen = cleanStr(obj.screen_name || obj.screenName || obj.legacy?.screen_name);
-  if (screen && screen !== 'twitter_user') {
+  if (screen && screen !== 'twitter_user' && !screen.startsWith('user_')) {
     sanitizeUser(obj);
   }
 
@@ -312,48 +315,6 @@ function extractAllUsersFromPayload(obj) {
       extractAllUsersFromPayload(obj[k]);
     }
   }
-}
-
-function extractTweetAuthor(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-
-  const candidatePaths = [
-    obj.core?.user_results?.result?.legacy,
-    obj.core?.user_results?.result,
-    obj.tweet_results?.result?.core?.user_results?.result?.legacy,
-    obj.tweet_results?.result?.core?.user_results?.result,
-    obj.user_results?.result?.legacy,
-    obj.user_results?.result,
-    obj.user,
-    obj.legacy?.user
-  ];
-
-  for (const p of candidatePaths) {
-    if (p && typeof p === 'object') {
-      const restId = cleanStr(p.id_str || p.rest_id || p.legacy?.id_str);
-      const screen = cleanStr(p.screen_name || p.legacy?.screen_name);
-      
-      if (screen && screen !== 'twitter_user') {
-        return sanitizeUser(p);
-      }
-      if (restId && globalUserMap.has(restId)) {
-        return globalUserMap.get(restId);
-      }
-    }
-  }
-
-  const tweetUserId = cleanStr(obj.legacy?.user_id_str || obj.user_id_str);
-  if (tweetUserId && globalUserMap.has(tweetUserId)) {
-    return globalUserMap.get(tweetUserId);
-  }
-
-  // Backup: Check user_mentions or retweeted_status entities in case user_id isn't in globalUserMap
-  const retweetUser = obj.legacy?.retweeted_status_result?.result?.core?.user_results?.result?.legacy;
-  if (retweetUser && retweetUser.screen_name) {
-    return sanitizeUser(retweetUser);
-  }
-
-  return null;
 }
 
 function sanitizeTweet(t) {
@@ -583,98 +544,120 @@ async function backgroundScrape() {
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
-    let parsedTweets = [];
-    let parsedNotifications = [];
-
+    // Collect GraphQL network responses in parallel
     page.on('response', async (response) => {
       try {
-        const url = response.url();
         const json = await response.json().catch(() => null);
-        if (!json) return;
-
-        // Pre-pass: Hydrate global user map from all JSON structures
-        extractAllUsersFromPayload(json);
-
-        if (url.includes('/graphql/') && (url.includes('HomeTimeline') || url.includes('HomeLatestTimeline') || url.includes('UserTweets') || url.includes('TweetDetail') || url.includes('Notification'))) {
-          const isNotif = url.includes('Notification');
-
-          function recursiveSearch(obj) {
-            if (!obj || typeof obj !== 'object') return;
-
-            if (obj.legacy && (obj.legacy.full_text || obj.legacy.text)) {
-              const legacy = obj.legacy;
-              const tweetAuthor = extractTweetAuthor(obj) || sanitizeUser(null);
-
-              let entities = legacy.entities ? JSON.parse(JSON.stringify(legacy.entities)) : { hashtags: [], symbols: [], user_mentions: [], urls: [] };
-              let extendedEntities = legacy.extended_entities ? JSON.parse(JSON.stringify(legacy.extended_entities)) : (entities.media ? { media: entities.media } : undefined);
-
-              if (extendedEntities && extendedEntities.media) {
-                extendedEntities.media = extendedEntities.media.map(m => sanitizeMedia(m)).filter(Boolean);
-                entities.media = extendedEntities.media;
-              }
-
-              const tweetIdStr = legacy.id_str || Date.now().toString();
-              const favCount = Number(legacy.favorite_count ?? obj.favorite_count ?? 0);
-              const retCount = Number(legacy.retweet_count ?? obj.retweet_count ?? 0);
-
-              const rawTweet = {
-                created_at: formatTwitterDate(legacy.created_at),
-                id: tweetIdStr,
-                id_str: tweetIdStr,
-                text: legacy.full_text || legacy.text || "",
-                full_text: legacy.full_text || legacy.text || "",
-                source: legacy.source || obj.source || '<a href="http://twitter.com" rel="nofollow">Twitter for iPhone</a>',
-                truncated: false,
-                in_reply_to_status_id: legacy.in_reply_to_status_id_str || null,
-                in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
-                in_reply_to_user_id: legacy.in_reply_to_user_id_str || null,
-                in_reply_to_user_id_str: legacy.in_reply_to_user_id_str || null,
-                in_reply_to_screen_name: legacy.in_reply_to_screen_name || null,
-                user_id: tweetAuthor?.id || 0,
-                user_id_str: tweetAuthor?.id_str || "0",
-                user: tweetAuthor,
-                entities: entities,
-                extended_entities: extendedEntities,
-                favorited: legacy.favorited || false,
-                retweeted: legacy.retweeted || false,
-                retweet_count: retCount,
-                favorite_count: favCount,
-                lang: legacy.lang || "en"
-              };
-
-              const sanitized = sanitizeTweet(rawTweet);
-              parsedTweets.push(sanitized);
-              if (isNotif) {
-                parsedNotifications.push(sanitized);
-              }
-            }
-
-            for (const key of Object.keys(obj)) {
-              if (typeof obj[key] === 'object' && obj[key] !== null) recursiveSearch(obj[key]);
-            }
-          }
-          recursiveSearch(json);
-        }
+        if (json) extractAllUsersFromPayload(json);
       } catch (e) {}
     });
 
-    // Wait for network idle to allow asynchronous UserByRestId GraphQL calls to complete
-    await page.goto('https://x.com/home', { waitUntil: 'networkidle2', timeout: 35000 }).catch(() => {});
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    // Navigate to home timeline
+    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+    await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
+    
+    // Scroll down to force hydration of DOM and background GraphQL requests
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await new Promise(r => setTimeout(r, 2000));
+    }
 
-    await page.goto('https://x.com/notifications', { waitUntil: 'networkidle2', timeout: 35000 }).catch(() => {});
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    // Direct DOM Scraping Engine with Multiple Attribute Selector Fallbacks
+    const scrapedTweets = await page.evaluate(() => {
+      const items = [];
+      const articles = document.querySelectorAll('article[data-testid="tweet"]');
+      articles.forEach(art => {
+        try {
+          let name = "";
+          let screen_name = "";
+
+          // Method 1: Extract screen name from user link href (e.g., href="/ElonMusk")
+          const userLinks = art.querySelectorAll('a[role="link"]');
+          for (const link of userLinks) {
+            const href = link.getAttribute('href') || '';
+            if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/search') && !href.includes('/analytics')) {
+              const handleCandidate = href.split('/')[1].split('?')[0].trim();
+              if (handleCandidate && handleCandidate.length > 0) {
+                screen_name = handleCandidate;
+                break;
+              }
+            }
+          }
+
+          // Method 2: Extract display name and screen_name from User-Name block text spans
+          const userNameContainer = art.querySelector('[data-testid="User-Name"]');
+          if (userNameContainer) {
+            const spans = Array.from(userNameContainer.querySelectorAll('span')).map(s => s.textContent.trim()).filter(Boolean);
+            for (const s of spans) {
+              if (s.startsWith('@') && !screen_name) {
+                screen_name = s.slice(1);
+              } else if (!s.startsWith('@') && s !== '·' && s.length > 0 && !name) {
+                name = s;
+              }
+            }
+          }
+
+          if (!name) name = screen_name || "Twitter User";
+          if (!screen_name) return; // Skip invalid stub DOM nodes without valid handles
+
+          const avatarImg = art.querySelector('img[src*="profile_images"]');
+          const profile_image_url_https = avatarImg ? avatarImg.src.replace('_normal', '_400x400') : "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+
+          const textDiv = art.querySelector('[data-testid="tweetText"]');
+          const text = textDiv ? textDiv.innerText : "";
+
+          const timeEl = art.querySelector('time');
+          const datetime = timeEl ? timeEl.getAttribute('datetime') : new Date().toISOString();
+          
+          let id_str = Math.floor(Math.random() * 900000000000000000).toString();
+          const links = art.querySelectorAll('a[href*="/status/"]');
+          for (const l of links) {
+            const m = l.href.match(/\/status\/(\d+)/);
+            if (m) {
+              id_str = m[1];
+              break;
+            }
+          }
+
+          const media = [];
+          const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
+          photos.forEach(p => {
+            if (p.src) {
+              media.push({
+                media_url_https: p.src,
+                type: 'photo',
+                url: p.src,
+                display_url: 'pic.twitter.com',
+                expanded_url: p.src
+              });
+            }
+          });
+
+          items.push({
+            id_str,
+            text,
+            created_at: datetime,
+            user: {
+              id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
+              name: name,
+              screen_name: screen_name,
+              profile_image_url_https,
+              profile_image_url: profile_image_url_https,
+              verified: !!art.querySelector('svg[aria-label="Verified account"]')
+            },
+            entities: { media: media.length ? media : undefined },
+            extended_entities: media.length ? { media } : undefined
+          });
+        } catch (err) {}
+      });
+      return items;
+    });
 
     await browser.close();
 
-    if (parsedTweets.length > 0) {
-      await appendCachedTimelineToWorker(parsedTweets);
-    }
-    if (parsedNotifications.length > 0) {
-      const notifMap = new Map();
-      localNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
-      parsedNotifications.forEach(n => notifMap.set(n.id_str || n.id, n));
-      localNotifications = Array.from(notifMap.values()).slice(0, 100);
+    const sanitizedParsed = scrapedTweets.map(t => sanitizeTweet(t));
+    if (sanitizedParsed.length > 0) {
+      await appendCachedTimelineToWorker(sanitizedParsed);
     }
   } catch (err) {
     if (browser) await browser.close().catch(() => {});
@@ -711,7 +694,6 @@ app.all('/oauth/request_token', (req, res) => {
   const callback = callbackFromHeader || callbackFromQuery;
   if (callback && callback !== 'oob') {
     currentOAuthCallback = decodeURIComponent(callback);
-    console.log(`[XitterBridge] Captured app oauth_callback: ${currentOAuthCallback}`);
   }
 
   const reqToken = "xitterbridge_req_token_static";
@@ -726,7 +708,6 @@ app.get('/oauth/callback', (req, res) => {
   if (currentOAuthCallback && !currentOAuthCallback.includes('xitterbridge.onrender.com') && !currentOAuthCallback.includes('localhost')) {
     const separator = currentOAuthCallback.includes('?') ? '&' : '?';
     const redirectUrl = `${currentOAuthCallback}${separator}oauth_token=${oauthToken}&oauth_verifier=${oauthVerifier}`;
-    console.log(`[XitterBridge] Redirecting back to app callback protocol: ${redirectUrl}`);
     return res.redirect(302, redirectUrl);
   }
 
