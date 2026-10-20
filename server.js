@@ -244,21 +244,11 @@ function sanitizeUser(u) {
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id || u.legacy?.id_str);
 
   if (userIdStr && globalUserMap.has(userIdStr)) {
-    const cached = globalUserMap.get(userIdStr);
-    if (cached.screen_name && cached.screen_name !== 'twitter_user' && !cached.screen_name.startsWith('user_')) {
-      return cached;
-    }
+    return globalUserMap.get(userIdStr);
   }
 
-  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen.startsWith('user_')) {
-    const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
-    return {
-      ...defaultUser,
-      id: Number(fallbackId) || 12345678,
-      id_str: fallbackId,
-      name: rawName && rawName !== 'Twitter User' ? rawName : `User ${fallbackId.slice(-4)}`,
-      screen_name: rawScreen && !rawScreen.startsWith('user_') ? rawScreen : `user_${fallbackId.slice(-6)}`
-    };
+  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'undefined' || rawScreen === 'null') {
+    rawScreen = rawName ? rawName.toLowerCase().replace(/[^a-z0-9_]/g, '') : 'x_user';
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
@@ -269,7 +259,7 @@ function sanitizeUser(u) {
     ...defaultUser,
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
-    name: rawName || rawScreen,
+    name: rawName && rawName !== 'Twitter User' ? rawName : rawScreen,
     screen_name: rawScreen,
     location: cleanStr(u.location || u.legacy?.location) || "",
     description: cleanStr(u.description || u.legacy?.description) || "",
@@ -292,29 +282,6 @@ function sanitizeUser(u) {
   if (rawScreen) globalUserMap.set(rawScreen.toLowerCase(), sanitized);
 
   return sanitized;
-}
-
-function extractAllUsersFromPayload(obj) {
-  if (!obj || typeof obj !== 'object') return;
-  
-  const screen = cleanStr(obj.screen_name || obj.screenName || obj.legacy?.screen_name);
-  if (screen && screen !== 'twitter_user' && !screen.startsWith('user_')) {
-    sanitizeUser(obj);
-  }
-
-  if (obj.user_results?.result) {
-    const uResult = obj.user_results.result;
-    const uLegacy = uResult.legacy || uResult;
-    if (uLegacy.screen_name) {
-      sanitizeUser({ ...uLegacy, rest_id: uResult.rest_id || obj.rest_id });
-    }
-  }
-
-  for (const k of Object.keys(obj)) {
-    if (typeof obj[k] === 'object' && obj[k] !== null) {
-      extractAllUsersFromPayload(obj[k]);
-    }
-  }
 }
 
 function sanitizeTweet(t) {
@@ -461,20 +428,6 @@ async function getCachedAccountFromWorker() {
   return null;
 }
 
-async function updateCachedAccountInWorker(accountObj) {
-  const workerUrl = process.env.WORKER_URL;
-  const secret = process.env.BRIDGE_SECRET;
-  if (!workerUrl || !secret || !accountObj) return;
-
-  try {
-    await fetch(`${workerUrl}/update-account`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(accountObj)
-    });
-  } catch (e) {}
-}
-
 async function getCachedTimelineFromWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
@@ -544,80 +497,78 @@ async function backgroundScrape() {
       { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
     );
 
-    // Collect GraphQL network responses in parallel
-    page.on('response', async (response) => {
-      try {
-        const json = await response.json().catch(() => null);
-        if (json) extractAllUsersFromPayload(json);
-      } catch (e) {}
-    });
-
-    // Navigate to home timeline
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
     await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
     
-    // Scroll down to force hydration of DOM and background GraphQL requests
     for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // Direct DOM Scraping Engine with Multiple Attribute Selector Fallbacks
+    // Bulletproof DOM Text Node & Link Extraction Engine
     const scrapedTweets = await page.evaluate(() => {
       const items = [];
       const articles = document.querySelectorAll('article[data-testid="tweet"]');
+
       articles.forEach(art => {
         try {
           let name = "";
           let screen_name = "";
+          let profile_image_url_https = "";
+          let id_str = "";
+          let text = "";
 
-          // Method 1: Extract screen name from user link href (e.g., href="/ElonMusk")
-          const userLinks = art.querySelectorAll('a[role="link"]');
-          for (const link of userLinks) {
-            const href = link.getAttribute('href') || '';
-            if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/search') && !href.includes('/analytics')) {
-              const handleCandidate = href.split('/')[1].split('?')[0].trim();
-              if (handleCandidate && handleCandidate.length > 0) {
-                screen_name = handleCandidate;
-                break;
-              }
-            }
-          }
-
-          // Method 2: Extract display name and screen_name from User-Name block text spans
+          // 1. Extract name and screen_name from User-Name spans
           const userNameContainer = art.querySelector('[data-testid="User-Name"]');
           if (userNameContainer) {
-            const spans = Array.from(userNameContainer.querySelectorAll('span')).map(s => s.textContent.trim()).filter(Boolean);
-            for (const s of spans) {
-              if (s.startsWith('@') && !screen_name) {
-                screen_name = s.slice(1);
-              } else if (!s.startsWith('@') && s !== '·' && s.length > 0 && !name) {
-                name = s;
+            const spans = userNameContainer.querySelectorAll('span');
+            for (const span of spans) {
+              const txt = span.textContent ? span.textContent.trim() : '';
+              if (txt.startsWith('@')) {
+                screen_name = txt.substring(1);
+              } else if (txt && txt !== '·' && !txt.startsWith('http') && name === '') {
+                name = txt;
               }
             }
           }
 
-          if (!name) name = screen_name || "Twitter User";
-          if (!screen_name) return; // Skip invalid stub DOM nodes without valid handles
+          // 2. Fallback screen_name from profile link href if spans failed
+          if (!screen_name) {
+            const links = art.querySelectorAll('a[role="link"]');
+            for (const link of links) {
+              const href = link.getAttribute('href') || '';
+              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search')) {
+                const candidate = href.split('/')[1];
+                if (candidate && candidate.length > 0 && !['home', 'explore', 'notifications', 'messages'].includes(candidate)) {
+                  screen_name = candidate;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (!name) name = screen_name ? screen_name : "Twitter User";
+          if (!screen_name) screen_name = "x_user";
 
           const avatarImg = art.querySelector('img[src*="profile_images"]');
-          const profile_image_url_https = avatarImg ? avatarImg.src.replace('_normal', '_400x400') : "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+          if (avatarImg && avatarImg.src) {
+            profile_image_url_https = avatarImg.src.replace('_normal', '_400x400');
+          } else {
+            profile_image_url_https = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+          }
 
           const textDiv = art.querySelector('[data-testid="tweetText"]');
-          const text = textDiv ? textDiv.innerText : "";
+          if (textDiv) text = textDiv.innerText || "";
 
-          const timeEl = art.querySelector('time');
-          const datetime = timeEl ? timeEl.getAttribute('datetime') : new Date().toISOString();
-          
-          let id_str = Math.floor(Math.random() * 900000000000000000).toString();
-          const links = art.querySelectorAll('a[href*="/status/"]');
-          for (const l of links) {
+          const statusLinks = art.querySelectorAll('a[href*="/status/"]');
+          for (const l of statusLinks) {
             const m = l.href.match(/\/status\/(\d+)/);
-            if (m) {
+            if (m && m[1]) {
               id_str = m[1];
               break;
             }
           }
+          if (!id_str) id_str = Math.floor(Math.random() * 900000000000000000).toString();
 
           const media = [];
           const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
@@ -636,7 +587,7 @@ async function backgroundScrape() {
           items.push({
             id_str,
             text,
-            created_at: datetime,
+            created_at: new Date().toISOString(),
             user: {
               id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
               name: name,
@@ -648,7 +599,7 @@ async function backgroundScrape() {
             entities: { media: media.length ? media : undefined },
             extended_entities: media.length ? { media } : undefined
           });
-        } catch (err) {}
+        } catch (e) {}
       });
       return items;
     });
