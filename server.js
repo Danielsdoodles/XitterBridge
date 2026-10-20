@@ -244,11 +244,19 @@ function sanitizeUser(u) {
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id || u.legacy?.id_str);
 
   if (userIdStr && globalUserMap.has(userIdStr)) {
-    return globalUserMap.get(userIdStr);
+    const cached = globalUserMap.get(userIdStr);
+    if (cached.screen_name && cached.screen_name !== 'twitter_user' && !cached.screen_name.startsWith('user_')) {
+      return cached;
+    }
   }
 
-  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'undefined' || rawScreen === 'null') {
-    rawScreen = rawName ? rawName.toLowerCase().replace(/[^a-z0-9_]/g, '') : 'x_user';
+  // Strict check: Only generate fallback if screen_name is missing or invalid
+  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen === 'undefined' || rawScreen === 'null') {
+    const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
+    rawScreen = `user_${fallbackId.slice(-6)}`;
+    rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
+  } else if (!rawName || rawName.startsWith('user_') || rawName === 'Twitter User') {
+    rawName = rawScreen;
   }
 
   const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
@@ -259,7 +267,7 @@ function sanitizeUser(u) {
     ...defaultUser,
     id: Number(finalIdStr) || 12345678,
     id_str: finalIdStr,
-    name: rawName && rawName !== 'Twitter User' ? rawName : rawScreen,
+    name: rawName,
     screen_name: rawScreen,
     location: cleanStr(u.location || u.legacy?.location) || "",
     description: cleanStr(u.description || u.legacy?.description) || "",
@@ -505,7 +513,7 @@ async function backgroundScrape() {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // Bulletproof DOM Text Node & Link Extraction Engine
+    // Modern X User Extraction Engine
     const scrapedTweets = await page.evaluate(() => {
       const items = [];
       const articles = document.querySelectorAll('article[data-testid="tweet"]');
@@ -518,87 +526,97 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          // 1. Extract name and screen_name from User-Name spans
-          const userNameContainer = art.querySelector('[data-testid="User-Name"]');
-          if (userNameContainer) {
-            const spans = userNameContainer.querySelectorAll('span');
-            for (const span of spans) {
-              const txt = span.textContent ? span.textContent.trim() : '';
-              if (txt.startsWith('@')) {
-                screen_name = txt.substring(1);
-              } else if (txt && txt !== '·' && !txt.startsWith('http') && name === '') {
-                name = txt;
+          // Inspect the User-Name element directly
+          const userNameEl = art.querySelector('[data-testid="User-Name"]');
+          if (userNameEl) {
+            // Find screen name by inspecting hrefs inside User-Name
+            const userAnchors = userNameEl.querySelectorAll('a[href]');
+            for (const a of userAnchors) {
+              const href = a.getAttribute('href') || '';
+              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/')) {
+                const parts = href.split('/').filter(Boolean);
+                if (parts.length === 1) {
+                  screen_name = parts[0];
+                  break;
+                }
+              }
+            }
+
+            // Find display name from text content
+            const allSpans = Array.from(userNameEl.querySelectorAll('span'));
+            for (const span of allSpans) {
+              const content = span.textContent ? span.textContent.trim() : '';
+              if (content && !content.startsWith('@') && content !== '·' && !name) {
+                name = content;
+                break;
               }
             }
           }
 
-          // 2. Fallback screen_name from profile link href if spans failed
+          // Fallback to outer links if User-Name block didn't yield a screen_name
           if (!screen_name) {
-            const links = art.querySelectorAll('a[role="link"]');
-            for (const link of links) {
+            const allLinks = art.querySelectorAll('a[href]');
+            for (const link of allLinks) {
               const href = link.getAttribute('href') || '';
-              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search')) {
-                const candidate = href.split('/')[1];
-                if (candidate && candidate.length > 0 && !['home', 'explore', 'notifications', 'messages'].includes(candidate)) {
-                  screen_name = candidate;
+              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
+                const p = href.split('/').filter(Boolean)[0];
+                if (p && !['home', 'explore', 'notifications', 'messages'].includes(p)) {
+                  screen_name = p;
                   break;
                 }
               }
             }
           }
 
-          if (!name) name = screen_name ? screen_name : "Twitter User";
-          if (!screen_name) screen_name = "x_user";
+          if (screen_name) {
+            if (!name) name = screen_name;
 
-          const avatarImg = art.querySelector('img[src*="profile_images"]');
-          if (avatarImg && avatarImg.src) {
-            profile_image_url_https = avatarImg.src.replace('_normal', '_400x400');
-          } else {
-            profile_image_url_https = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
-          }
+            const avatarImg = art.querySelector('img[src*="profile_images"]');
+            profile_image_url_https = avatarImg ? avatarImg.src.replace('_normal', '_400x400') : "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
 
-          const textDiv = art.querySelector('[data-testid="tweetText"]');
-          if (textDiv) text = textDiv.innerText || "";
+            const textDiv = art.querySelector('[data-testid="tweetText"]');
+            text = textDiv ? textDiv.innerText : "";
 
-          const statusLinks = art.querySelectorAll('a[href*="/status/"]');
-          for (const l of statusLinks) {
-            const m = l.href.match(/\/status\/(\d+)/);
-            if (m && m[1]) {
-              id_str = m[1];
-              break;
+            const statusLinks = art.querySelectorAll('a[href*="/status/"]');
+            for (const l of statusLinks) {
+              const m = l.href.match(/\/status\/(\d+)/);
+              if (m && m[1]) {
+                id_str = m[1];
+                break;
+              }
             }
+            if (!id_str) id_str = Math.floor(Math.random() * 900000000000000000).toString();
+
+            const media = [];
+            const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
+            photos.forEach(p => {
+              if (p.src) {
+                media.push({
+                  media_url_https: p.src,
+                  type: 'photo',
+                  url: p.src,
+                  display_url: 'pic.twitter.com',
+                  expanded_url: p.src
+                });
+              }
+            });
+
+            items.push({
+              id_str,
+              text,
+              created_at: new Date().toISOString(),
+              user: {
+                id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
+                name: name,
+                screen_name: screen_name,
+                profile_image_url_https,
+                profile_image_url: profile_image_url_https,
+                verified: !!art.querySelector('svg[aria-label="Verified account"]')
+              },
+              entities: { media: media.length ? media : undefined },
+              extended_entities: media.length ? { media } : undefined
+            });
           }
-          if (!id_str) id_str = Math.floor(Math.random() * 900000000000000000).toString();
-
-          const media = [];
-          const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
-          photos.forEach(p => {
-            if (p.src) {
-              media.push({
-                media_url_https: p.src,
-                type: 'photo',
-                url: p.src,
-                display_url: 'pic.twitter.com',
-                expanded_url: p.src
-              });
-            }
-          });
-
-          items.push({
-            id_str,
-            text,
-            created_at: new Date().toISOString(),
-            user: {
-              id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
-              name: name,
-              screen_name: screen_name,
-              profile_image_url_https,
-              profile_image_url: profile_image_url_https,
-              verified: !!art.querySelector('svg[aria-label="Verified account"]')
-            },
-            entities: { media: media.length ? media : undefined },
-            extended_entities: media.length ? { media } : undefined
-          });
         } catch (e) {}
       });
       return items;
