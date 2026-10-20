@@ -250,7 +250,6 @@ function sanitizeUser(u) {
     }
   }
 
-  // Strict check: Only generate fallback if screen_name is missing or invalid
   if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen === 'undefined' || rawScreen === 'null') {
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
@@ -506,19 +505,47 @@ async function backgroundScrape() {
     );
 
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
-    await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
+    
+    // Log current page state to identify headless navigation issues
+    const currentUrl = page.url();
+    const pageTitle = await page.title().catch(() => 'No Title');
+    console.log(`[XitterBridge Scraper] Landed on URL: ${currentUrl} | Page Title: ${pageTitle}`);
+
+    const hasTweets = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).then(() => true).catch(() => false);
+    if (!hasTweets) {
+      console.log(`[XitterBridge Scraper] Warning: 'article[data-testid="tweet"]' selector timed out on ${currentUrl}. Checking fallback post ancestors.`);
+    }
     
     for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // Modern X User Extraction Engine
+    // Flexible Ancestor Scraper Engine
     const scrapedTweets = await page.evaluate(() => {
       const items = [];
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
+      let postElements = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+      
+      if (postElements.length === 0) {
+        // Fallback: find post containers by status link ancestors
+        const statusLinks = document.querySelectorAll('a[href*="/status/"]');
+        const containerSet = new Set();
+        statusLinks.forEach(l => {
+          let parent = l.parentElement;
+          let depth = 0;
+          while (parent && depth < 8) {
+            if (parent.tagName === 'ARTICLE' || parent.getAttribute('role') === 'article' || parent.classList.contains('css-175oi2r')) {
+              containerSet.add(parent);
+              break;
+            }
+            parent = parent.parentElement;
+            depth++;
+          }
+        });
+        postElements = Array.from(containerSet);
+      }
 
-      articles.forEach(art => {
+      postElements.forEach(art => {
         try {
           let name = "";
           let screen_name = "";
@@ -526,45 +553,26 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          // Inspect the User-Name element directly
-          const userNameEl = art.querySelector('[data-testid="User-Name"]');
-          if (userNameEl) {
-            // Find screen name by inspecting hrefs inside User-Name
-            const userAnchors = userNameEl.querySelectorAll('a[href]');
-            for (const a of userAnchors) {
-              const href = a.getAttribute('href') || '';
-              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/')) {
-                const parts = href.split('/').filter(Boolean);
-                if (parts.length === 1) {
-                  screen_name = parts[0];
-                  break;
-                }
-              }
-            }
-
-            // Find display name from text content
-            const allSpans = Array.from(userNameEl.querySelectorAll('span'));
-            for (const span of allSpans) {
-              const content = span.textContent ? span.textContent.trim() : '';
-              if (content && !content.startsWith('@') && content !== '·' && !name) {
-                name = content;
+          // Extract handle by scanning all inner links for handle paths
+          const links = art.querySelectorAll('a[href]');
+          for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
+              const candidate = href.split('/')[1].split('?')[0].trim();
+              if (candidate && !['home', 'explore', 'notifications', 'messages', 'settings'].includes(candidate.toLowerCase())) {
+                screen_name = candidate;
                 break;
               }
             }
           }
 
-          // Fallback to outer links if User-Name block didn't yield a screen_name
-          if (!screen_name) {
-            const allLinks = art.querySelectorAll('a[href]');
-            for (const link of allLinks) {
-              const href = link.getAttribute('href') || '';
-              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
-                const p = href.split('/').filter(Boolean)[0];
-                if (p && !['home', 'explore', 'notifications', 'messages'].includes(p)) {
-                  screen_name = p;
-                  break;
-                }
-              }
+          // Extract display name by scanning text nodes
+          const allTextSpans = Array.from(art.querySelectorAll('span'));
+          for (const span of allTextSpans) {
+            const t = span.textContent ? span.textContent.trim() : '';
+            if (t && !t.startsWith('@') && t !== '·' && !t.startsWith('http') && t.length > 0) {
+              name = t;
+              break;
             }
           }
 
@@ -621,6 +629,8 @@ async function backgroundScrape() {
       });
       return items;
     });
+
+    console.log(`[XitterBridge Scraper] Successfully extracted ${scrapedTweets.length} posts from page DOM.`);
 
     await browser.close();
 
