@@ -17,6 +17,10 @@ app.use(express.json());
 
 const globalUserMap = new Map();
 
+// Local fallback memory for tokens if worker is not used
+let manualAuthToken = process.env.X_AUTH_TOKEN || '';
+let manualCt0 = process.env.X_CT0 || '';
+
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -391,33 +395,29 @@ function findTweetById(allTweets, idInput) {
   );
 }
 
-async function saveTokensToWorker(authToken, ct0Token) {
+async function getTokens() {
+  if (manualAuthToken && manualCt0) {
+    return { auth_token: manualAuthToken, ct0: manualCt0 };
+  }
+
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
-  if (!workerUrl || !secret) return;
+  if (workerUrl && secret) {
+    try {
+      const response = await fetch(`${workerUrl}/get-tokens`, { headers: { 'X-Bridge-Secret': secret } });
+      if (response.ok) {
+        const data = await response.json();
+        if (data.auth_token && data.ct0) {
+          return { auth_token: data.auth_token, ct0: data.ct0 };
+        }
+      }
+    } catch (err) {}
+  }
 
-  try {
-    await fetch(`${workerUrl}/update-tokens`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify({ auth_token: authToken, ct0: ct0Token })
-    });
-  } catch (err) {}
-}
-
-async function getTokensFromCloudflareWorker() {
-  const workerUrl = process.env.WORKER_URL;
-  const secret = process.env.BRIDGE_SECRET;
-  if (!workerUrl || !secret) return { auth_token: process.env.X_AUTH_TOKEN || '', ct0: process.env.X_CT0 || '' };
-
-  try {
-    const response = await fetch(`${workerUrl}/get-tokens`, { headers: { 'X-Bridge-Secret': secret } });
-    if (response.ok) {
-      const data = await response.json();
-      return { auth_token: data.auth_token || '', ct0: data.ct0 || '' };
-    }
-  } catch (err) {}
-  return { auth_token: '', ct0: '' };
+  return { 
+    auth_token: process.env.X_AUTH_TOKEN || '', 
+    ct0: process.env.X_CT0 || '' 
+  };
 }
 
 async function getCachedAccountFromWorker() {
@@ -484,8 +484,14 @@ async function backgroundScrape() {
   isScraping = true;
   lastScrapeTime = now;
 
-  const tokens = await getTokensFromCloudflareWorker();
-  if (!tokens.auth_token || !tokens.ct0) { isScraping = false; return; }
+  const tokens = await getTokens();
+  console.log(`[XitterBridge Scraper] Token Check -> auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
+
+  if (!tokens.auth_token || !tokens.ct0) {
+    console.log(`[XitterBridge Scraper] ABORTED: Missing auth_token or ct0 cookies! Visit /set-tokens?auth_token=YOUR_TOKEN&ct0=YOUR_CT0 to configure them.`);
+    isScraping = false;
+    return;
+  }
 
   let browser;
   try {
@@ -506,44 +512,20 @@ async function backgroundScrape() {
 
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
     
-    // Log current page state to identify headless navigation issues
     const currentUrl = page.url();
     const pageTitle = await page.title().catch(() => 'No Title');
     console.log(`[XitterBridge Scraper] Landed on URL: ${currentUrl} | Page Title: ${pageTitle}`);
 
-    const hasTweets = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).then(() => true).catch(() => false);
-    if (!hasTweets) {
-      console.log(`[XitterBridge Scraper] Warning: 'article[data-testid="tweet"]' selector timed out on ${currentUrl}. Checking fallback post ancestors.`);
-    }
+    await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
     
     for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // Flexible Ancestor Scraper Engine
     const scrapedTweets = await page.evaluate(() => {
       const items = [];
-      let postElements = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
-      
-      if (postElements.length === 0) {
-        // Fallback: find post containers by status link ancestors
-        const statusLinks = document.querySelectorAll('a[href*="/status/"]');
-        const containerSet = new Set();
-        statusLinks.forEach(l => {
-          let parent = l.parentElement;
-          let depth = 0;
-          while (parent && depth < 8) {
-            if (parent.tagName === 'ARTICLE' || parent.getAttribute('role') === 'article' || parent.classList.contains('css-175oi2r')) {
-              containerSet.add(parent);
-              break;
-            }
-            parent = parent.parentElement;
-            depth++;
-          }
-        });
-        postElements = Array.from(containerSet);
-      }
+      const postElements = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
 
       postElements.forEach(art => {
         try {
@@ -553,7 +535,6 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          // Extract handle by scanning all inner links for handle paths
           const links = art.querySelectorAll('a[href]');
           for (const a of links) {
             const href = a.getAttribute('href') || '';
@@ -566,7 +547,6 @@ async function backgroundScrape() {
             }
           }
 
-          // Extract display name by scanning text nodes
           const allTextSpans = Array.from(art.querySelectorAll('span'));
           for (const span of allTextSpans) {
             const t = span.textContent ? span.textContent.trim() : '';
@@ -639,6 +619,7 @@ async function backgroundScrape() {
       await appendCachedTimelineToWorker(sanitizedParsed);
     }
   } catch (err) {
+    console.error(`[XitterBridge Scraper] Error during scraping:`, err);
     if (browser) await browser.close().catch(() => {});
   } finally {
     isScraping = false;
@@ -650,6 +631,19 @@ getCachedAccountFromWorker().then(acc => {
 });
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
+
+// Quick token setup endpoint for browser configuration
+app.get('/set-tokens', (req, res) => {
+  const token = req.query.auth_token;
+  const ct0 = req.query.ct0;
+  if (token && ct0) {
+    manualAuthToken = token;
+    manualCt0 = ct0;
+    backgroundScrape();
+    return res.send('Tokens set successfully! Scraping triggered in background. Check your Render console logs.');
+  }
+  return res.send('Usage: /set-tokens?auth_token=YOUR_AUTH_TOKEN&ct0=YOUR_CT0');
+});
 
 app.get('/clear-cache', async (req, res) => {
   await appendCachedTimelineToWorker([]);
@@ -714,7 +708,6 @@ app.all('/oauth/access_token', async (req, res) => {
   const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
 
   if (usernameInput.length > 5 && passwordInput.length > 5) {
-    await saveTokensToWorker(usernameInput, passwordInput);
     backgroundScrape();
   }
 
