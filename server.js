@@ -20,6 +20,8 @@ const globalUserMap = new Map();
 let manualAuthToken = process.env.X_AUTH_TOKEN || '';
 let manualCt0 = process.env.X_CT0 || '';
 
+const DEFAULT_USER_AVATAR = "https://pbs.twimg.com/profile_images/2066211932248457216/K9R7-xk9_400x400.jpg";
+
 app.use((req, res, next) => {
   const nowSec = Math.floor(Date.now() / 1000);
   res.setHeader('X-Rate-Limit-Limit', '180');
@@ -113,24 +115,21 @@ function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/media/')) {
-    if (!fixed.includes('format=')) {
-      const sep = fixed.includes('?') ? '&' : '?';
-      fixed = `${fixed.split('?')[0]}${sep}format=jpg&name=large`;
-    }
-    return fixed;
+    const baseUrl = fixed.split('?')[0];
+    return `${baseUrl}?format=jpg&name=large`;
   }
   return fixed;
 }
 
 function forceJpgAvatarUrl(url) {
-  const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
-  if (!url) return defaultAvatar;
+  if (!url) return DEFAULT_USER_AVATAR;
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/profile_images/')) {
-    fixed = fixed.split('?')[0].replace(/_(normal|mini|bigger|200x200|x96|400x400)\.(jpg|jpeg|png|webp)/i, '');
-    return `${fixed}_400x400.jpg`;
+    const baseUrl = fixed.split('?')[0];
+    const cleaned = baseUrl.replace(/_(normal|mini|bigger|200x200|x96|400x400)\.(jpg|jpeg|png|webp)/i, '').replace(/\.(jpg|jpeg|png|webp)$/i, '');
+    return `${cleaned}_400x400.jpg`;
   }
-  return fixed;
+  return fixed || DEFAULT_USER_AVATAR;
 }
 
 function sanitizeTweetText(text) {
@@ -197,7 +196,6 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
-  const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
   const defaultUser = {
     id: 12345678,
     id_str: "12345678",
@@ -214,8 +212,8 @@ function sanitizeUser(u) {
     created_at: "Wed Oct 10 00:00:00 +0000 2026",
     favourites_count: 100,
     statuses_count: 100,
-    profile_image_url: defaultAvatar,
-    profile_image_url_https: defaultAvatar,
+    profile_image_url: DEFAULT_USER_AVATAR,
+    profile_image_url_https: DEFAULT_USER_AVATAR,
     profile_banner_url: "",
     default_profile: true,
     default_profile_image: true,
@@ -500,7 +498,7 @@ async function backgroundScrape() {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    const scrapedTweets = await page.evaluate(() => {
+    const scrapedTweets = await page.evaluate((defaultAvatarUrl) => {
       const items = [];
       const postElements = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
 
@@ -596,8 +594,8 @@ async function backgroundScrape() {
               id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
               name: name,
               screen_name: screen_name,
-              profile_image_url_https: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-              profile_image_url: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+              profile_image_url_https: profile_image_url_https || defaultAvatarUrl,
+              profile_image_url: profile_image_url_https || defaultAvatarUrl,
               verified: !!art.querySelector('svg[aria-label="Verified account"]')
             },
             entities: { media: media.length ? media : undefined },
@@ -606,7 +604,7 @@ async function backgroundScrape() {
         } catch (e) {}
       });
       return items;
-    });
+    }, DEFAULT_USER_AVATAR);
 
     console.log(`[XitterBridge Scraper] Successfully extracted ${scrapedTweets.length} posts from page DOM.`);
 
