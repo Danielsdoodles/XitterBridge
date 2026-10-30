@@ -17,7 +17,6 @@ app.use(express.json());
 
 const globalUserMap = new Map();
 
-// Local fallback memory for tokens if worker is not used
 let manualAuthToken = process.env.X_AUTH_TOKEN || '';
 let manualCt0 = process.env.X_CT0 || '';
 
@@ -632,7 +631,6 @@ getCachedAccountFromWorker().then(acc => {
 
 app.get('/health', (req, res) => res.status(200).json({ status: 'ok' }));
 
-// Quick token setup endpoint for browser configuration
 app.get('/set-tokens', (req, res) => {
   const token = req.query.auth_token;
   const ct0 = req.query.ct0;
@@ -843,6 +841,13 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
 });
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
+  // Automatically detect an app refresh (when pulling to refresh the top of the timeline, max_id is omitted)
+  if (!req.query.max_id) {
+    console.log('[XitterBridge] App refresh detected -> Clearing user map and local cache for fresh data.');
+    globalUserMap.clear();
+    localTimeline = [];
+  }
+
   const cachedTweets = await getCachedTimelineFromWorker();
   backgroundScrape();
 
