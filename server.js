@@ -121,6 +121,21 @@ function forceJpgUrl(url) {
   return fixed.split('?')[0];
 }
 
+function forceJpgAvatarUrl(url) {
+  const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
+  if (!url) return defaultAvatar;
+  let fixed = fixUrl(url);
+  if (fixed.includes('pbs.twimg.com/profile_images/')) {
+    fixed = fixed.replace(/_(normal|mini|bigger|200x200|x96)\./i, '_400x400.');
+    fixed = fixed.split('?')[0];
+    if (!fixed.match(/\.(jpg|jpeg|png)$/i)) {
+      fixed += '.jpg';
+    }
+    return fixed;
+  }
+  return fixed;
+}
+
 function sanitizeTweetText(text) {
   if (!text) return '';
   return text
@@ -195,6 +210,7 @@ function sanitizeMedia(m) {
 }
 
 function sanitizeUser(u) {
+  const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
   const defaultUser = {
     id: 12345678,
     id_str: "12345678",
@@ -211,8 +227,8 @@ function sanitizeUser(u) {
     created_at: "Wed Oct 10 00:00:00 +0000 2026",
     favourites_count: 100,
     statuses_count: 100,
-    profile_image_url: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-    profile_image_url_https: "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+    profile_image_url: defaultAvatar,
+    profile_image_url_https: defaultAvatar,
     profile_banner_url: "",
     default_profile: true,
     default_profile_image: true,
@@ -261,7 +277,8 @@ function sanitizeUser(u) {
     rawName = rawScreen;
   }
 
-  const avatar = fixUrl(u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https) || defaultUser.profile_image_url_https;
+  const rawAvatar = u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https;
+  const avatar = forceJpgAvatarUrl(rawAvatar);
   const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || defaultUser.profile_banner_url;
   const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
 
@@ -487,7 +504,7 @@ async function backgroundScrape() {
   console.log(`[XitterBridge Scraper] Token Check -> auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
 
   if (!tokens.auth_token || !tokens.ct0) {
-    console.log(`[XitterBridge Scraper] ABORTED: Missing auth_token or ct0 cookies! Visit /set-tokens?auth_token=YOUR_TOKEN&ct0=YOUR_CT0 to configure them.`);
+    console.log(`[XitterBridge Scraper] ABORTED: Missing auth_token or ct0 cookies!`);
     isScraping = false;
     return;
   }
@@ -515,6 +532,13 @@ async function backgroundScrape() {
     const pageTitle = await page.title().catch(() => 'No Title');
     console.log(`[XitterBridge Scraper] Landed on URL: ${currentUrl} | Page Title: ${pageTitle}`);
 
+    if (currentUrl.includes('/login') || currentUrl.includes('/i/flow/login')) {
+      console.log(`[XitterBridge Scraper] ERROR: X redirected to Login! Session cookies may have expired.`);
+      await browser.close();
+      isScraping = false;
+      return;
+    }
+
     await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 }).catch(() => {});
     
     for (let i = 0; i < 2; i++) {
@@ -534,70 +558,82 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          const links = art.querySelectorAll('a[href]');
-          for (const a of links) {
-            const href = a.getAttribute('href') || '';
-            if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
-              const candidate = href.split('/')[1].split('?')[0].trim();
-              if (candidate && !['home', 'explore', 'notifications', 'messages', 'settings'].includes(candidate.toLowerCase())) {
-                screen_name = candidate;
+          const userNameContainer = art.querySelector('[data-testid="User-Name"]');
+          if (userNameContainer) {
+            const userLinks = userNameContainer.querySelectorAll('a[href]');
+            for (const a of userLinks) {
+              const href = a.getAttribute('href') || '';
+              const cleanedHref = href.startsWith('/') ? href.slice(1) : href;
+              if (cleanedHref && !cleanedHref.includes('/status/') && !cleanedHref.includes('/i/')) {
+                screen_name = cleanedHref.split('/')[0].trim();
                 break;
+              }
+            }
+            const nameSpan = userNameContainer.querySelector('span');
+            if (nameSpan) {
+              name = nameSpan.textContent.trim();
+            }
+          }
+
+          if (!screen_name) {
+            const links = art.querySelectorAll('a[href]');
+            for (const a of links) {
+              const href = a.getAttribute('href') || '';
+              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
+                const candidate = href.split('/')[1].split('?')[0].trim();
+                if (candidate && !['home', 'explore', 'notifications', 'messages', 'settings'].includes(candidate.toLowerCase())) {
+                  screen_name = candidate;
+                  break;
+                }
               }
             }
           }
 
-          const allTextSpans = Array.from(art.querySelectorAll('span'));
-          for (const span of allTextSpans) {
-            const t = span.textContent ? span.textContent.trim() : '';
-            if (t && !t.startsWith('@') && t !== '·' && !t.startsWith('http') && t.length > 0) {
-              name = t;
+          if (!name && screen_name) name = screen_name;
+
+          const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img, [data-testid*="Avatar"] img, img[src*="profile_images"]');
+          if (avatarImg && avatarImg.src) {
+            profile_image_url_https = avatarImg.src;
+          }
+
+          const textDiv = art.querySelector('[data-testid="tweetText"]');
+          text = textDiv ? textDiv.innerText : "";
+
+          const statusLinks = art.querySelectorAll('a[href*="/status/"]');
+          for (const l of statusLinks) {
+            const m = l.href.match(/\/status\/(\d+)/);
+            if (m && m[1]) {
+              id_str = m[1];
               break;
             }
           }
+          if (!id_str) id_str = Math.floor(Math.random() * 900000000000000000).toString();
+
+          const media = [];
+          const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
+          photos.forEach(p => {
+            if (p.src) {
+              media.push({
+                media_url_https: p.src,
+                type: 'photo',
+                url: p.src,
+                display_url: 'pic.twitter.com',
+                expanded_url: p.src
+              });
+            }
+          });
 
           if (screen_name) {
-            if (!name) name = screen_name;
-
-            const avatarImg = art.querySelector('img[src*="profile_images"]');
-            profile_image_url_https = avatarImg ? avatarImg.src.replace('_normal', '_400x400') : "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
-
-            const textDiv = art.querySelector('[data-testid="tweetText"]');
-            text = textDiv ? textDiv.innerText : "";
-
-            const statusLinks = art.querySelectorAll('a[href*="/status/"]');
-            for (const l of statusLinks) {
-              const m = l.href.match(/\/status\/(\d+)/);
-              if (m && m[1]) {
-                id_str = m[1];
-                break;
-              }
-            }
-            if (!id_str) id_str = Math.floor(Math.random() * 900000000000000000).toString();
-
-            const media = [];
-            const photos = art.querySelectorAll('[data-testid="tweetPhoto"] img');
-            photos.forEach(p => {
-              if (p.src) {
-                media.push({
-                  media_url_https: p.src,
-                  type: 'photo',
-                  url: p.src,
-                  display_url: 'pic.twitter.com',
-                  expanded_url: p.src
-                });
-              }
-            });
-
             items.push({
               id_str,
               text,
               created_at: new Date().toISOString(),
               user: {
                 id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
-                name: name,
+                name: name || screen_name,
                 screen_name: screen_name,
-                profile_image_url_https,
-                profile_image_url: profile_image_url_https,
+                profile_image_url_https: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+                profile_image_url: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
                 verified: !!art.querySelector('svg[aria-label="Verified account"]')
               },
               entities: { media: media.length ? media : undefined },
@@ -638,7 +674,7 @@ app.get('/set-tokens', (req, res) => {
     manualAuthToken = token;
     manualCt0 = ct0;
     backgroundScrape();
-    return res.send('Tokens set successfully! Scraping triggered in background. Check your Render console logs.');
+    return res.send('Tokens set successfully! Scraping triggered in background.');
   }
   return res.send('Usage: /set-tokens?auth_token=YOUR_AUTH_TOKEN&ct0=YOUR_CT0');
 });
@@ -685,18 +721,10 @@ app.get('/oauth/callback', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   return res.status(200).send(`<!DOCTYPE html>
   <html>
-    <head>
-      <title>Authorization Successful</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <script>
-        setTimeout(() => {
-          try { window.close(); } catch(e) {}
-        }, 500);
-      </script>
-    </head>
-    <body style="background:#fff; color:#111; font-family:-apple-system, BlinkMacSystemFont, sans-serif; text-align:center; padding-top:60px;">
-      <h2 style="color:#3b9400; font-size:22px;">✓ Authorization Successful</h2>
-      <p style="color:#666; font-size:14px;">XitterBridge has been successfully linked to your account.<br>You can now return to the application.</p>
+    <head><title>Authorization Successful</title></head>
+    <body style="text-align:center;padding-top:60px;">
+      <h2 style="color:#3b9400;">✓ Authorization Successful</h2>
+      <p>XitterBridge has been successfully linked.</p>
     </body>
   </html>`);
 });
@@ -746,17 +774,11 @@ app.get('/1.1/account/totals.json', (req, res) => {
 
 app.get('/1.1/users/profile_banner.json', (req, res) => {
   const screenName = req.query.screen_name || cachedAccountProfile?.screen_name || "";
-  const acc = cachedAccountProfile?.screen_name?.toLowerCase() === screenName.toLowerCase() ? cachedAccountProfile : null;
-  const bannerUrl = acc?.profile_banner_url || "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
-  
+  const bannerUrl = "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
   return res.status(200).json({
     sizes: {
-      ipad: { w: 600, h: 200, url: bannerUrl },
-      ipad_retina: { w: 1200, h: 400, url: bannerUrl },
       web: { w: 1500, h: 500, url: bannerUrl },
-      web_retina: { w: 3000, h: 1000, url: bannerUrl },
-      mobile: { w: 640, h: 320, url: bannerUrl },
-      mobile_retina: { w: 1280, h: 640, url: bannerUrl }
+      mobile: { w: 640, h: 320, url: bannerUrl }
     }
   });
 });
@@ -841,7 +863,6 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
 });
 
 app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
-  // Automatically detect an app refresh (when pulling to refresh the top of the timeline, max_id is omitted)
   if (!req.query.max_id) {
     console.log('[XitterBridge] App refresh detected -> Clearing user map and local cache for fresh data.');
     globalUserMap.clear();
