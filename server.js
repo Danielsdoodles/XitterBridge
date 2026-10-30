@@ -127,12 +127,8 @@ function forceJpgAvatarUrl(url) {
   if (!url) return defaultAvatar;
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/profile_images/')) {
-    fixed = fixed.replace(/_(normal|mini|bigger|200x200|x96)\./i, '_400x400.');
-    fixed = fixed.split('?')[0];
-    if (!fixed.match(/\.(jpg|jpeg|png)$/i)) {
-      fixed += '.jpg';
-    }
-    return fixed;
+    fixed = fixed.split('?')[0].replace(/_(normal|mini|bigger|200x200|x96|400x400)\.(jpg|jpeg|png|webp)/i, '');
+    return `${fixed}_400x400.jpg`;
   }
   return fixed;
 }
@@ -178,16 +174,6 @@ function sanitizeMedia(m) {
         url: cleanStr(v.url) ? cleanStr(v.url).replace(/^http:\/\//i, 'https://') : ''
       })).filter(v => v.url)
     };
-  } else if (m.type === 'video' || m.type === 'animated_gif' || mediaRes.__typename === 'Video' || mediaRes.__typename === 'AnimatedGif' || mediaLegacy.type === 'video') {
-    videoInfo = {
-      aspect_ratio: [16, 9],
-      duration_millis: 5000,
-      variants: [{
-        bitrate: 2176000,
-        content_type: 'video/mp4',
-        url: httpsUrl.replace(/\.[^/.]+$/, ".mp4")
-      }]
-    };
   }
 
   return {
@@ -201,10 +187,10 @@ function sanitizeMedia(m) {
     type: cleanStr(m.type || mediaLegacy.type || mediaRes.__typename?.toLowerCase() || 'photo'),
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
     sizes: {
-      thumb: { w: m.sizes?.thumb?.w || mediaLegacy.sizes?.thumb?.w || 150, h: m.sizes?.thumb?.h || mediaLegacy.sizes?.thumb?.h || 150, resize: 'crop' },
-      small: { w: m.sizes?.small?.w || mediaLegacy.sizes?.small?.w || 680, h: m.sizes?.small?.h || mediaLegacy.sizes?.small?.h || 680, resize: 'fit' },
-      medium: { w: m.sizes?.medium?.w || mediaLegacy.sizes?.medium?.w || 1200, h: m.sizes?.medium?.h || mediaLegacy.sizes?.medium?.h || 1200, resize: 'fit' },
-      large: { w: m.sizes?.large?.w || mediaLegacy.sizes?.large?.w || 2048, h: m.sizes?.large?.h || mediaLegacy.sizes?.large?.h || 2048, resize: 'fit' }
+      thumb: { w: 150, h: 150, resize: 'crop' },
+      small: { w: 680, h: 680, resize: 'fit' },
+      medium: { w: 1200, h: 1200, resize: 'fit' },
+      large: { w: 2048, h: 2048, resize: 'fit' }
     },
     video_info: videoInfo
   };
@@ -233,28 +219,9 @@ function sanitizeUser(u) {
     profile_banner_url: "",
     default_profile: true,
     default_profile_image: true,
-    utc_offset: null,
-    time_zone: null,
     geo_enabled: true,
     lang: "en",
-    contributors_enabled: false,
-    is_translator: false,
-    profile_background_color: "C0DEED",
-    profile_background_image_url: "https://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_image_url_https: "https://abs.twimg.com/images/themes/theme1/bg.png",
-    profile_background_tile: false,
-    profile_link_color: "1DA1F2",
-    profile_sidebar_border_color: "C0DEED",
-    profile_sidebar_fill_color: "DDEEF6",
-    profile_text_color: "333333",
-    profile_use_background_image: true,
-    has_extended_profile: true,
-    following: false,
-    follow_request_sent: false,
-    notifications: false,
-    translator_type: "none",
-    entities: { description: { urls: [] }, url: { urls: [] } },
-    status: null
+    entities: { description: { urls: [] }, url: { urls: [] } }
   };
 
   if (!u || typeof u !== 'object') return defaultUser;
@@ -270,11 +237,11 @@ function sanitizeUser(u) {
     }
   }
 
-  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen === 'undefined' || rawScreen === 'null' || rawScreen.startsWith('user_')) {
+  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen.startsWith('user_')) {
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
-  } else if (!rawName || rawName.startsWith('user_') || rawName === 'Twitter User') {
+  } else if (!rawName || rawName === 'Twitter User') {
     rawName = rawScreen;
   }
 
@@ -372,17 +339,9 @@ function sanitizeTweet(t) {
     truncated: false,
     in_reply_to_status_id: replyIdStr ? (Number(replyIdStr) > Number.MAX_SAFE_INTEGER ? parseInt(replyIdStr.slice(-9)) : Number(replyIdStr)) : null,
     in_reply_to_status_id_str: replyIdStr,
-    in_reply_to_user_id: t.in_reply_to_user_id ? Number(t.in_reply_to_user_id) : null,
-    in_reply_to_user_id_str: cleanStr(t.in_reply_to_user_id_str),
-    in_reply_to_screen_name: cleanStr(t.in_reply_to_screen_name),
     user_id: author?.id || 0,
     user_id_str: author?.id_str || "0",
     user: author,
-    geo: null,
-    coordinates: null,
-    place: null,
-    contributors: null,
-    is_quote_status: !!t.is_quote_status,
     retweet_count: Number(t.retweet_count ?? 0),
     favorite_count: Number(t.favorite_count ?? 0),
     entities: entities,
@@ -390,12 +349,6 @@ function sanitizeTweet(t) {
     favorited: !!t.favorited,
     retweeted: !!t.retweeted,
     lang: langVal,
-    metadata: {
-      result_type: "recent",
-      iso_language_code: langVal
-    },
-    possibly_sensitive: false,
-    filter_level: "medium",
     retweeted_status: t.retweeted_status ? sanitizeTweet(t.retweeted_status) : null,
     quoted_status: t.quoted_status ? sanitizeTweet(t.quoted_status) : null
   };
@@ -559,24 +512,52 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          // Robust root-level user handle & display name scanning
-          const allLinks = art.querySelectorAll('a[href^="/"]');
-          for (const a of allLinks) {
-            const href = a.getAttribute('href') || '';
-            const parts = href.split('/').filter(Boolean);
-            if (parts.length === 1 && !['home', 'explore', 'notifications', 'messages', 'settings', 'i', 'search', 'hashtag'].includes(parts[0].toLowerCase())) {
-              screen_name = parts[0];
-              const nameEl = a.querySelector('span') || a.previousElementSibling;
-              if (nameEl && nameEl.textContent) {
-                name = nameEl.textContent.trim();
+          // Robust Handle & Display Name extraction from User-Name container
+          const userNameBlock = art.querySelector('[data-testid="User-Name"]');
+          if (userNameBlock) {
+            const links = Array.from(userNameBlock.querySelectorAll('a[href]'));
+            for (const l of links) {
+              const href = l.getAttribute('href') || '';
+              const cleaned = href.replace(/^\//, '').split('/')[0].trim();
+              if (cleaned && !cleaned.includes('i') && !cleaned.includes('status')) {
+                screen_name = cleaned;
+                break;
               }
-              break;
+            }
+            const spans = Array.from(userNameBlock.querySelectorAll('span'));
+            for (const s of spans) {
+              const txt = s.textContent ? s.textContent.trim() : '';
+              if (txt.startsWith('@')) {
+                screen_name = txt.replace('@', '');
+                break;
+              }
+            }
+            for (const s of spans) {
+              const txt = s.textContent ? s.textContent.trim() : '';
+              if (txt && !txt.startsWith('@') && txt !== '·' && txt.length > 0) {
+                name = txt;
+                break;
+              }
             }
           }
 
-          if (!name && screen_name) name = screen_name;
+          if (!screen_name) {
+            const allLinks = art.querySelectorAll('a[href^="/"]');
+            for (const a of allLinks) {
+              const href = a.getAttribute('href'] || '';
+              const parts = href.split('/').filter(Boolean);
+              if (parts.length === 1 && !['home', 'explore', 'notifications', 'messages', 'settings', 'i', 'search', 'hashtag', 'compose'].includes(parts[0].toLowerCase())) {
+                screen_name = parts[0];
+                break;
+              }
+            }
+          }
 
-          const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img, [data-testid*="Avatar"] img, img[src*="profile_images"]');
+          if (!screen_name) screen_name = "twitter_user";
+          if (!name) name = screen_name;
+
+          // Profile Picture extraction
+          const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img, img[src*="profile_images"]');
           if (avatarImg && avatarImg.src) {
             profile_image_url_https = avatarImg.src;
           }
@@ -609,23 +590,21 @@ async function backgroundScrape() {
             }
           });
 
-          if (screen_name) {
-            items.push({
-              id_str,
-              text,
-              created_at: new Date().toISOString(),
-              user: {
-                id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
-                name: name || screen_name,
-                screen_name: screen_name,
-                profile_image_url_https: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-                profile_image_url: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
-                verified: !!art.querySelector('svg[aria-label="Verified account"]')
-              },
-              entities: { media: media.length ? media : undefined },
-              extended_entities: media.length ? { media } : undefined
-            });
-          }
+          items.push({
+            id_str,
+            text,
+            created_at: new Date().toISOString(),
+            user: {
+              id_str: String(Math.abs(screen_name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) + 800000000),
+              name: name,
+              screen_name: screen_name,
+              profile_image_url_https: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+              profile_image_url: profile_image_url_https || "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png",
+              verified: !!art.querySelector('svg[aria-label="Verified account"]')
+            },
+            entities: { media: media.length ? media : undefined },
+            extended_entities: media.length ? { media } : undefined
+          });
         } catch (e) {}
       });
       return items;
@@ -759,7 +738,6 @@ app.get('/1.1/account/totals.json', (req, res) => {
 });
 
 app.get('/1.1/users/profile_banner.json', (req, res) => {
-  const screenName = req.query.screen_name || cachedAccountProfile?.screen_name || "";
   const bannerUrl = "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
   return res.status(200).json({
     sizes: {
