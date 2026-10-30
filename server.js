@@ -113,12 +113,13 @@ function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/media/')) {
-    fixed = fixed.split('?')[0];
-    if (!fixed.includes('.')) fixed += '.jpg';
-    else fixed = fixed.replace(/\.(webp|png|jpeg|avif)$/i, '.jpg');
+    if (!fixed.includes('format=')) {
+      const sep = fixed.includes('?') ? '&' : '?';
+      fixed = `${fixed.split('?')[0]}${sep}format=jpg&name=large`;
+    }
     return fixed;
   }
-  return fixed.split('?')[0];
+  return fixed;
 }
 
 function forceJpgAvatarUrl(url) {
@@ -269,7 +270,7 @@ function sanitizeUser(u) {
     }
   }
 
-  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen === 'undefined' || rawScreen === 'null') {
+  if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen === 'undefined' || rawScreen === 'null' || rawScreen.startsWith('user_')) {
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
@@ -306,7 +307,7 @@ function sanitizeUser(u) {
   };
 
   if (finalIdStr) globalUserMap.set(finalIdStr, sanitized);
-  if (rawScreen) globalUserMap.set(rawScreen.toLowerCase(), sanitized);
+  if (rawScreen && !rawScreen.startsWith('user_')) globalUserMap.set(rawScreen.toLowerCase(), sanitized);
 
   return sanitized;
 }
@@ -558,34 +559,18 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          const userNameContainer = art.querySelector('[data-testid="User-Name"]');
-          if (userNameContainer) {
-            const userLinks = userNameContainer.querySelectorAll('a[href]');
-            for (const a of userLinks) {
-              const href = a.getAttribute('href') || '';
-              const cleanedHref = href.startsWith('/') ? href.slice(1) : href;
-              if (cleanedHref && !cleanedHref.includes('/status/') && !cleanedHref.includes('/i/')) {
-                screen_name = cleanedHref.split('/')[0].trim();
-                break;
+          // Robust root-level user handle & display name scanning
+          const allLinks = art.querySelectorAll('a[href^="/"]');
+          for (const a of allLinks) {
+            const href = a.getAttribute('href') || '';
+            const parts = href.split('/').filter(Boolean);
+            if (parts.length === 1 && !['home', 'explore', 'notifications', 'messages', 'settings', 'i', 'search', 'hashtag'].includes(parts[0].toLowerCase())) {
+              screen_name = parts[0];
+              const nameEl = a.querySelector('span') || a.previousElementSibling;
+              if (nameEl && nameEl.textContent) {
+                name = nameEl.textContent.trim();
               }
-            }
-            const nameSpan = userNameContainer.querySelector('span');
-            if (nameSpan) {
-              name = nameSpan.textContent.trim();
-            }
-          }
-
-          if (!screen_name) {
-            const links = art.querySelectorAll('a[href]');
-            for (const a of links) {
-              const href = a.getAttribute('href') || '';
-              if (href.startsWith('/') && !href.includes('/status/') && !href.includes('/i/') && !href.includes('/search') && !href.includes('/analytics')) {
-                const candidate = href.split('/')[1].split('?')[0].trim();
-                if (candidate && !['home', 'explore', 'notifications', 'messages', 'settings'].includes(candidate.toLowerCase())) {
-                  screen_name = candidate;
-                  break;
-                }
-              }
+              break;
             }
           }
 
@@ -615,6 +600,7 @@ async function backgroundScrape() {
             if (p.src) {
               media.push({
                 media_url_https: p.src,
+                media_url: p.src,
                 type: 'photo',
                 url: p.src,
                 display_url: 'pic.twitter.com',
