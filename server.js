@@ -512,7 +512,6 @@ async function backgroundScrape() {
           let id_str = "";
           let text = "";
 
-          // Robust Handle & Display Name extraction from User-Name container
           const userNameBlock = art.querySelector('[data-testid="User-Name"]');
           if (userNameBlock) {
             const links = Array.from(userNameBlock.querySelectorAll('a[href]'));
@@ -544,7 +543,7 @@ async function backgroundScrape() {
           if (!screen_name) {
             const allLinks = art.querySelectorAll('a[href^="/"]');
             for (const a of allLinks) {
-              const href = a.getAttribute('href'] || '';
+              const href = a.getAttribute('href') || '';
               const parts = href.split('/').filter(Boolean);
               if (parts.length === 1 && !['home', 'explore', 'notifications', 'messages', 'settings', 'i', 'search', 'hashtag', 'compose'].includes(parts[0].toLowerCase())) {
                 screen_name = parts[0];
@@ -556,7 +555,6 @@ async function backgroundScrape() {
           if (!screen_name) screen_name = "twitter_user";
           if (!name) name = screen_name;
 
-          // Profile Picture extraction
           const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img, img[src*="profile_images"]');
           if (avatarImg && avatarImg.src) {
             profile_image_url_https = avatarImg.src;
