@@ -69,14 +69,11 @@ function extractOAuthParam(authHeader, paramName) {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+// FIX: one stable, collision-resistant id per handle (fits signed 32-bit for old clients)
 function generateUniqueUserId(screenName) {
   if (!screenName || screenName === 'twitter_user') return Math.floor(Math.random() * 800000000) + 100000000;
-  let hash = 0;
-  for (let i = 0; i < screenName.length; i++) {
-    hash = (hash << 5) - hash + screenName.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash) + 800000000;
+  const digest = crypto.createHash('sha1').update(String(screenName).toLowerCase()).digest('hex');
+  return (parseInt(digest.slice(0, 8), 16) % 1000000000) + 1000000000;
 }
 
 function cleanStr(val) {
@@ -196,6 +193,32 @@ function sanitizeMedia(m) {
   };
 }
 
+// NEW: understands X's newer GraphQL user shape (core / avatar / privacy / verification)
+// and unwraps { result: {...} } / { user_results: { result: {...} } } wrappers.
+function normalizeRawUser(u) {
+  let r = u;
+  for (let i = 0; i < 3; i++) {
+    if (r && r.user_results && r.user_results.result) r = r.user_results.result;
+    else if (r && r.result && typeof r.result === 'object' && !r.screen_name) r = r.result;
+    else break;
+  }
+  if (!r || typeof r !== 'object') return u;
+  const core = r.core || {};
+  const legacy = r.legacy || {};
+  return {
+    ...legacy,
+    ...r,
+    id_str: cleanStr(r.id_str || r.rest_id || legacy.id_str) || undefined,
+    screen_name: cleanStr(r.screen_name || core.screen_name || legacy.screen_name) || undefined,
+    name: cleanStr(r.name || core.name || legacy.name) || undefined,
+    created_at: r.created_at || core.created_at || legacy.created_at,
+    profile_image_url_https: r.profile_image_url_https || (r.avatar && r.avatar.image_url) || legacy.profile_image_url_https || r.profile_image_url,
+    location: cleanStr((r.location && r.location.location) ?? r.location ?? legacy.location) || '',
+    verified: !!(r.verified || (r.verification && r.verification.verified) || legacy.verified),
+    protected: !!(r.protected || (r.privacy && r.privacy.protected) || legacy.protected)
+  };
+}
+
 function sanitizeUser(u) {
   const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
   const defaultUser = {
@@ -225,12 +248,21 @@ function sanitizeUser(u) {
   };
 
   if (!u || typeof u !== 'object') return defaultUser;
+
+  u = normalizeRawUser(u);
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || u.legacy?.screen_name || '');
   let rawName = cleanStr(u.name || u.legacy?.name || '');
   let userIdStr = cleanStr(u.id_str || u.rest_id || u.id || u.legacy?.id_str);
 
-  if (userIdStr && globalUserMap.has(userIdStr)) {
+  const hasRealScreen = !!rawScreen && rawScreen !== 'twitter_user' && rawScreen !== 'x_user' && !rawScreen.startsWith('user_');
+
+  // IDs from the old char-code-sum scraper (800000000-800009999) collide between users, so ignore them.
+  if (hasRealScreen && userIdStr && /^80000\d{4}$/.test(userIdStr)) userIdStr = null;
+
+  // Look users up by handle (unique) instead of by ID when we know the handle.
+  const knownByName = hasRealScreen ? globalUserMap.get(rawScreen.toLowerCase()) : null;
+  if (!hasRealScreen && userIdStr && globalUserMap.has(userIdStr)) {
     const cached = globalUserMap.get(userIdStr);
     if (cached.screen_name && cached.screen_name !== 'twitter_user' && !cached.screen_name.startsWith('user_')) {
       return cached;
@@ -242,13 +274,16 @@ function sanitizeUser(u) {
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
   } else if (!rawName || rawName === 'Twitter User') {
-    rawName = rawScreen;
+    rawName = (knownByName && knownByName.name) || rawScreen;
   }
 
   const rawAvatar = u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https;
-  const avatar = forceJpgAvatarUrl(rawAvatar);
+  let avatar = forceJpgAvatarUrl(rawAvatar);
+  if (avatar.includes('default_profile') && knownByName && knownByName.profile_image_url_https && !knownByName.profile_image_url_https.includes('default_profile')) {
+    avatar = knownByName.profile_image_url_https; // a half-loaded scrape shouldn't wipe a good avatar
+  }
   const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || defaultUser.profile_banner_url;
-  const finalIdStr = userIdStr || String(generateUniqueUserId(rawScreen));
+  const finalIdStr = userIdStr || (knownByName && knownByName.id_str) || String(generateUniqueUserId(rawScreen));
 
   const sanitized = {
     ...defaultUser,
@@ -323,6 +358,22 @@ function sanitizeTweet(t) {
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
   let author = t.user ? sanitizeUser(t.user) : null;
+
+  // NEW: if we couldn't identify the author, recover the handle from the tweet's own media link
+  // (https://x.com/<handle>/status/<this tweet's id>/photo/1). Only trusted when the status id matches.
+  const mediaHandle = (() => {
+    for (const m of rawMediaList) {
+      const link = cleanStr(m && (m.expanded_url || m.url)) || '';
+      const hit = link.match(/(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\/(\d+)/i);
+      if (hit && hit[2] === idStr) return hit[1];
+    }
+    return null;
+  })();
+  if (mediaHandle && (!author || author.screen_name === 'twitter_user' || author.screen_name.startsWith('user_')) &&
+      !(author && author.screen_name.toLowerCase() === mediaHandle.toLowerCase())) {
+    const keepAvatar = author && !String(author.profile_image_url_https).includes('default_profile') ? author.profile_image_url_https : undefined;
+    author = sanitizeUser({ screen_name: mediaHandle, profile_image_url_https: keepAvatar });
+  }
 
   let rawSource = cleanStr(t.source) || '<a href="http://twitter.com" rel="nofollow">Twitter for iPhone</a>';
   if (!rawSource.includes('<a')) {
@@ -518,7 +569,7 @@ async function backgroundScrape() {
             for (const l of links) {
               const href = l.getAttribute('href') || '';
               const cleaned = href.replace(/^\//, '').split('/')[0].trim();
-              if (cleaned && !cleaned.includes('i') && !cleaned.includes('status')) {
+              if (cleaned && cleaned !== 'i' && cleaned !== 'status') {
                 screen_name = cleaned;
                 break;
               }
@@ -540,6 +591,13 @@ async function backgroundScrape() {
             }
           }
 
+          // The avatar's data-testid carries the exact handle; trust it over text scraping.
+          const avatarBox = art.querySelector('[data-testid="Tweet-User-Avatar"] [data-testid^="UserAvatar-Container-"]');
+          if (avatarBox) {
+            const h = (avatarBox.getAttribute('data-testid') || '').replace('UserAvatar-Container-', '').trim();
+            if (h) screen_name = h;
+          }
+
           if (!screen_name) {
             const allLinks = art.querySelectorAll('a[href^="/"]');
             for (const a of allLinks) {
@@ -555,9 +613,14 @@ async function backgroundScrape() {
           if (!screen_name) screen_name = "twitter_user";
           if (!name) name = screen_name;
 
-          const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img, img[src*="profile_images"]');
-          if (avatarImg && avatarImg.src) {
-            profile_image_url_https = avatarImg.src;
+          const avatarImg = art.querySelector('[data-testid="Tweet-User-Avatar"] img[src*="profile_images"]') || art.querySelector('img[src*="profile_images"]');
+          if (avatarImg && (avatarImg.currentSrc || avatarImg.src)) {
+            profile_image_url_https = avatarImg.currentSrc || avatarImg.src;
+          }
+          if (!profile_image_url_https) {
+            const bgEl = art.querySelector('[data-testid="Tweet-User-Avatar"] [style*="background-image"]');
+            const bgMatch = bgEl && (bgEl.getAttribute('style') || '').match(/url\(["']?([^"')]+)["']?\)/);
+            if (bgMatch) profile_image_url_https = bgMatch[1];
           }
 
           const textDiv = art.querySelector('[data-testid="tweetText"]');
@@ -649,6 +712,23 @@ app.get('/clear-cache', async (req, res) => {
   cachedAccountProfile = null;
   globalUserMap.clear();
   return res.send('KV Cache and User Map cleared successfully!');
+});
+
+// TEMPORARY DEBUG: shows the raw `user` objects the Worker returns (before sanitizing). Delete when done.
+app.get('/debug/raw-users', async (req, res) => {
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  try {
+    const r = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
+    const data = await r.json();
+    return res.status(200).json((Array.isArray(data) ? data : []).slice(0, 3).map(t => ({
+      id_str: t.id_str,
+      user_id_str: t.user_id_str,
+      user: t.user
+    })));
+  } catch (e) {
+    return res.status(200).json({ error: String(e) });
+  }
 });
 
 app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
