@@ -17,6 +17,19 @@ app.use(express.json());
 
 const globalUserMap = new Map();
 
+// Display names learned from user_mentions (handle -> name). Mentions carry real display names.
+const nameDirectory = new Map();
+function indexMentionNames(t) {
+  if (!t || typeof t !== 'object') return;
+  const list = t.entities && Array.isArray(t.entities.user_mentions) ? t.entities.user_mentions : [];
+  for (const m of list) {
+    const h = cleanStr(m && m.screen_name), n = cleanStr(m && m.name);
+    if (h && n && n.toLowerCase() !== h.toLowerCase()) nameDirectory.set(h.toLowerCase(), n);
+  }
+  if (t.retweeted_status) indexMentionNames(t.retweeted_status);
+  if (t.quoted_status) indexMentionNames(t.quoted_status);
+}
+
 let manualAuthToken = process.env.X_AUTH_TOKEN || '';
 let manualCt0 = process.env.X_CT0 || '';
 
@@ -273,8 +286,9 @@ function sanitizeUser(u) {
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
-  } else if (!rawName || rawName === 'Twitter User') {
-    rawName = (knownByName && knownByName.name) || rawScreen;
+  } else if (!rawName || rawName === 'Twitter User' || rawName.toLowerCase() === rawScreen.toLowerCase()) {
+    const cachedName = knownByName && knownByName.name && knownByName.name.toLowerCase() !== rawScreen.toLowerCase() ? knownByName.name : null;
+    rawName = cachedName || nameDirectory.get(rawScreen.toLowerCase()) || rawScreen;
   }
 
   const rawAvatar = u.profile_image_url_https || u.profile_image_url || u.legacy?.profile_image_url_https;
@@ -316,6 +330,7 @@ function sanitizeUser(u) {
 
 function sanitizeTweet(t) {
   if (!t || typeof t !== 'object') return t;
+  indexMentionNames(t);
   
   const idStr = cleanStr(t.id_str) || String(t.id || Date.now());
   let safeId = 123456789;
@@ -465,6 +480,7 @@ async function getCachedTimelineFromWorker() {
     const response = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
     if (response.ok) {
       const data = await response.json();
+      if (Array.isArray(data)) data.forEach(indexMentionNames);
       return Array.isArray(data) ? data.map(t => sanitizeTweet(t)) : [];
     }
   } catch (e) {}
