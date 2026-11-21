@@ -17,6 +17,9 @@ app.use(express.json());
 
 const globalUserMap = new Map();
 
+// Legacy clients can't play HLS and choke on 1080p/4K, so videos are capped (override with env MAX_VIDEO_BITRATE).
+const MAX_VIDEO_BITRATE = Number(process.env.MAX_VIDEO_BITRATE) || 2176000;
+
 // Display names learned from user_mentions (handle -> name). Mentions carry real display names.
 const nameDirectory = new Map();
 function indexMentionNames(t) {
@@ -123,9 +126,10 @@ function forceJpgUrl(url) {
   if (!url) return '';
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/media/')) {
+    const fmt = (fixed.match(/[?&]format=(jpg|jpeg|png)/i) || [])[1];
     fixed = fixed.split('?')[0];
     if (!fixed.match(/\.(jpg|jpeg|png)$/i)) {
-      fixed += '.jpg';
+      fixed += '.' + (fmt ? fmt.toLowerCase() : 'jpg');
     }
     return fixed;
   }
@@ -184,11 +188,24 @@ function sanitizeMedia(m) {
         url: cleanStr(v.url) ? cleanStr(v.url).replace(/^http:\/\//i, 'https://') : ''
       })).filter(v => v.url)
     };
+    // Keep MP4s only (no HLS), at or under MAX_VIDEO_BITRATE, best first.
+    const mp4s = videoInfo.variants.filter(v => /mp4/i.test(v.content_type));
+    if (mp4s.length) {
+      const capped = mp4s.filter(v => v.bitrate <= MAX_VIDEO_BITRATE);
+      const pick = capped.length ? capped : [mp4s.slice().sort((a, b) => a.bitrate - b.bitrate)[0]];
+      videoInfo.variants = pick.sort((a, b) => b.bitrate - a.bitrate);
+    }
   }
 
+  // Every media item needs its own id (the old fallback gave all photos in a tweet the same Date.now()).
+  let mediaIdStr = cleanStr(m.id_str || mediaRes.rest_id);
+  if (!mediaIdStr) mediaIdStr = String(parseInt(crypto.createHash('sha1').update(String(rawUrl)).digest('hex').slice(0, 10), 16));
+  let mediaIdNum = Number(mediaIdStr) || Date.now();
+  if (mediaIdNum > Number.MAX_SAFE_INTEGER) mediaIdNum = parseInt(mediaIdStr.slice(-9)) || Date.now();
+
   return {
-    id: Number(m.id || mediaRes.rest_id || Date.now()),
-    id_str: cleanStr(m.id_str || mediaRes.rest_id || String(m.id || Date.now())),
+    id: mediaIdNum,
+    id_str: mediaIdStr,
     media_url: httpUrl,
     media_url_https: httpsUrl,
     url: cleanStr(m.url) || httpsUrl,
@@ -260,8 +277,12 @@ function sanitizeUser(u) {
     entities: { description: { urls: [] }, url: { urls: [] } }
   };
 
-  if (!u || typeof u !== 'object') return defaultUser;
+  if (!u || typeof u !== 'object') {
+    console.log('[XitterBridge sanitizeUser] got non-object user input:', JSON.stringify(u));
+    return defaultUser;
+  }
 
+  const beforeNormalize = u;
   u = normalizeRawUser(u);
   
   let rawScreen = cleanStr(u.screen_name || u.screenName || u.legacy?.screen_name || '');
@@ -283,10 +304,11 @@ function sanitizeUser(u) {
   }
 
   if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen.startsWith('user_')) {
+    console.log('[XitterBridge sanitizeUser] no usable screen_name, falling back. Raw input keys:', Object.keys(beforeNormalize || {}).join(','), '| after normalize:', JSON.stringify({ screen_name: u.screen_name, id_str: u.id_str, name: u.name }));
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
-  } else if (!rawName || rawName === 'Twitter User' || rawName.toLowerCase() === rawScreen.toLowerCase()) {
+  } else if (!rawName || rawName === 'Twitter User' || rawName === rawScreen) {
     const cachedName = knownByName && knownByName.name && knownByName.name.toLowerCase() !== rawScreen.toLowerCase() ? knownByName.name : null;
     rawName = cachedName || nameDirectory.get(rawScreen.toLowerCase()) || rawScreen;
   }
@@ -328,6 +350,30 @@ function sanitizeUser(u) {
   return sanitized;
 }
 
+// The text has its trailing t.co/pic links stripped, so entity indices from X no longer line up.
+// Re-find each entity in the cleaned text (bad indices make some clients drop the media or crash).
+function fixEntityIndices(text, entities, mediaList) {
+  const lower = text.toLowerCase();
+  const len = text.length;
+  const realign = (list, needleOf) => {
+    let cursor = 0;
+    return list.slice().sort((a, b) => ((a.indices && a.indices[0]) || 0) - ((b.indices && b.indices[0]) || 0)).map(e => {
+      const needle = needleOf(e);
+      const i = needle ? lower.indexOf(String(needle).toLowerCase(), cursor) : -1;
+      if (i < 0) return null;
+      cursor = i + String(needle).length;
+      return { ...e, indices: [i, cursor] };
+    }).filter(Boolean);
+  };
+  entities.hashtags = realign(entities.hashtags, h => h.text ? '#' + h.text : null);
+  entities.user_mentions = realign(entities.user_mentions, m => m.screen_name ? '@' + m.screen_name : null);
+  entities.urls = realign(entities.urls, u => u.url);
+  (mediaList || []).forEach(m => {
+    const i = m.url ? lower.indexOf(String(m.url).toLowerCase()) : -1;
+    m.indices = i >= 0 ? [i, i + String(m.url).length] : [len, len];
+  });
+}
+
 function sanitizeTweet(t) {
   if (!t || typeof t !== 'object') return t;
   indexMentionNames(t);
@@ -349,6 +395,14 @@ function sanitizeTweet(t) {
   }
 
   const sanitizedMedia = rawMediaList.map(m => sanitizeMedia(m)).filter(Boolean);
+  if (rawMediaList.length > 0 && sanitizedMedia.length === 0) {
+    console.log('[XitterBridge sanitizeTweet] tweet', idStr, 'had', rawMediaList.length, 'raw media item(s) but 0 survived sanitizing. First raw item:', JSON.stringify(rawMediaList[0]).slice(0, 500));
+  }
+  sanitizedMedia.forEach(m => {
+    if (m.type === 'video' && (!m.video_info || !Array.isArray(m.video_info.variants) || m.video_info.variants.length === 0)) {
+      console.log('[XitterBridge sanitizeTweet] tweet', idStr, 'media', m.id_str, 'is type video but has no playable variants.');
+    }
+  });
 
   let entities = t.entities && typeof t.entities === 'object' ? JSON.parse(JSON.stringify(t.entities)) : {};
   entities.hashtags = Array.isArray(entities.hashtags) ? entities.hashtags : [];
@@ -370,6 +424,7 @@ function sanitizeTweet(t) {
   const langVal = cleanStr(t.lang) || 'en';
   const rawText = cleanStr(t.text) || cleanStr(t.full_text) || '';
   const cleanedText = sanitizeTweetText(rawText);
+  fixEntityIndices(cleanedText, entities, sanitizedMedia);
   const replyIdStr = cleanStr(t.in_reply_to_status_id_str || t.in_reply_to_status_id);
 
   let author = t.user ? sanitizeUser(t.user) : null;
@@ -481,10 +536,35 @@ async function getCachedTimelineFromWorker() {
     if (response.ok) {
       const data = await response.json();
       if (Array.isArray(data)) data.forEach(indexMentionNames);
+      if (Array.isArray(data)) data.forEach(t => { try { if (t && t.user) sanitizeUser(t.user); } catch (e) {} });
       return Array.isArray(data) ? data.map(t => sanitizeTweet(t)) : [];
     }
   } catch (e) {}
   return [];
+}
+
+// The Worker's copy of a tweet has the real date/counts/video; the DOM scraper's copy has the real name/avatar.
+// Merge them instead of letting one overwrite the other.
+function mergeTweet(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const mediaOf = t => (t.extended_entities && t.extended_entities.media) || [];
+  const richness = t => (t.retweet_count || 0) + (t.favorite_count || 0) + (mediaOf(t).some(m => m.video_info) ? 1e6 : 0) + mediaOf(t).length;
+  const userScore = u => !u ? 0 :
+    (u.screen_name && !u.screen_name.startsWith('user_') ? 2 : 0) +
+    (u.profile_image_url_https && !u.profile_image_url_https.includes('default_profile') ? 2 : 0) +
+    (u.name && u.name !== u.screen_name ? 1 : 0);
+  const base = richness(a) >= richness(b) ? a : b;
+  const other = base === a ? b : a;
+  const out = { ...base };
+  if (userScore(other.user) > userScore(base.user)) {
+    out.user = other.user;
+    out.user_id = other.user_id;
+    out.user_id_str = other.user_id_str;
+  }
+  const ta = Date.parse(a.created_at), tb = Date.parse(b.created_at);
+  if (!isNaN(ta) && !isNaN(tb)) out.created_at = ta <= tb ? a.created_at : b.created_at; // scraper stamps "now"
+  return out;
 }
 
 async function appendCachedTimelineToWorker(newTweets) {
@@ -496,7 +576,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     const existing = await getCachedTimelineFromWorker();
     const map = new Map();
     existing.forEach(t => map.set(t.id_str || t.id, t));
-    newTweets.forEach(t => map.set(t.id_str || t.id, t));
+    newTweets.forEach(t => { const k = t.id_str || t.id; map.set(k, mergeTweet(map.get(k), t)); });
     const merged = Array.from(map.values()).sort((a, b) => {
       try {
         return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
@@ -667,6 +747,14 @@ async function backgroundScrape() {
             }
           });
 
+          const posters = art.querySelectorAll('[data-testid="videoPlayer"] video[poster], [data-testid="videoComponent"] video[poster]');
+          posters.forEach(v => {
+            const src = v.getAttribute('poster');
+            if (src && !media.some(x => x.media_url_https === src)) {
+              media.push({ media_url_https: src, media_url: src, type: 'photo', url: src, display_url: 'pic.twitter.com', expanded_url: src });
+            }
+          });
+
           items.push({
             id_str,
             text,
@@ -737,10 +825,15 @@ app.get('/debug/raw-users', async (req, res) => {
   try {
     const r = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
     const data = await r.json();
-    return res.status(200).json((Array.isArray(data) ? data : []).slice(0, 3).map(t => ({
+    const raw = Array.isArray(data) ? data : [];
+    // Prefer tweets that actually carry media, since that's what's broken; fall back to the first few otherwise.
+    const withMedia = raw.filter(t => (t.extended_entities?.media?.length || t.entities?.media?.length));
+    const pick = (withMedia.length ? withMedia : raw).slice(0, 3);
+    return res.status(200).json(pick.map(t => ({
       id_str: t.id_str,
-      user_id_str: t.user_id_str,
-      user: t.user
+      raw_user: t.user,
+      raw_media: t.extended_entities?.media || t.entities?.media || null,
+      sanitized: sanitizeTweet(JSON.parse(JSON.stringify(t)))
     })));
   } catch (e) {
     return res.status(200).json({ error: String(e) });
