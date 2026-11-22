@@ -840,6 +840,22 @@ app.get('/debug/raw-users', async (req, res) => {
   }
 });
 
+app.get('/debug/profile', async (req, res) => {
+  const screenName = req.query.screen_name;
+  if (!screenName) return res.status(200).json({ error: 'pass ?screen_name=someuser' });
+  const steps = {};
+  steps.globalUserMap_hit = globalUserMap.has(screenName.toLowerCase());
+  const cachedTweets = await getCachedTimelineFromWorker();
+  steps.cachedTweets_scanned = cachedTweets.length;
+  const matchedTweet = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === screenName.toLowerCase());
+  steps.cachedTweet_match_found = !!matchedTweet;
+  steps.cachedTweet_match_raw_user = matchedTweet ? matchedTweet.user : null;
+  steps.would_fall_back_to_synthetic = !steps.globalUserMap_hit && !matchedTweet;
+  const userTimeline = cachedTweets.filter(t => t.user?.screen_name?.toLowerCase() === screenName.toLowerCase());
+  steps.user_timeline_tweet_count = userTimeline.length;
+  return res.status(200).json(steps);
+});
+
 app.all(['/oauth/authorize', '/oauth/authenticate'], (req, res) => {
   const oauthToken = req.query.oauth_token || '';
   return res.redirect(`https://xitterbridge-webauth.danielsdoodles.workers.dev/?oauth_token=${oauthToken}`);
@@ -925,6 +941,7 @@ app.get('/1.1/account/totals.json', (req, res) => {
 });
 
 app.get('/1.1/users/profile_banner.json', (req, res) => {
+  console.log('[XitterBridge profile_banner] requested for', req.query.screen_name || req.query.user_id || '(none)', '- currently always returns the same placeholder banner regardless of who was asked for.');
   const bannerUrl = "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
   return res.status(200).json({
     sizes: {
@@ -953,14 +970,17 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const currentAcc = cachedAccountProfile || await getCachedAccountFromWorker() || sanitizeUser(null);
 
   if ((!screenName && !userId) || (screenName && currentAcc && screenName.toLowerCase() === currentAcc.screen_name.toLowerCase())) {
+    console.log('[XitterBridge users/show] returning own account for', screenName || userId || '(none given)');
     return res.status(200).json(currentAcc);
   }
 
   if (screenName && globalUserMap.has(screenName.toLowerCase())) {
+    console.log('[XitterBridge users/show] hit globalUserMap by screen_name:', screenName);
     return res.status(200).json(globalUserMap.get(screenName.toLowerCase()));
   }
 
   if (userId && globalUserMap.has(userId.toString())) {
+    console.log('[XitterBridge users/show] hit globalUserMap by user_id:', userId);
     return res.status(200).json(globalUserMap.get(userId.toString()));
   }
 
@@ -971,10 +991,12 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   );
 
   if (matchedTweet && matchedTweet.user) {
+    console.log('[XitterBridge users/show] found via cached tweet match for', screenName || userId);
     return res.status(200).json(sanitizeUser(matchedTweet.user));
   }
 
   if (screenName) {
+    console.log('[XitterBridge users/show] NO MATCH for', screenName, '- returning synthetic placeholder profile. Scanned', cachedTweets.length, 'cached tweets, globalUserMap had', globalUserMap.size, 'entries.');
     const uid = generateUniqueUserId(screenName);
     return res.status(200).json(sanitizeUser({
       id: uid,
@@ -987,6 +1009,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     }));
   }
 
+  console.log('[XitterBridge users/show] fell all the way through with user_id', userId, '- returning own account as last resort.');
   return res.status(200).json(currentAcc);
 });
 
