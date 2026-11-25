@@ -26,8 +26,10 @@ const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
 const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 6000; // old apps give up after ~10-15s
 const STORE = { forStorage: true };
-// Profile picture size sent to the app. 400x400 is what worked; other options: normal, bigger, 200x200, original.
-const AVATAR_SIZE = (process.env.AVATAR_SIZE || '400x400').toLowerCase();
+// Profile picture size sent to the app. The app expects "_normal" and swaps in the size it needs itself
+// (small for tweets, larger for profile headers); a fixed 400x400 shows up cropped. Other options:
+// 400x400, bigger, 200x200, original.
+const AVATAR_SIZE = (process.env.AVATAR_SIZE || 'normal').toLowerCase();
 // IMAGE_PROXY=on: pictures are fetched by this server and passed to the phone, so the phone never has to
 // connect to X's image server itself (fixes phones that can't reach pbs.twimg.com).
 const IMAGE_PROXY = /^(on|true|1|yes)$/i.test(process.env.IMAGE_PROXY || '');
