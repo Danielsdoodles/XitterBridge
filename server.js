@@ -668,7 +668,7 @@ function tweetFromGraphQL(r, depth = 0) {
 }
 
 function newSink() {
-  return { tweets: [], users: new Map(), userItems: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
+  return { tweets: [], users: new Map(), userItems: [], trends: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
 }
 
 // Render's small instance can only run ONE headless browser. Every job waits for its turn; nothing forces
@@ -708,6 +708,19 @@ function collectFromGraphQL(json, sink) {
         if (!prev || (u.followers_count !== undefined && prev.followers_count === undefined) || (u.description && !prev.description)) sink.users.set(key, u);
         if (rawGraphUsers.size > 300) rawGraphUsers.delete(rawGraphUsers.keys().next().value);
         rawGraphUsers.set(key, node);
+      }
+    }
+    // Trends (Explore page): { name, trend_metadata: { meta_description: "12.3K posts" }, trend_url: { url } }
+    if ((node.itemType === 'TimelineTrend' || node.__typename === 'TimelineTrend') && typeof node.name === 'string' && node.name) {
+      if (!sink.trends.some(x => x.name === node.name)) {
+        let query = node.name;
+        const turl = node.trend_url && node.trend_url.url;
+        if (typeof turl === 'string') {
+          const m = turl.match(/[?&]query=([^&]+)/);
+          if (m) { try { query = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch (e) {} }
+        }
+        const meta = node.trend_metadata || {};
+        sink.trends.push({ name: node.name, query, volumeText: meta.meta_description || '', context: meta.domain_context || '' });
       }
     }
     // People results (search "People" tab): keep them in the order X lists them.
@@ -1954,28 +1967,98 @@ app.get('/1.1/statuses/retweets/:id.json', (req, res) => res.status(200).json([]
 app.get('/1.1/statuses/retweeters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" }));
 
+// ---------- Trends ----------
+// Real trends from X's Explore page (the ones X shows your account), refreshed every 15 minutes.
+const trendsCache = { trends: null, fetchedAt: 0 };
+let trendsInFlight = null;
+
+function parseVolume(text) {
+  const m = String(text || '').replace(/,/g, '').match(/([\d.]+)\s*([KkMm])?/);
+  if (!m) return null;
+  let n = parseFloat(m[1]);
+  if (/k/i.test(m[2] || '')) n *= 1000;
+  if (/m/i.test(m[2] || '')) n *= 1000000;
+  return Math.round(n);
+}
+
+function scrapeTrends() {
+  if (trendsInFlight) return trendsInFlight;
+  trendsInFlight = (async () => {
+    const tokens = await getTokens();
+    if (!tokens.auth_token || !tokens.ct0) return null;
+    if (!(await acquireBrowser(60000))) return null;
+    let browser;
+    const sink = newSink();
+    const watchdog = startWatchdog(() => browser, 'Trends fetch');
+    try {
+      const opened = await openXPage(tokens);
+      browser = opened.browser;
+      const page = opened.page;
+      attachGraphQLCapture(page, sink);
+      await page.goto('https://x.com/explore/tabs/trending', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      // Wait until a trend has been captured (or give up after ~25s).
+      for (let i = 0; i < 50 && sink.trends.length === 0; i++) await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 1500));
+      await Promise.allSettled(sink.pending);
+    } catch (e) {
+      scrapeStats.lastError = `trends: ${e && e.message ? e.message : e}`;
+    } finally {
+      clearTimeout(watchdog);
+      if (browser) await browser.close().catch(() => {});
+      isScraping = false;
+    }
+    scrapeStats.lastTrends = { at: new Date().toISOString(), graphqlResponses: sink.responses, trends: sink.trends.length };
+    console.log(`[XitterBridge Trends] ${sink.responses} API responses, ${sink.trends.length} trends.`);
+    if (sink.trends.length) {
+      trendsCache.trends = sink.trends;
+      trendsCache.fetchedAt = Date.now();
+    }
+    return sink.trends.length ? trendsCache : null;
+  })().finally(() => { trendsInFlight = null; });
+  return trendsInFlight;
+}
+
+function toApiTrend(t) {
+  return {
+    name: t.name,
+    url: `http://twitter.com/search?q=${encodeURIComponent(t.query)}`,
+    promoted_content: null,
+    query: encodeURIComponent(t.query),
+    tweet_volume: parseVolume(t.volumeText)
+  };
+}
+
+const FALLBACK_TRENDS = [
+  { name: '#WindowsPhone', query: '#WindowsPhone', volumeText: '' },
+  { name: 'Nokia Lumia', query: 'Nokia Lumia', volumeText: '' },
+  { name: 'Windows 10 Mobile', query: 'Windows 10 Mobile', volumeText: '' }
+];
+
 app.get(['/1.1/trends/closest.json', '/1/trends/closest.json'], (req, res) => {
-  return res.status(200).json([{ woeid: 1, name: "Worldwide", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, url: "http://where.yahooapis.com/v1/place/1", centroid: [0, 0] }]);
+  return res.status(200).json([{ country: '', countryCode: null, name: 'Worldwide', parentid: 0, placeType: { code: 19, name: 'Supername' }, url: 'http://where.yahooapis.com/v1/place/1', woeid: 1 }]);
 });
 
-app.get('/1.1/trends/place.json', (req, res) => {
+app.get(['/1.1/trends/place.json', '/1/trends/place.json'], async (req, res) => {
+  const fresh = trendsCache.trends && Date.now() - trendsCache.fetchedAt < 15 * 60 * 1000;
+  if (!fresh) {
+    const job = scrapeTrends();
+    // First time: wait a little; after that, answer with the last trends and refresh in the background.
+    if (!trendsCache.trends) await Promise.race([job, new Promise(r => setTimeout(r, SEARCH_WAIT_MS))]);
+  }
+  const list = trendsCache.trends || FALLBACK_TRENDS;
+  const asOf = new Date((trendsCache.fetchedAt || Date.now())).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  console.log(`[XitterBridge trends/place] ${trendsCache.trends ? list.length + ' real trends' : 'X still loading, placeholder trends (reopen search shortly)'}`);
   return res.status(200).json([{
-    trends: [
-      { name: "#WindowsPhone", query: "%23WindowsPhone", tweet_volume: 15400 },
-      { name: "Nokia Lumia", query: "Nokia+Lumia", tweet_volume: 8200 },
-      { name: "Windows 10 Mobile", query: "Windows+10+Mobile", tweet_volume: 5100 },
-      { name: "XitterBridge", query: "XitterBridge", tweet_volume: 12500 }
-    ],
-    as_of: formatTwitterDate(),
-    created_at: formatTwitterDate(),
-    locations: [{ woeid: 1, name: "Worldwide" }]
+    trends: list.slice(0, 30).map(toApiTrend),
+    as_of: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+    created_at: asOf,
+    locations: [{ name: 'Worldwide', woeid: Number(req.query.id) || 1 }]
   }]);
 });
 
-app.get('/1.1/trends/available.json', (req, res) => {
+app.get(['/1.1/trends/available.json', '/1/trends/available.json'], (req, res) => {
   return res.status(200).json([
-    { name: "Worldwide", country: "", country_code: "", parentid: 0, placeType: { code: 19, name: "Global" }, woeid: 1 },
-    { name: "United States", country: "United States", country_code: "US", parentid: 1, placeType: { code: 12, name: "Country" }, woeid: 23424977 }
+    { country: '', countryCode: null, name: 'Worldwide', parentid: 0, placeType: { code: 19, name: 'Supername' }, url: 'http://where.yahooapis.com/v1/place/1', woeid: 1 }
   ]);
 });
 
