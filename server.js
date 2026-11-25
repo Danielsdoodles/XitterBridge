@@ -20,6 +20,20 @@ const globalUserMap = new Map();
 // Legacy clients can't play HLS and choke on 1080p/4K, so videos are capped (override with env MAX_VIDEO_BITRATE).
 const MAX_VIDEO_BITRATE = Number(process.env.MAX_VIDEO_BITRATE) || 2176000;
 
+// VIDEO_MODE=photo (default): videos/GIFs are sent as their thumbnail picture, so clients that can't play
+// native video still show something. Set VIDEO_MODE=video on Render to send real playable video instead.
+const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
+// How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
+const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 20000;
+const STORE = { forStorage: true };
+
+// Real users captured from X's own API responses (handle -> sanitized user). Never cleared on refresh.
+const knownUsers = new Map();
+// Profile fetches: handle -> { user, tweets, fetchedAt, ttl }
+const profileCache = new Map();
+const profileInFlight = new Map();
+const scrapeStats = { lastHome: null, lastProfile: null, lastError: null };
+
 // Display names learned from user_mentions (handle -> name). Mentions carry real display names.
 const nameDirectory = new Map();
 function indexMentionNames(t) {
@@ -156,7 +170,7 @@ function sanitizeTweetText(text) {
     .trim();
 }
 
-function sanitizeMedia(m) {
+function sanitizeMedia(m, opts = {}) {
   if (!m || typeof m !== 'object') return null;
   
   const mediaRes = m.media_results?.result || m.media_results || {};
@@ -203,6 +217,14 @@ function sanitizeMedia(m) {
   let mediaIdNum = Number(mediaIdStr) || Date.now();
   if (mediaIdNum > Number.MAX_SAFE_INTEGER) mediaIdNum = parseInt(mediaIdStr.slice(-9)) || Date.now();
 
+  // Storage keeps the real video; only what's sent to the client is converted (so nothing is lost in KV).
+  let outType = cleanStr(m.type || mediaLegacy.type || mediaRes.__typename?.toLowerCase() || 'photo');
+  let outVideo = videoInfo;
+  if (!opts.forStorage && VIDEO_MODE === 'photo' && (outType === 'video' || outType === 'animated_gif')) {
+    outType = 'photo';
+    outVideo = undefined;
+  }
+
   return {
     id: mediaIdNum,
     id_str: mediaIdStr,
@@ -211,15 +233,15 @@ function sanitizeMedia(m) {
     url: cleanStr(m.url) || httpsUrl,
     display_url: cleanStr(m.display_url) || 'pic.twitter.com',
     expanded_url: cleanStr(m.expanded_url) || httpsUrl,
-    type: cleanStr(m.type || mediaLegacy.type || mediaRes.__typename?.toLowerCase() || 'photo'),
+    type: outType,
     indices: Array.isArray(m.indices) ? m.indices : [0, 0],
-    sizes: {
+    sizes: (m.sizes && m.sizes.large && m.sizes.large.w) ? m.sizes : {
       thumb: { w: 150, h: 150, resize: 'crop' },
       small: { w: 680, h: 680, resize: 'fit' },
       medium: { w: 1200, h: 1200, resize: 'fit' },
       large: { w: 2048, h: 2048, resize: 'fit' }
     },
-    video_info: videoInfo
+    video_info: outVideo
   };
 }
 
@@ -277,10 +299,7 @@ function sanitizeUser(u) {
     entities: { description: { urls: [] }, url: { urls: [] } }
   };
 
-  if (!u || typeof u !== 'object') {
-    console.log('[XitterBridge sanitizeUser] got non-object user input:', JSON.stringify(u));
-    return defaultUser;
-  }
+  if (!u || typeof u !== 'object') return defaultUser;
 
   const beforeNormalize = u;
   u = normalizeRawUser(u);
@@ -295,7 +314,8 @@ function sanitizeUser(u) {
   if (hasRealScreen && userIdStr && /^80000\d{4}$/.test(userIdStr)) userIdStr = null;
 
   // Look users up by handle (unique) instead of by ID when we know the handle.
-  const knownByName = hasRealScreen ? globalUserMap.get(rawScreen.toLowerCase()) : null;
+  const knownReal = hasRealScreen ? knownUsers.get(rawScreen.toLowerCase()) : null;
+  const knownByName = hasRealScreen ? (knownReal || globalUserMap.get(rawScreen.toLowerCase())) : null;
   if (!hasRealScreen && userIdStr && globalUserMap.has(userIdStr)) {
     const cached = globalUserMap.get(userIdStr);
     if (cached.screen_name && cached.screen_name !== 'twitter_user' && !cached.screen_name.startsWith('user_')) {
@@ -304,7 +324,6 @@ function sanitizeUser(u) {
   }
 
   if (!rawScreen || rawScreen === 'twitter_user' || rawScreen === 'x_user' || rawScreen.startsWith('user_')) {
-    console.log('[XitterBridge sanitizeUser] no usable screen_name, falling back. Raw input keys:', Object.keys(beforeNormalize || {}).join(','), '| after normalize:', JSON.stringify({ screen_name: u.screen_name, id_str: u.id_str, name: u.name }));
     const fallbackId = userIdStr && userIdStr !== "12345678" ? userIdStr : String(Math.floor(Math.random() * 800000000) + 100000000);
     rawScreen = `user_${fallbackId.slice(-6)}`;
     rawName = rawName && rawName !== 'Twitter User' && !rawName.startsWith('user_') ? rawName : `User ${fallbackId.slice(-4)}`;
@@ -318,8 +337,14 @@ function sanitizeUser(u) {
   if (avatar.includes('default_profile') && knownByName && knownByName.profile_image_url_https && !knownByName.profile_image_url_https.includes('default_profile')) {
     avatar = knownByName.profile_image_url_https; // a half-loaded scrape shouldn't wipe a good avatar
   }
-  const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || defaultUser.profile_banner_url;
-  const finalIdStr = userIdStr || (knownByName && knownByName.id_str) || String(generateUniqueUserId(rawScreen));
+  const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || (knownReal && knownReal.profile_banner_url) || defaultUser.profile_banner_url;
+  if (knownReal) {
+    // A thin copy of a user (e.g. from an old cached tweet) inherits the real profile we captured from X.
+    for (const k of ['description', 'location', 'url', 'followers_count', 'friends_count', 'listed_count', 'favourites_count', 'statuses_count', 'created_at', 'verified', 'protected', 'entities']) {
+      if (u[k] === undefined || u[k] === null || u[k] === '') u = { ...u, [k]: knownReal[k] };
+    }
+  }
+  const finalIdStr = (knownReal && knownReal.id_str) || userIdStr || (knownByName && knownByName.id_str) || String(generateUniqueUserId(rawScreen));
 
   const sanitized = {
     ...defaultUser,
@@ -374,7 +399,7 @@ function fixEntityIndices(text, entities, mediaList) {
   });
 }
 
-function sanitizeTweet(t) {
+function sanitizeTweet(t, opts = {}) {
   if (!t || typeof t !== 'object') return t;
   indexMentionNames(t);
   
@@ -394,7 +419,7 @@ function sanitizeTweet(t) {
     rawMediaList = t.entities.media;
   }
 
-  const sanitizedMedia = rawMediaList.map(m => sanitizeMedia(m)).filter(Boolean);
+  const sanitizedMedia = rawMediaList.map(m => sanitizeMedia(m, opts)).filter(Boolean);
   if (rawMediaList.length > 0 && sanitizedMedia.length === 0) {
     console.log('[XitterBridge sanitizeTweet] tweet', idStr, 'had', rawMediaList.length, 'raw media item(s) but 0 survived sanitizing. First raw item:', JSON.stringify(rawMediaList[0]).slice(0, 500));
   }
@@ -470,9 +495,215 @@ function sanitizeTweet(t) {
     favorited: !!t.favorited,
     retweeted: !!t.retweeted,
     lang: langVal,
-    retweeted_status: t.retweeted_status ? sanitizeTweet(t.retweeted_status) : null,
-    quoted_status: t.quoted_status ? sanitizeTweet(t.quoted_status) : null
+    retweeted_status: t.retweeted_status ? sanitizeTweet(t.retweeted_status, opts) : null,
+    quoted_status: t.quoted_status ? sanitizeTweet(t.quoted_status, opts) : null
   };
+}
+
+// ---------- X GraphQL capture ----------
+// The headless browser already loads X, and X's page fetches complete JSON for every tweet and author
+// (real name, avatar, video files). We read those responses instead of guessing from the rendered page.
+function userFromGraphQL(u) {
+  if (!u || typeof u !== 'object' || u.__typename === 'UserUnavailable') return null;
+  const core = u.core || {};
+  const legacy = u.legacy || {};
+  const screen_name = core.screen_name || legacy.screen_name;
+  const id_str = u.rest_id || legacy.id_str;
+  if (!screen_name || !id_str) return null;
+  return {
+    id_str,
+    screen_name,
+    name: core.name || legacy.name || screen_name,
+    created_at: core.created_at || legacy.created_at,
+    profile_image_url_https: (u.avatar && u.avatar.image_url) || legacy.profile_image_url_https,
+    profile_banner_url: legacy.profile_banner_url || '',
+    description: legacy.description || (u.profile_bio && u.profile_bio.description) || '',
+    location: (u.location && u.location.location) || (typeof legacy.location === 'string' ? legacy.location : '') || '',
+    url: legacy.url || null,
+    followers_count: legacy.followers_count,
+    friends_count: legacy.friends_count,
+    listed_count: legacy.listed_count,
+    favourites_count: legacy.favourites_count,
+    statuses_count: legacy.statuses_count,
+    verified: !!(u.is_blue_verified || (u.verification && u.verification.verified) || legacy.verified),
+    protected: !!((u.privacy && u.privacy.protected) || legacy.protected),
+    entities: legacy.entities
+  };
+}
+
+function tweetFromGraphQL(r, depth = 0) {
+  if (!r || typeof r !== 'object' || depth > 3) return null;
+  if (r.__typename === 'TweetWithVisibilityResults' && r.tweet) r = r.tweet;
+  else if (r.tweet && !r.legacy) r = r.tweet;
+  const legacy = r.legacy;
+  if (!legacy) return null;
+  const user = userFromGraphQL(r.core && r.core.user_results && r.core.user_results.result);
+  const note = r.note_tweet && r.note_tweet.note_tweet_results && r.note_tweet.note_tweet_results.result;
+  const text = (note && note.text) || legacy.full_text || '';
+  const rt = legacy.retweeted_status_result && legacy.retweeted_status_result.result;
+  const qt = r.quoted_status_result && r.quoted_status_result.result;
+  return {
+    id_str: r.rest_id || legacy.id_str,
+    created_at: legacy.created_at,
+    text,
+    full_text: text,
+    source: r.source,
+    in_reply_to_status_id_str: legacy.in_reply_to_status_id_str || null,
+    retweet_count: legacy.retweet_count,
+    favorite_count: legacy.favorite_count,
+    favorited: !!legacy.favorited,
+    retweeted: !!legacy.retweeted,
+    lang: legacy.lang,
+    entities: legacy.entities || {},
+    extended_entities: legacy.extended_entities,
+    user,
+    retweeted_status: rt ? tweetFromGraphQL(rt, depth + 1) : null,
+    quoted_status: qt ? tweetFromGraphQL(qt, depth + 1) : null
+  };
+}
+
+function newSink() {
+  return { tweets: [], users: new Map(), seen: new Set(), pending: [], responses: 0, profileUser: null };
+}
+
+// Walks any X GraphQL response, so it keeps working when X moves fields around.
+function collectFromGraphQL(json, sink) {
+  const walk = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 60) return;
+    if (Array.isArray(node)) { for (const x of node) walk(x, depth + 1); return; }
+    if (node.__typename === 'User' && node.rest_id) {
+      const u = userFromGraphQL(node);
+      if (u) sink.users.set(u.screen_name.toLowerCase(), u);
+    }
+    if ((node.itemType === 'TimelineTweet' || node.__typename === 'TimelineTweet') &&
+        node.tweet_results && node.tweet_results.result && !node.promotedMetadata) {
+      const t = tweetFromGraphQL(node.tweet_results.result);
+      if (t && t.user && t.id_str && !sink.seen.has(t.id_str)) {
+        sink.seen.add(t.id_str);
+        sink.tweets.push(t);
+      }
+    }
+    for (const k of Object.keys(node)) walk(node[k], depth + 1);
+  };
+  walk(json, 0);
+}
+
+function attachGraphQLCapture(page, sink) {
+  page.on('response', resp => {
+    const url = resp.url();
+    if (!url.includes('/i/api/graphql/')) return;
+    try { if (resp.request().method() === 'OPTIONS') return; } catch (e) {}
+    sink.pending.push(resp.json().then(json => {
+      sink.responses++;
+      collectFromGraphQL(json, sink);
+      if (url.includes('UserByScreenName')) {
+        const u = userFromGraphQL(json && json.data && json.data.user && json.data.user.result);
+        if (u) sink.profileUser = u;
+      }
+    }).catch(() => {}));
+  });
+}
+
+function registerSinkUsers(sink) {
+  for (const u of sink.users.values()) {
+    const s = sanitizeUser(u);
+    if (s && s.screen_name && !s.screen_name.startsWith('user_')) knownUsers.set(s.screen_name.toLowerCase(), s);
+  }
+}
+
+async function openXPage(tokens) {
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
+    defaultViewport: { width: 1280, height: 800 },
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
+    ignoreHTTPSErrors: true,
+  });
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+  await page.setCookie(
+    { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
+    { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+  );
+  return { browser, page };
+}
+
+function isPlaceholderUser(u) {
+  return !u || !u.screen_name || u.screen_name === 'twitter_user' || u.screen_name === 'x_user' || u.screen_name.startsWith('user_');
+}
+
+function handleForUserId(id) {
+  if (!id) return null;
+  const sid = String(id);
+  for (const u of knownUsers.values()) if (u.id_str === sid) return u.screen_name;
+  const g = globalUserMap.get(sid);
+  return g && !isPlaceholderUser(g) ? g.screen_name : null;
+}
+
+function filterByIdRange(list, query) {
+  let out = list;
+  try { if (query.since_id) { const s = BigInt(query.since_id); out = out.filter(t => { try { return BigInt(t.id_str) > s; } catch (e) { return true; } }); } } catch (e) {}
+  try { if (query.max_id) { const m = BigInt(query.max_id); out = out.filter(t => { try { return BigInt(t.id_str) < m; } catch (e) { return true; } }); } } catch (e) {}
+  return out;
+}
+
+// Opens x.com/<handle> in the shared headless browser and keeps that person's real profile + tweets.
+function scrapeProfile(handle) {
+  const key = String(handle).toLowerCase();
+  if (profileInFlight.has(key)) return profileInFlight.get(key);
+  const job = (async () => {
+    const tokens = await getTokens();
+    if (!tokens.auth_token || !tokens.ct0) return null;
+    // Render's small instances can only run one Chromium, so wait for the timeline scraper to finish.
+    const waitStart = Date.now();
+    while (isScraping && Date.now() - waitStart < 40000) await new Promise(r => setTimeout(r, 500));
+    isScraping = true;
+    lastScrapeTime = Date.now();
+    let browser;
+    const sink = newSink();
+    try {
+      const opened = await openXPage(tokens);
+      browser = opened.browser;
+      const page = opened.page;
+      attachGraphQLCapture(page, sink);
+      await page.goto(`https://x.com/${encodeURIComponent(handle)}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      await page.waitForSelector('article[data-testid="tweet"], [data-testid="emptyState"]', { timeout: 15000 }).catch(() => {});
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+      await new Promise(r => setTimeout(r, 2500));
+      await Promise.allSettled(sink.pending);
+    } catch (e) {
+      scrapeStats.lastError = `profile ${handle}: ${e && e.message ? e.message : e}`;
+    } finally {
+      if (browser) await browser.close().catch(() => {});
+      isScraping = false;
+    }
+    registerSinkUsers(sink);
+    const user = sink.profileUser ? sanitizeUser(sink.profileUser) : (knownUsers.get(key) || null);
+    if (user && !isPlaceholderUser(user)) knownUsers.set(key, user);
+    const tweets = sink.tweets
+      .filter(t => t.user && t.user.screen_name && t.user.screen_name.toLowerCase() === key)
+      .map(t => sanitizeTweet(t, STORE))
+      .sort((a, b) => { try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; } });
+    const ok = !!user || tweets.length > 0;
+    const entry = { user, tweets, fetchedAt: Date.now(), ttl: ok ? 10 * 60 * 1000 : 2 * 60 * 1000 };
+    profileCache.set(key, entry);
+    scrapeStats.lastProfile = { handle, at: new Date().toISOString(), graphqlResponses: sink.responses, gotUser: !!user, tweets: tweets.length };
+    console.log(`[XitterBridge Profile] @${handle}: ${sink.responses} API responses, user ${user ? 'found' : 'NOT found'}, ${tweets.length} tweets.`);
+    return entry;
+  })().finally(() => profileInFlight.delete(key));
+  profileInFlight.set(key, job);
+  return job;
+}
+
+async function getProfile(handle, wait = true) {
+  if (!handle) return null;
+  const key = String(handle).toLowerCase();
+  const cached = profileCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < cached.ttl) return cached;
+  const job = scrapeProfile(handle);
+  if (!wait) return cached || null;
+  const fresh = await Promise.race([job, new Promise(r => setTimeout(() => r(null), PROFILE_WAIT_MS))]);
+  return fresh || cached || null;
 }
 
 function findTweetById(allTweets, idInput) {
@@ -526,7 +757,7 @@ async function getCachedAccountFromWorker() {
   return null;
 }
 
-async function getCachedTimelineFromWorker() {
+async function getRawTimelineFromWorker() {
   const workerUrl = process.env.WORKER_URL;
   const secret = process.env.BRIDGE_SECRET;
   if (!workerUrl || !secret) return [];
@@ -535,12 +766,27 @@ async function getCachedTimelineFromWorker() {
     const response = await fetch(`${workerUrl}/get-timeline`, { headers: { 'X-Bridge-Secret': secret } });
     if (response.ok) {
       const data = await response.json();
-      if (Array.isArray(data)) data.forEach(indexMentionNames);
-      if (Array.isArray(data)) data.forEach(t => { try { if (t && t.user) sanitizeUser(t.user); } catch (e) {} });
-      return Array.isArray(data) ? data.map(t => sanitizeTweet(t)) : [];
+      if (!Array.isArray(data)) return [];
+      data.forEach(indexMentionNames);
+      data.forEach(t => {
+        try {
+          if (!t || !t.user) return;
+          const s = sanitizeUser(t.user);
+          // Remember fully-known users (real handle + real avatar) across refreshes.
+          if (!isPlaceholderUser(s) && !String(s.profile_image_url_https).includes('default_profile') && !knownUsers.has(s.screen_name.toLowerCase())) {
+            knownUsers.set(s.screen_name.toLowerCase(), s);
+          }
+        } catch (e) {}
+      });
+      return data;
     }
   } catch (e) {}
   return [];
+}
+
+async function getCachedTimelineFromWorker() {
+  const raw = await getRawTimelineFromWorker();
+  return raw.map(t => sanitizeTweet(t));
 }
 
 // The Worker's copy of a tweet has the real date/counts/video; the DOM scraper's copy has the real name/avatar.
@@ -573,10 +819,10 @@ async function appendCachedTimelineToWorker(newTweets) {
   if (!workerUrl || !secret || !newTweets.length) return;
 
   try {
-    const existing = await getCachedTimelineFromWorker();
+    const existing = (await getRawTimelineFromWorker()).map(t => sanitizeTweet(t, STORE));
     const map = new Map();
     existing.forEach(t => map.set(t.id_str || t.id, t));
-    newTweets.forEach(t => { const k = t.id_str || t.id; map.set(k, mergeTweet(map.get(k), t)); });
+    newTweets.map(t => sanitizeTweet(t, STORE)).forEach(t => { const k = t.id_str || t.id; map.set(k, mergeTweet(map.get(k), t)); });
     const merged = Array.from(map.values()).sort((a, b) => {
       try {
         return Number(BigInt(b.id_str || b.id) - BigInt(a.id_str || a.id));
@@ -588,7 +834,7 @@ async function appendCachedTimelineToWorker(newTweets) {
     await fetch(`${workerUrl}/update-timeline`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
-      body: JSON.stringify(merged.slice(0, 500).map(t => sanitizeTweet(t)))
+      body: JSON.stringify(merged.slice(0, 500).map(t => sanitizeTweet(t, STORE)))
     });
   } catch (e) {}
 }
@@ -611,21 +857,12 @@ async function backgroundScrape() {
   }
 
   let browser;
+  const sink = newSink();
   try {
-    browser = await puppeteer.launch({
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
-      defaultViewport: { width: 1280, height: 800 },
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-      ignoreHTTPSErrors: true,
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-    await page.setCookie(
-      { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
-      { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
-    );
+    const opened = await openXPage(tokens);
+    browser = opened.browser;
+    const page = opened.page;
+    attachGraphQLCapture(page, sink);
 
     await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
     
@@ -777,13 +1014,43 @@ async function backgroundScrape() {
 
     console.log(`[XitterBridge Scraper] Successfully extracted ${scrapedTweets.length} posts from page DOM.`);
 
-    await browser.close();
+    const ownHandle = await page.evaluate(() => {
+      const a = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
+      return a ? (a.getAttribute('href') || '').replace(/^\//, '').split('/')[0] : null;
+    }).catch(() => null);
 
-    const sanitizedParsed = scrapedTweets.map(t => sanitizeTweet(t));
-    if (sanitizedParsed.length > 0) {
-      await appendCachedTimelineToWorker(sanitizedParsed);
+    await Promise.allSettled(sink.pending);
+    await browser.close();
+    browser = null;
+
+    registerSinkUsers(sink);
+    scrapeStats.lastHome = {
+      at: new Date().toISOString(),
+      landedUrl: currentUrl,
+      graphqlResponses: sink.responses,
+      graphqlTweets: sink.tweets.length,
+      graphqlUsers: sink.users.size,
+      domTweets: scrapedTweets.length,
+      ownHandle
+    };
+    console.log(`[XitterBridge Scraper] X API: ${sink.responses} responses, ${sink.tweets.length} tweets, ${sink.users.size} users. Own handle: ${ownHandle || 'unknown'}`);
+
+    // Tweets from X's API carry real names, avatars and video; DOM tweets only fill gaps (merged per tweet).
+    const combined = [...sink.tweets, ...scrapedTweets];
+    if (combined.length > 0) {
+      await appendCachedTimelineToWorker(combined);
+    }
+
+    // Own profile: if the Worker never supplied it, fetch it from X once we know the handle.
+    if (ownHandle && isPlaceholderUser(cachedAccountProfile)) {
+      setTimeout(() => {
+        scrapeProfile(ownHandle).then(entry => {
+          if (entry && entry.user && isPlaceholderUser(cachedAccountProfile)) cachedAccountProfile = entry.user;
+        }).catch(() => {});
+      }, 1000);
     }
   } catch (err) {
+    scrapeStats.lastError = `home: ${err && err.message ? err.message : err}`;
     console.error(`[XitterBridge Scraper] Error during scraping:`, err);
     if (browser) await browser.close().catch(() => {});
   } finally {
@@ -810,12 +1077,40 @@ app.get('/set-tokens', (req, res) => {
 });
 
 app.get('/clear-cache', async (req, res) => {
-  await appendCachedTimelineToWorker([]);
+  let workerStatus = 'not configured';
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (workerUrl && secret) {
+    try {
+      const r = await fetch(`${workerUrl}/update-timeline`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
+        body: '[]'
+      });
+      workerStatus = `HTTP ${r.status}`;
+    } catch (e) {
+      workerStatus = `failed: ${e.message}`;
+    }
+  }
   localTimeline = [];
   localNotifications = [];
   cachedAccountProfile = null;
   globalUserMap.clear();
-  return res.send('KV Cache and User Map cleared successfully!');
+  knownUsers.clear();
+  profileCache.clear();
+  backgroundScrape();
+  return res.send(`Cache cleared. Worker timeline wipe: ${workerStatus}. A fresh scrape has started; refresh your app in about a minute.`);
+});
+
+// Shows whether the scraper is getting real data from X. Open this after a refresh.
+app.get('/debug/scrape-status', (req, res) => {
+  return res.status(200).json({
+    videoMode: VIDEO_MODE,
+    ownAccount: cachedAccountProfile ? cachedAccountProfile.screen_name : null,
+    knownUsers: knownUsers.size,
+    cachedProfiles: Array.from(profileCache.keys()),
+    ...scrapeStats
+  });
 });
 
 // TEMPORARY DEBUG: shows the raw `user` objects the Worker returns (before sanitizing). Delete when done.
@@ -941,7 +1236,20 @@ app.get('/1.1/account/totals.json', (req, res) => {
 });
 
 app.get('/1.1/users/profile_banner.json', (req, res) => {
-  console.log('[XitterBridge profile_banner] requested for', req.query.screen_name || req.query.user_id || '(none)', '- currently always returns the same placeholder banner regardless of who was asked for.');
+  const handle = req.query.screen_name || handleForUserId(req.query.user_id) || (cachedAccountProfile && cachedAccountProfile.screen_name);
+  const known = handle ? (knownUsers.get(handle.toLowerCase()) || (profileCache.get(handle.toLowerCase()) || {}).user) : null;
+  const realBanner = known && known.profile_banner_url ? known.profile_banner_url.split('?')[0] : '';
+  if (realBanner) {
+    return res.status(200).json({
+      sizes: {
+        web: { w: 520, h: 260, url: `${realBanner}/web` },
+        web_retina: { w: 1040, h: 520, url: `${realBanner}/web_retina` },
+        mobile: { w: 320, h: 160, url: `${realBanner}/mobile` },
+        mobile_retina: { w: 640, h: 320, url: `${realBanner}/mobile_retina` },
+        '1500x500': { w: 1500, h: 500, url: `${realBanner}/1500x500` }
+      }
+    });
+  }
   const bannerUrl = "https://pbs.twimg.com/profile_banners/12345678/1600000000/web";
   return res.status(200).json({
     sizes: {
@@ -972,6 +1280,20 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   if ((!screenName && !userId) || (screenName && currentAcc && screenName.toLowerCase() === currentAcc.screen_name.toLowerCase())) {
     console.log('[XitterBridge users/show] returning own account for', screenName || userId || '(none given)');
     return res.status(200).json(currentAcc);
+  }
+
+  const lookupHandle = screenName || handleForUserId(userId);
+  if (lookupHandle) {
+    const prof = await getProfile(lookupHandle);
+    if (prof && prof.user && !isPlaceholderUser(prof.user)) {
+      console.log('[XitterBridge users/show] real profile from X for', lookupHandle);
+      return res.status(200).json(prof.user);
+    }
+    const known = knownUsers.get(lookupHandle.toLowerCase());
+    if (known) {
+      console.log('[XitterBridge users/show] known user (profile fetch pending/failed) for', lookupHandle);
+      return res.status(200).json(known);
+    }
   }
 
   if (screenName && globalUserMap.has(screenName.toLowerCase())) {
@@ -1021,6 +1343,12 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
     const requestedNames = String(screenNameQuery).split(',').map(s => s.trim().toLowerCase());
     const matchedUsers = [];
     for (const name of requestedNames) {
+      const viaId = /^\d+$/.test(name) ? handleForUserId(name) : null;
+      const known = knownUsers.get((viaId || name).toLowerCase()) || (profileCache.get((viaId || name).toLowerCase()) || {}).user;
+      if (known && !isPlaceholderUser(known)) {
+        matchedUsers.push(known);
+        continue;
+      }
       if (globalUserMap.has(name)) {
         matchedUsers.push(globalUserMap.get(name));
         continue;
@@ -1085,18 +1413,28 @@ app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
 
 app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
   const screenName = req.query.screen_name || req.query.screenName;
-  const cachedTweets = await getCachedTimelineFromWorker();
   const currentAcc = cachedAccountProfile;
-  
-  const targetScreen = screenName || currentAcc?.screen_name || "";
+
+  const targetScreen = screenName || handleForUserId(req.query.user_id) || (isPlaceholderUser(currentAcc) ? '' : currentAcc.screen_name) || scrapeStats.lastHome?.ownHandle || '';
+  const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets].map(t => sanitizeTweet(t));
-  
+
   if (!targetScreen) {
-    return res.status(200).json(allTweets.slice(0, 25));
+    return res.status(200).json(filterByIdRange(allTweets, req.query).slice(0, 25));
   }
 
-  const userTweets = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === targetScreen.toLowerCase());
-  return res.status(200).json(userTweets.length > 0 ? userTweets : allTweets.slice(0, 15));
+  const key = targetScreen.toLowerCase();
+  const fromTimeline = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === key);
+  const prof = await getProfile(targetScreen);
+  const fromProfile = prof && prof.tweets ? prof.tweets.map(t => sanitizeTweet(t)) : [];
+
+  const byId = new Map();
+  [...fromTimeline, ...fromProfile].forEach(t => byId.set(t.id_str, t));
+  const userTweets = Array.from(byId.values()).sort((a, b) => {
+    try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; }
+  });
+  console.log(`[XitterBridge user_timeline] @${targetScreen}: ${fromProfile.length} from profile fetch, ${fromTimeline.length} from home cache.`);
+  return res.status(200).json(filterByIdRange(userTweets, req.query));
 });
 
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
