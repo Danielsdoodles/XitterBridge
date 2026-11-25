@@ -406,8 +406,12 @@ function sanitizeUser(u) {
   const banner = fixUrl(u.profile_banner_url || u.legacy?.profile_banner_url) || (knownReal && knownReal.profile_banner_url) || defaultUser.profile_banner_url;
   if (knownReal) {
     // A thin copy of a user (e.g. from an old cached tweet) inherits the real profile we captured from X.
-    for (const k of ['description', 'location', 'url', 'followers_count', 'friends_count', 'listed_count', 'favourites_count', 'statuses_count', 'created_at', 'verified', 'protected', 'entities']) {
+    for (const k of ['description', 'location', 'url', 'created_at', 'verified', 'protected', 'entities']) {
       if (u[k] === undefined || u[k] === null || u[k] === '') u = { ...u, [k]: knownReal[k] };
+    }
+    for (const k of ['followers_count', 'friends_count', 'listed_count', 'favourites_count', 'statuses_count']) {
+      if (typeof knownReal[k] === 'number' && knownReal[k] !== 100) u = { ...u, [k]: knownReal[k] };
+      else if (u[k] === undefined || u[k] === null) u = { ...u, [k]: knownReal[k] };
     }
   }
   const finalIdStr = (knownReal && knownReal.id_str) || userIdStr || (knownByName && knownByName.id_str) || String(generateUniqueUserId(rawScreen));
@@ -590,6 +594,12 @@ function findCount(obj, names, depth = 0) {
   return undefined;
 }
 
+function num(v) {
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+  return undefined;
+}
+
 // Last raw user objects seen from X, for /debug/user.
 const rawGraphUsers = new Map();
 
@@ -606,15 +616,17 @@ function userFromGraphQL(u) {
     name: core.name || legacy.name || screen_name,
     created_at: core.created_at || legacy.created_at,
     profile_image_url_https: (u.avatar && u.avatar.image_url) || legacy.profile_image_url_https,
-    profile_banner_url: legacy.profile_banner_url || '',
-    description: legacy.description || (u.profile_bio && u.profile_bio.description) || '',
+    // X's current layout (seen live): banner.image_url, relationship_counts.{followers,following},
+    // tweet_counts.tweets, action_counts.favorites_count, website.url. Older layout kept as a fallback.
+    profile_banner_url: (u.banner && u.banner.image_url) || legacy.profile_banner_url || '',
+    description: (u.profile_bio && u.profile_bio.description) || legacy.description || '',
     location: (u.location && u.location.location) || (typeof legacy.location === 'string' ? legacy.location : '') || '',
-    url: legacy.url || null,
-    followers_count: findCount(legacy, ['followers_count']) ?? findCount(u, ['followers_count', 'normal_followers_count']),
-    friends_count: findCount(legacy, ['friends_count']) ?? findCount(u, ['friends_count', 'following_count']),
+    url: (u.website && u.website.url) || legacy.url || null,
+    followers_count: num(u.relationship_counts && u.relationship_counts.followers) ?? findCount(legacy, ['followers_count']) ?? findCount(u, ['followers_count', 'normal_followers_count']),
+    friends_count: num(u.relationship_counts && u.relationship_counts.following) ?? findCount(legacy, ['friends_count']) ?? findCount(u, ['friends_count', 'following_count']),
     listed_count: findCount(legacy, ['listed_count']) ?? findCount(u, ['listed_count']),
-    favourites_count: findCount(legacy, ['favourites_count']) ?? findCount(u, ['favourites_count', 'likes_count', 'like_count']),
-    statuses_count: findCount(legacy, ['statuses_count']) ?? findCount(u, ['statuses_count', 'tweet_count', 'tweets_count']),
+    favourites_count: num(u.action_counts && u.action_counts.favorites_count) ?? findCount(legacy, ['favourites_count']) ?? findCount(u, ['favourites_count', 'likes_count', 'like_count']),
+    statuses_count: num(u.tweet_counts && u.tweet_counts.tweets) ?? findCount(legacy, ['statuses_count']) ?? findCount(u, ['statuses_count', 'tweet_count', 'tweets_count']),
     verified: !!(u.is_blue_verified || (u.verification && u.verification.verified) || legacy.verified),
     protected: !!((u.privacy && u.privacy.protected) || legacy.protected),
     entities: legacy.entities
