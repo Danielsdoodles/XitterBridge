@@ -622,11 +622,24 @@ async function openXPage(tokens) {
   });
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+  const clean = v => String(v || '').trim().replace(/^["']|["']$/g, '');
   await page.setCookie(
-    { name: 'auth_token', value: tokens.auth_token.trim(), domain: '.x.com', path: '/' },
-    { name: 'ct0', value: tokens.ct0.trim(), domain: '.x.com', path: '/' }
+    { name: 'auth_token', value: clean(tokens.auth_token), domain: '.x.com', path: '/', secure: true, httpOnly: true, sameSite: 'None' },
+    { name: 'ct0', value: clean(tokens.ct0), domain: '.x.com', path: '/', secure: true, sameSite: 'Lax' }
   );
   return { browser, page };
+}
+
+// Describes a cookie's format without revealing it: a real auth_token is 40 hex characters, ct0 is usually 160.
+function describeCookie(v) {
+  const str = String(v || '');
+  const t = str.trim();
+  const problems = [];
+  if (t !== str) problems.push('has spaces/newlines around it');
+  if (/["'%]/.test(t)) problems.push('contains quotes or %-encoding');
+  if (/^(auth_token|ct0)\s*=/.test(t)) problems.push('includes the cookie NAME, paste only the value');
+  if (t && !/^[0-9a-f]+$/i.test(t)) problems.push('has non-hex characters');
+  return `${t.length} chars${problems.length ? ' (' + problems.join(', ') + ')' : ', hex ok'}`;
 }
 
 function isPlaceholderUser(u) {
@@ -875,8 +888,18 @@ async function backgroundScrape() {
 
     const loggedOut = currentUrl.includes('/login') || currentUrl.includes('/i/flow/login') || !currentUrl.includes('/home');
     if (loggedOut) {
-      scrapeStats.lastHome = { at: new Date().toISOString(), landedUrl: currentUrl, loggedOut: true, tokenSource };
-      console.log(`[XitterBridge Scraper] ERROR: X treated these cookies as LOGGED OUT (landed on ${currentUrl}). Cookie source: ${tokenSource}. Get fresh auth_token/ct0.`);
+      // Did X delete the cookie (it considers it invalid) or keep it but still refuse (blocking this server)?
+      const jar = await page.cookies('https://x.com').catch(() => []);
+      const kept = jar.find(c => c.name === 'auth_token');
+      const verdict = kept
+        ? 'X KEPT auth_token but still showed the logged-out page: the cookie looks valid, X is refusing it from this server.'
+        : 'X DELETED auth_token: X considers this cookie invalid (expired, logged out, or copied wrong).';
+      scrapeStats.lastHome = {
+        at: new Date().toISOString(), landedUrl: currentUrl, loggedOut: true, tokenSource, verdict,
+        auth_token_format: describeCookie(tokens.auth_token), ct0_format: describeCookie(tokens.ct0)
+      };
+      console.log(`[XitterBridge Scraper] ERROR: X treated these cookies as LOGGED OUT (landed on ${currentUrl}). Cookie source: ${tokenSource}.`);
+      console.log(`[XitterBridge Scraper] ${verdict} auth_token: ${describeCookie(tokens.auth_token)} | ct0: ${describeCookie(tokens.ct0)}`);
       await browser.close();
       isScraping = false;
       return;
