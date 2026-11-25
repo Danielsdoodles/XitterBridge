@@ -47,6 +47,7 @@ function indexMentionNames(t) {
   if (t.quoted_status) indexMentionNames(t.quoted_status);
 }
 
+let tokenSource = 'none';
 let manualAuthToken = process.env.X_AUTH_TOKEN || '';
 let manualCt0 = process.env.X_CT0 || '';
 
@@ -719,6 +720,7 @@ function findTweetById(allTweets, idInput) {
 
 async function getTokens() {
   if (manualAuthToken && manualCt0) {
+    tokenSource = (manualAuthToken === process.env.X_AUTH_TOKEN) ? 'Render env vars X_AUTH_TOKEN/X_CT0 (these override your app login!)' : '/set-tokens';
     return { auth_token: manualAuthToken, ct0: manualCt0 };
   }
 
@@ -730,6 +732,7 @@ async function getTokens() {
       if (response.ok) {
         const data = await response.json();
         if (data.auth_token && data.ct0) {
+          tokenSource = 'Worker (from your app login)';
           return { auth_token: data.auth_token, ct0: data.ct0 };
         }
       }
@@ -870,8 +873,10 @@ async function backgroundScrape() {
     const pageTitle = await page.title().catch(() => 'No Title');
     console.log(`[XitterBridge Scraper] Landed on URL: ${currentUrl} | Page Title: ${pageTitle}`);
 
-    if (currentUrl.includes('/login') || currentUrl.includes('/i/flow/login')) {
-      console.log(`[XitterBridge Scraper] ERROR: X redirected to Login! Session cookies may have expired.`);
+    const loggedOut = currentUrl.includes('/login') || currentUrl.includes('/i/flow/login') || !currentUrl.includes('/home');
+    if (loggedOut) {
+      scrapeStats.lastHome = { at: new Date().toISOString(), landedUrl: currentUrl, loggedOut: true, tokenSource };
+      console.log(`[XitterBridge Scraper] ERROR: X treated these cookies as LOGGED OUT (landed on ${currentUrl}). Cookie source: ${tokenSource}. Get fresh auth_token/ct0.`);
       await browser.close();
       isScraping = false;
       return;
@@ -1094,7 +1099,6 @@ app.get('/clear-cache', async (req, res) => {
   }
   localTimeline = [];
   localNotifications = [];
-  cachedAccountProfile = null;
   globalUserMap.clear();
   knownUsers.clear();
   profileCache.clear();
@@ -1105,6 +1109,7 @@ app.get('/clear-cache', async (req, res) => {
 // Shows whether the scraper is getting real data from X. Open this after a refresh.
 app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
+    cookieSource: tokenSource,
     videoMode: VIDEO_MODE,
     ownAccount: cachedAccountProfile ? cachedAccountProfile.screen_name : null,
     knownUsers: knownUsers.size,
@@ -1200,6 +1205,10 @@ app.all('/oauth/access_token', async (req, res) => {
     backgroundScrape();
   }
 
+  if (isPlaceholderUser(cachedAccountProfile)) {
+    const acc = await getCachedAccountFromWorker();
+    if (acc) cachedAccountProfile = acc;
+  }
   const activeUserId = cachedAccountProfile?.id_str || "12345678";
   const activeScreenName = cachedAccountProfile?.screen_name || "x_user";
   
@@ -1211,12 +1220,19 @@ app.all('/oauth/access_token', async (req, res) => {
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
-app.get('/1.1/account/settings.json', (req, res) => res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || "x_user" }));
+app.get('/1.1/account/settings.json', async (req, res) => {
+  if (isPlaceholderUser(cachedAccountProfile)) {
+    const acc = await getCachedAccountFromWorker();
+    if (acc) cachedAccountProfile = acc;
+  }
+  return res.status(200).json({ screen_name: cachedAccountProfile?.screen_name || "x_user" });
+});
 app.get('/1.1/application/rate_limit_status.json', (req, res) => res.status(200).json({ resources: { statuses: { "/statuses/home_timeline": { limit: 180, remaining: 180 } } } }));
 
 app.get('/1.1/account/verify_credentials.json', async (req, res) => {
-  if (!cachedAccountProfile) {
-    cachedAccountProfile = await getCachedAccountFromWorker();
+  if (isPlaceholderUser(cachedAccountProfile)) {
+    const acc = await getCachedAccountFromWorker();
+    if (acc) cachedAccountProfile = acc;
   }
   backgroundScrape();
   return res.status(200).json(sanitizeUser(cachedAccountProfile));
