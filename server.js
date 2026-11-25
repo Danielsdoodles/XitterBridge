@@ -26,10 +26,9 @@ const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
 const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 6000; // old apps give up after ~10-15s
 const STORE = { forStorage: true };
-// Profile picture size sent to the app. The app expects "_normal" and swaps in the size it needs itself
-// (small for tweets, larger for profile headers); a fixed 400x400 shows up cropped. Other options:
-// 400x400, bigger, 200x200, original.
-const AVATAR_SIZE = (process.env.AVATAR_SIZE || 'normal').toLowerCase();
+// Profile picture size sent to the app. Tested on the phone: "normal" stops ALL pictures and media from
+// loading in this app, 400x400 loads. Other options to try for sizing: 200x200, bigger, original.
+const AVATAR_SIZE = (process.env.AVATAR_SIZE || '400x400').toLowerCase();
 // IMAGE_PROXY=on: pictures are fetched by this server and passed to the phone, so the phone never has to
 // connect to X's image server itself (fixes phones that can't reach pbs.twimg.com).
 const IMAGE_PROXY = /^(on|true|1|yes)$/i.test(process.env.IMAGE_PROXY || '');
@@ -1735,6 +1734,26 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
   console.log(`[XitterBridge user_timeline] @${targetScreen}: ${fromProfile.length} from profile fetch, ${fromTimeline.length} from home cache.`);
   return res.status(200).json(filterByIdRange(userTweets, req.query));
 });
+
+// Profile "media" section: that person's tweets with pictures or videos.
+app.get(['/1.1/statuses/media_timeline.json', '/1/statuses/media_timeline.json'], async (req, res) => {
+  const target = req.query.screen_name || handleForUserId(req.query.user_id) || (req.query.user_id && cachedAccountProfile && idMatches(req.query.user_id, cachedAccountProfile.id_str) ? cachedAccountProfile.screen_name : '');
+  if (!target) return res.status(200).json([]);
+  const key = String(target).toLowerCase();
+  const fromHome = (await getCachedTimelineFromWorker()).filter(t => t.user?.screen_name?.toLowerCase() === key);
+  const cachedProf = profileCache.get(key);
+  const fromProfile = cachedProf && cachedProf.tweets ? cachedProf.tweets.map(t => sanitizeTweet(t)) : [];
+  const byId = new Map();
+  [...fromHome, ...fromProfile].forEach(t => { if (t.extended_entities && t.extended_entities.media && t.extended_entities.media.length) byId.set(t.id_str, t); });
+  const list = Array.from(byId.values()).sort((a, b) => { try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; } });
+  return res.status(200).json(filterByIdRange(list, req.query).slice(0, Number(req.query.count) || 25));
+});
+
+// Suggestion lists the app shows on profiles and in Discover. The bridge has none yet, so answer with
+// the empty list the app expects (an empty {} isn't a list and can break the page).
+app.get(['/1/users/recommendations.json', '/1.1/users/recommendations.json'], (req, res) => res.status(200).json([]));
+app.get(['/1.1/users/suggestions.json', '/1/users/suggestions.json'], (req, res) => res.status(200).json([]));
+app.get(['/1.1/saved_searches/list.json', '/1/saved_searches/list.json'], (req, res) => res.status(200).json([]));
 
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
   backgroundScrape();
