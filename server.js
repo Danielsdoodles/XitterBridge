@@ -668,7 +668,30 @@ function tweetFromGraphQL(r, depth = 0) {
 }
 
 function newSink() {
-  return { tweets: [], users: new Map(), seen: new Set(), pending: [], responses: 0, profileUser: null };
+  return { tweets: [], users: new Map(), userItems: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
+}
+
+// Render's small instance can only run ONE headless browser. Every job waits for its turn; nothing forces
+// its way in (that caused "Timed out ... waiting for the WS endpoint" when two started at once).
+const BROWSER_JOB_LIMIT_MS = 110000; // a stuck job gets its browser closed after this
+async function acquireBrowser(maxWaitMs) {
+  const start = Date.now();
+  while (isScraping) {
+    if (Date.now() - start > maxWaitMs) return false;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  isScraping = true;
+  lastScrapeTime = Date.now();
+  return true;
+}
+function startWatchdog(getBrowser, label) {
+  return setTimeout(() => {
+    const b = getBrowser();
+    if (b) {
+      console.log(`[XitterBridge] ${label} ran too long; closing its browser.`);
+      b.close().catch(() => {});
+    }
+  }, BROWSER_JOB_LIMIT_MS);
 }
 
 // Walks any X GraphQL response, so it keeps working when X moves fields around.
@@ -686,6 +709,11 @@ function collectFromGraphQL(json, sink) {
         if (rawGraphUsers.size > 300) rawGraphUsers.delete(rawGraphUsers.keys().next().value);
         rawGraphUsers.set(key, node);
       }
+    }
+    // People results (search "People" tab): keep them in the order X lists them.
+    if ((node.itemType === 'TimelineUser' || node.__typename === 'TimelineUser') && node.user_results && node.user_results.result) {
+      const pu = userFromGraphQL(node.user_results.result);
+      if (pu && !sink.userItems.some(x => x.id_str === pu.id_str)) sink.userItems.push(pu);
     }
     if ((node.itemType === 'TimelineTweet' || node.__typename === 'TimelineTweet') &&
         node.tweet_results && node.tweet_results.result && !node.promotedMetadata) {
@@ -815,16 +843,14 @@ function filterByIdRange(list, query) {
 function scrapeProfile(handle) {
   const key = String(handle).toLowerCase();
   if (profileInFlight.has(key)) return profileInFlight.get(key);
+  if (profileInFlight.size >= 3) return Promise.resolve(null); // don't let background fetches pile up
   const job = (async () => {
     const tokens = await getTokens();
     if (!tokens.auth_token || !tokens.ct0) return null;
-    // Render's small instances can only run one Chromium, so wait for the timeline scraper to finish.
-    const waitStart = Date.now();
-    while (isScraping && Date.now() - waitStart < 40000) await new Promise(r => setTimeout(r, 500));
-    isScraping = true;
-    lastScrapeTime = Date.now();
+    if (!(await acquireBrowser(90000))) return null; // busy for too long: skip, try again next time
     let browser;
     const sink = newSink();
+    const watchdog = startWatchdog(() => browser, `Profile fetch @${handle}`);
     try {
       const opened = await openXPage(tokens);
       browser = opened.browser;
@@ -842,6 +868,7 @@ function scrapeProfile(handle) {
     } catch (e) {
       scrapeStats.lastError = `profile ${handle}: ${e && e.message ? e.message : e}`;
     } finally {
+      clearTimeout(watchdog);
       if (browser) await browser.close().catch(() => {});
       isScraping = false;
     }
@@ -862,6 +889,67 @@ function scrapeProfile(handle) {
   })().finally(() => profileInFlight.delete(key));
   profileInFlight.set(key, job);
   return job;
+}
+
+// ---------- Search ----------
+// Opens x.com/search in the shared browser and keeps X's own results (tweets, or people).
+const SEARCH_WAIT_MS = Number(process.env.SEARCH_WAIT_MS) || 12000; // old apps give up after ~15s
+const searchCache = new Map();    // "mode:query" -> { tweets, users, fetchedAt }
+const searchInFlight = new Map();
+
+function scrapeSearch(query, mode) {
+  const key = `${mode}:${query.toLowerCase()}`;
+  if (searchInFlight.has(key)) return searchInFlight.get(key);
+  const job = (async () => {
+    const tokens = await getTokens();
+    if (!tokens.auth_token || !tokens.ct0) return null;
+    if (!(await acquireBrowser(60000))) return null;
+    let browser;
+    const sink = newSink();
+    const watchdog = startWatchdog(() => browser, `Search "${query}"`);
+    try {
+      const opened = await openXPage(tokens);
+      browser = opened.browser;
+      const page = opened.page;
+      attachGraphQLCapture(page, sink);
+      const gotResults = page.waitForResponse(r => /\/SearchTimeline\b/.test(r.url()), { timeout: 30000 }).catch(() => null);
+      const tab = mode === 'users' ? '&f=user' : (mode === 'recent' ? '&f=live' : '');
+      await page.goto(`https://x.com/search?q=${encodeURIComponent(query)}&src=typed_query${tab}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      await gotResults;
+      await new Promise(r => setTimeout(r, 1500));
+      await Promise.allSettled(sink.pending);
+    } catch (e) {
+      scrapeStats.lastError = `search "${query}": ${e && e.message ? e.message : e}`;
+    } finally {
+      clearTimeout(watchdog);
+      if (browser) await browser.close().catch(() => {});
+      isScraping = false;
+    }
+    registerSinkUsers(sink);
+    const entry = {
+      tweets: sink.tweets.map(t => sanitizeTweet(t, STORE)),
+      users: sink.userItems.map(u => sanitizeUser(u)),
+      fetchedAt: Date.now()
+    };
+    searchCache.set(key, entry);
+    if (searchCache.size > 50) searchCache.delete(searchCache.keys().next().value);
+    scrapeStats.lastSearch = { query, mode, at: new Date().toISOString(), graphqlResponses: sink.responses, tweets: entry.tweets.length, users: entry.users.length };
+    console.log(`[XitterBridge Search] "${query}" (${mode}): ${sink.responses} API responses, ${entry.tweets.length} tweets, ${entry.users.length} people.`);
+    return entry;
+  })().finally(() => searchInFlight.delete(key));
+  searchInFlight.set(key, job);
+  return job;
+}
+
+// Fresh cached results answer instantly; otherwise wait up to SEARCH_WAIT_MS, and if X is slower the
+// results are kept, so searching again shows them.
+async function getSearch(query, mode) {
+  const key = `${mode}:${query.toLowerCase()}`;
+  const cached = searchCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < 5 * 60 * 1000) return cached;
+  const job = scrapeSearch(query, mode);
+  const fresh = await Promise.race([job, new Promise(r => setTimeout(() => r(null), SEARCH_WAIT_MS))]);
+  return fresh || cached || null;
 }
 
 async function getProfile(handle, wait = true) {
@@ -1014,7 +1102,8 @@ async function appendCachedTimelineToWorker(newTweets) {
 async function backgroundScrape() {
   const now = Date.now();
   if (isScraping) {
-    if (now - lastScrapeTime > 45000) { isScraping = false; } else { return; }
+    // Another browser job is running. Never start a second browser; only recover from a flag left stuck.
+    if (now - lastScrapeTime > BROWSER_JOB_LIMIT_MS + 30000) { isScraping = false; } else { return; }
   }
   isScraping = true;
   lastScrapeTime = now;
@@ -1030,6 +1119,7 @@ async function backgroundScrape() {
 
   let browser;
   const sink = newSink();
+  const watchdog = startWatchdog(() => browser, 'Timeline scrape');
   try {
     const opened = await openXPage(tokens);
     browser = opened.browser;
@@ -1241,6 +1331,7 @@ async function backgroundScrape() {
     console.error(`[XitterBridge Scraper] Error during scraping:`, err);
     if (browser) await browser.close().catch(() => {});
   } finally {
+    clearTimeout(watchdog);
     isScraping = false;
   }
 }
@@ -1888,22 +1979,90 @@ app.get('/1.1/trends/available.json', (req, res) => {
   ]);
 });
 
-app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '/1.1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
+// Old Twitter "universal" search, used by the app's search button. It answers with a list of modules:
+// { status: { data: tweet, metadata } } for each tweet, and { user_gallery: { data: [{ user: { data } }] } } for people.
+app.get(['/1.1/search/universal.json', '/1/search/universal.json', '/1.1/discover/universal.json'], async (req, res) => {
+  let q = String(req.query.q || req.query.query || '');
+  try { q = decodeURIComponent(q); } catch (e) {}
+  q = q.trim();
+  const lq = q.toLowerCase();
+  const wanted = String(req.query.modules || 'status,user_gallery').split(',').map(x => x.trim());
+  const count = Number(req.query.count) || 20;
+
+  let tweets = [], people = [], fromX = false;
+  if (q) {
+    const found = await getSearch(q, 'top');
+    if (found && found.tweets.length) {
+      fromX = true;
+      tweets = found.tweets.map(t => sanitizeTweet(t));
+      people = found.users.slice();
+    } else {
+      const cached = [...localTimeline, ...(await getCachedTimelineFromWorker())];
+      tweets = cached.filter(t =>
+        (t.text && t.text.toLowerCase().includes(lq)) ||
+        (t.user?.screen_name && t.user.screen_name.toLowerCase().includes(lq)) ||
+        (t.user?.name && t.user.name.toLowerCase().includes(lq))
+      ).map(t => sanitizeTweet(t));
+    }
+    // People gallery: accounts X listed, then known accounts whose name or handle matches.
+    const lqNoAt = lq.replace(/^@/, '').replace(/\s+/g, '');
+    for (const u of knownUsers.values()) {
+      if (people.length >= 6) break;
+      if (people.some(x => x.id_str === u.id_str)) continue;
+      if (u.screen_name.toLowerCase().includes(lqNoAt) || String(u.name || '').toLowerCase().replace(/\s+/g, '').includes(lqNoAt)) people.push(u);
+    }
+  }
+  tweets = filterByIdRange(tweets, req.query).slice(0, count);
+
+  const modules = [];
+  if (people.length && (wanted.includes('user_gallery') || wanted.includes('user'))) {
+    modules.push({ user_gallery: { metadata: { result_type: 'top' }, data: people.slice(0, 6).map(u => ({ user: { data: u, metadata: {} } })) } });
+  }
+  if (wanted.includes('status')) {
+    for (const t of tweets) modules.push({ status: { data: t, metadata: { result_type: fromX ? 'top' : 'recent' } } });
+  }
+  const maxId = tweets.length ? tweets[tweets.length - 1].id_str : '0';
+  console.log(`[XitterBridge universal search] "${q}": ${tweets.length} tweets ${fromX ? 'from X' : 'from cache (X still loading, search again shortly)'}, ${Math.min(people.length, 6)} people`);
+  return res.status(200).json({
+    metadata: { cursor: maxId, refresh_cursor: tweets.length ? tweets[0].id_str : '0' },
+    modules,
+    // Plain lists too, for app screens that read these instead of modules.
+    statuses: tweets,
+    search_metadata: { query: q, count: tweets.length, max_id_str: maxId }
+  });
+});
+
+app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json'], async (req, res) => {
   const rawQuery = req.query.q || req.query.query || "";
-  const query = decodeURIComponent(rawQuery).trim().toLowerCase();
+  let originalQuery = String(rawQuery);
+  try { originalQuery = decodeURIComponent(originalQuery); } catch (e) {}
+  originalQuery = originalQuery.trim();
+  const query = originalQuery.toLowerCase();
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  
-  let matching = allTweets;
+
+  let matching = [];
   if (query !== '') {
-    matching = allTweets.filter(t => 
-      (t.text && t.text.toLowerCase().includes(query)) ||
-      (t.user?.screen_name && t.user.screen_name.toLowerCase().includes(query)) ||
-      (t.user?.name && t.user.name.toLowerCase().includes(query))
-    );
+    const mode = String(req.query.result_type || '').toLowerCase() === 'recent' ? 'recent' : 'top';
+    const found = await getSearch(originalQuery, mode);
+    if (found && found.tweets.length) {
+      matching = found.tweets.map(t => sanitizeTweet(t));
+      console.log(`[XitterBridge search] "${originalQuery}": ${matching.length} results from X`);
+    } else {
+      // X didn't answer in time: show matches from the timeline cache for now.
+      matching = allTweets.filter(t =>
+        (t.text && t.text.toLowerCase().includes(query)) ||
+        (t.user?.screen_name && t.user.screen_name.toLowerCase().includes(query)) ||
+        (t.user?.name && t.user.name.toLowerCase().includes(query))
+      );
+      console.log(`[XitterBridge search] "${originalQuery}": X still loading, ${matching.length} matches from cache (search again shortly)`);
+    }
+    matching = filterByIdRange(matching, req.query);
+  } else {
+    matching = allTweets;
   }
 
-  const finalStatuses = matching.slice(0, 25).map(t => sanitizeTweet(t));
+  const finalStatuses = matching.slice(0, Number(req.query.count) || 25).map(t => sanitizeTweet(t));
   const uniqueUsers = {};
   finalStatuses.forEach(s => { if (s.user && s.user.id_str) uniqueUsers[s.user.id_str] = s.user; });
 
@@ -1921,19 +2080,60 @@ app.get(['/1.1/search/tweets.json', '/1/search/tweets.json', '/1/search.json', '
   });
 });
 
+// People search ("users" tab)
+app.get(['/1.1/users/search.json', '/1/users/search.json'], async (req, res) => {
+  let q = String(req.query.q || '');
+  try { q = decodeURIComponent(q); } catch (e) {}
+  q = q.trim();
+  if (!q) return res.status(200).json([]);
+  const found = await getSearch(q, 'users');
+  if (found && found.users.length) {
+    console.log(`[XitterBridge users/search] "${q}": ${found.users.length} people from X`);
+    return res.status(200).json(found.users.slice(0, Number(req.query.count) || 20));
+  }
+  const lq = q.toLowerCase().replace(/^@/, '');
+  const local = [...knownUsers.values()].filter(u => u.screen_name.toLowerCase().includes(lq) || String(u.name || '').toLowerCase().includes(lq));
+  console.log(`[XitterBridge users/search] "${q}": X still loading, ${local.length} known matches`);
+  return res.status(200).json(local.slice(0, 20));
+});
+
 app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, res) => {
   const rawQuery = req.query.q || "";
   const query = decodeURIComponent(rawQuery).trim().toLowerCase();
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
   
-  const users = allTweets.map(t => sanitizeUser(t.user)).filter(Boolean).slice(0, 5);
+  const q = query.replace(/^@/, '');
+  const seen = new Set();
+  const users = [];
+  const candidates = [...knownUsers.values(), ...allTweets.map(t => sanitizeUser(t.user))];
+  for (const u of candidates) {
+    if (!u || isPlaceholderUser(u) || seen.has(u.id_str)) continue;
+    if (q && !(u.screen_name.toLowerCase().startsWith(q) || String(u.name || '').toLowerCase().includes(q))) continue;
+    seen.add(u.id_str);
+    users.push(u);
+    if (users.length >= 8) break;
+  }
   const matchingStatuses = allTweets.filter(t => query === '' || t.text?.toLowerCase().includes(query)).slice(0, 5);
 
+  const tags = new Map();
+  for (const t of allTweets) {
+    for (const h of (t.entities && t.entities.hashtags) || []) {
+      const tag = '#' + h.text;
+      if (q && !h.text.toLowerCase().startsWith(q.replace(/^#/, ''))) continue;
+      tags.set(tag.toLowerCase(), tag);
+    }
+  }
+  const topics = Array.from(tags.values()).slice(0, 5).map(topic => ({ topic, rounded_score: 0, tokens: [], inline: false }));
   return res.status(200).json({
+    num_results: users.length + topics.length,
     users: users,
+    topics,
+    hashtags: topics.map(t => ({ hashtag: t.topic, rounded_score: 0 })),
+    oneclick: [],
     statuses: matchingStatuses.map(t => sanitizeTweet(t)),
-    topics: []
+    completed_in: 0.01,
+    query: rawQuery
   });
 });
 
