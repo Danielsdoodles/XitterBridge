@@ -26,6 +26,8 @@ const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
 const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 20000;
 const STORE = { forStorage: true };
+// Profile picture size sent to the app. 400x400 is what worked; other options: normal, bigger, 200x200, original.
+const AVATAR_SIZE = (process.env.AVATAR_SIZE || '400x400').toLowerCase();
 // IMAGE_PROXY=on: pictures are fetched by this server and passed to the phone, so the phone never has to
 // connect to X's image server itself (fixes phones that can't reach pbs.twimg.com).
 const IMAGE_PROXY = /^(on|true|1|yes)$/i.test(process.env.IMAGE_PROXY || '');
@@ -96,11 +98,34 @@ function rewriteImagesForClient(obj, base) {
   return obj;
 }
 
+// JavaScript numbers can't hold 19-digit IDs exactly (1731289699753291776 becomes ...291800), so the app
+// saw your account number differently at login and on your profile. Write every numeric id exactly as its
+// *_str twin, the way the real Twitter API did.
+const ID_PAIRS = [['id', 'id_str'], ['user_id', 'user_id_str'], ['in_reply_to_status_id', 'in_reply_to_status_id_str'],
+  ['in_reply_to_user_id', 'in_reply_to_user_id_str'], ['quoted_status_id', 'quoted_status_id_str']];
+function exactJsonStringify(body) {
+  const clone = JSON.parse(JSON.stringify(body === undefined ? null : body));
+  const walk = n => {
+    if (!n || typeof n !== 'object') return;
+    if (Array.isArray(n)) { n.forEach(walk); return; }
+    for (const [num, str] of ID_PAIRS) {
+      if (typeof n[num] === 'number' && typeof n[str] === 'string' && /^\d{1,19}$/.test(n[str])) n[num] = `__XB_EXACT_${n[str]}__`;
+    }
+    for (const k of Object.keys(n)) if (n[k] && typeof n[k] === 'object') walk(n[k]);
+  };
+  walk(clone);
+  return JSON.stringify(clone).replace(/"__XB_EXACT_(\d+)__"/g, '$1');
+}
+
 app.use((req, res, next) => {
-  if (!IMAGE_PROXY || !(req.path.startsWith('/1.1/') || req.path.startsWith('/1/'))) return next();
+  if (!(req.path.startsWith('/1.1/') || req.path.startsWith('/1/'))) return next();
   const base = (process.env.PUBLIC_URL || `https://${req.headers.host}`).replace(/\/$/, '');
-  const json = res.json.bind(res);
-  res.json = body => json(rewriteImagesForClient(JSON.parse(JSON.stringify(body)), base));
+  res.json = body => {
+    let out = body;
+    if (IMAGE_PROXY) out = rewriteImagesForClient(JSON.parse(JSON.stringify(out === undefined ? null : out)), base);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.send(exactJsonStringify(out));
+  };
   next();
 });
 
@@ -193,10 +218,10 @@ function forceJpgAvatarUrl(url) {
   if (!url) return defaultAvatar;
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/profile_images/')) {
-    // Old clients expect "_normal" and replace it themselves (_bigger, _reasonably_small, or nothing for
-    // full size). Keep the picture's real file type: a .png avatar asked for as .jpg can fail to load.
+    // Size comes from AVATAR_SIZE (default 400x400, the format the app displayed correctly).
+    // Keep the picture's real file type: a .png avatar asked for as .jpg can fail to load.
     const m = fixed.split('?')[0].match(/^(.*?)(?:_(?:normal|mini|bigger|reasonably_small|200x200|x96|400x400))?\.(jpe?g|png|gif|webp)$/i);
-    if (m) return `${m[1]}_normal.${m[2].toLowerCase()}`;
+    if (m) return AVATAR_SIZE === 'original' ? `${m[1]}.${m[2].toLowerCase()}` : `${m[1]}_${AVATAR_SIZE}.${m[2].toLowerCase()}`;
     return fixed.split('?')[0];
   }
   return fixed;
@@ -1296,6 +1321,7 @@ app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
     cookieSource: tokenSource,
     imageProxy: IMAGE_PROXY,
+    avatarSize: AVATAR_SIZE,
     videoMode: VIDEO_MODE,
     ownAccount: cachedAccountProfile ? cachedAccountProfile.screen_name : null,
     knownUsers: knownUsers.size,
