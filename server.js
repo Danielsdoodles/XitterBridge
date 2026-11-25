@@ -48,6 +48,7 @@ function indexMentionNames(t) {
 }
 
 let tokenSource = 'none';
+let ownRefreshedAt = 0;
 let manualAuthToken = process.env.X_AUTH_TOKEN || '';
 let manualCt0 = process.env.X_CT0 || '';
 
@@ -156,8 +157,11 @@ function forceJpgAvatarUrl(url) {
   if (!url) return defaultAvatar;
   let fixed = fixUrl(url);
   if (fixed.includes('pbs.twimg.com/profile_images/')) {
-    fixed = fixed.split('?')[0].replace(/_(normal|mini|bigger|200x200|x96|400x400)\.(jpg|jpeg|png|webp)/i, '');
-    return `${fixed}_400x400.jpg`;
+    // Old clients expect "_normal" and replace it themselves (_bigger, _reasonably_small, or nothing for
+    // full size). Keep the picture's real file type: a .png avatar asked for as .jpg can fail to load.
+    const m = fixed.split('?')[0].match(/^(.*?)(?:_(?:normal|mini|bigger|reasonably_small|200x200|x96|400x400))?\.(jpe?g|png|gif|webp)$/i);
+    if (m) return `${m[1]}_normal.${m[2].toLowerCase()}`;
+    return fixed.split('?')[0];
   }
   return fixed;
 }
@@ -504,6 +508,27 @@ function sanitizeTweet(t, opts = {}) {
 // ---------- X GraphQL capture ----------
 // The headless browser already loads X, and X's page fetches complete JSON for every tweet and author
 // (real name, avatar, video files). We read those responses instead of guessing from the rendered page.
+// Finds a number field by any of its known names inside one user object (not inside other users nested in it).
+function findCount(obj, names, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 4) return undefined;
+  for (const n of names) {
+    const v = obj[n];
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v);
+  }
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+    if (v.rest_id || v.__typename === 'User' || k === 'user_results') continue;
+    const r = findCount(v, names, depth + 1);
+    if (r !== undefined) return r;
+  }
+  return undefined;
+}
+
+// Last raw user objects seen from X, for /debug/user.
+const rawGraphUsers = new Map();
+
 function userFromGraphQL(u) {
   if (!u || typeof u !== 'object' || u.__typename === 'UserUnavailable') return null;
   const core = u.core || {};
@@ -521,11 +546,11 @@ function userFromGraphQL(u) {
     description: legacy.description || (u.profile_bio && u.profile_bio.description) || '',
     location: (u.location && u.location.location) || (typeof legacy.location === 'string' ? legacy.location : '') || '',
     url: legacy.url || null,
-    followers_count: legacy.followers_count,
-    friends_count: legacy.friends_count,
-    listed_count: legacy.listed_count,
-    favourites_count: legacy.favourites_count,
-    statuses_count: legacy.statuses_count,
+    followers_count: findCount(legacy, ['followers_count']) ?? findCount(u, ['followers_count', 'normal_followers_count']),
+    friends_count: findCount(legacy, ['friends_count']) ?? findCount(u, ['friends_count', 'following_count']),
+    listed_count: findCount(legacy, ['listed_count']) ?? findCount(u, ['listed_count']),
+    favourites_count: findCount(legacy, ['favourites_count']) ?? findCount(u, ['favourites_count', 'likes_count', 'like_count']),
+    statuses_count: findCount(legacy, ['statuses_count']) ?? findCount(u, ['statuses_count', 'tweet_count', 'tweets_count']),
     verified: !!(u.is_blue_verified || (u.verification && u.verification.verified) || legacy.verified),
     protected: !!((u.privacy && u.privacy.protected) || legacy.protected),
     entities: legacy.entities
@@ -574,7 +599,14 @@ function collectFromGraphQL(json, sink) {
     if (Array.isArray(node)) { for (const x of node) walk(x, depth + 1); return; }
     if (node.__typename === 'User' && node.rest_id) {
       const u = userFromGraphQL(node);
-      if (u) sink.users.set(u.screen_name.toLowerCase(), u);
+      if (u) {
+        const key = u.screen_name.toLowerCase();
+        // Keep the richest copy: profile responses carry more than timeline ones.
+        const prev = sink.users.get(key);
+        if (!prev || (u.followers_count !== undefined && prev.followers_count === undefined) || (u.description && !prev.description)) sink.users.set(key, u);
+        if (rawGraphUsers.size > 300) rawGraphUsers.delete(rawGraphUsers.keys().next().value);
+        rawGraphUsers.set(key, node);
+      }
     }
     if ((node.itemType === 'TimelineTweet' || node.__typename === 'TimelineTweet') &&
         node.tweet_results && node.tweet_results.result && !node.promotedMetadata) {
@@ -640,6 +672,22 @@ function describeCookie(v) {
   if (/^(auth_token|ct0)\s*=/.test(t)) problems.push('includes the cookie NAME, paste only the value');
   if (t && !/^[0-9a-f]+$/i.test(t)) problems.push('has non-hex characters');
   return `${t.length} chars${problems.length ? ' (' + problems.join(', ') + ')' : ', hex ok'}`;
+}
+
+async function saveOwnAccount(user) {
+  if (!user || isPlaceholderUser(user)) return;
+  cachedAccountProfile = user;
+  const workerUrl = process.env.WORKER_URL;
+  const secret = process.env.BRIDGE_SECRET;
+  if (!workerUrl || !secret) return;
+  try {
+    await fetch(`${workerUrl}/update-account`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret },
+      body: JSON.stringify(user)
+    });
+    console.log(`[XitterBridge] Saved your account @${user.screen_name} (id ${user.id_str}) to the Worker.`);
+  } catch (e) {}
 }
 
 function isPlaceholderUser(u) {
@@ -1070,10 +1118,13 @@ async function backgroundScrape() {
     }
 
     // Own profile: if the Worker never supplied it, fetch it from X once we know the handle.
-    if (ownHandle && isPlaceholderUser(cachedAccountProfile)) {
+    const ownStale = isPlaceholderUser(cachedAccountProfile) || cachedAccountProfile.screen_name.toLowerCase() !== String(ownHandle).toLowerCase() ||
+      !ownRefreshedAt || Date.now() - ownRefreshedAt > 30 * 60 * 1000;
+    if (ownHandle && ownStale) {
+      ownRefreshedAt = Date.now();
       setTimeout(() => {
         scrapeProfile(ownHandle).then(entry => {
-          if (entry && entry.user && isPlaceholderUser(cachedAccountProfile)) cachedAccountProfile = entry.user;
+          if (entry && entry.user) saveOwnAccount(entry.user);
         }).catch(() => {});
       }, 1000);
     }
@@ -1127,6 +1178,17 @@ app.get('/clear-cache', async (req, res) => {
   profileCache.clear();
   backgroundScrape();
   return res.send(`Cache cleared. Worker timeline wipe: ${workerStatus}. A fresh scrape has started; refresh your app in about a minute.`);
+});
+
+// Shows the raw user object X sent and what the bridge made of it: /debug/user?screen_name=brave
+app.get('/debug/user', (req, res) => {
+  const key = String(req.query.screen_name || '').toLowerCase();
+  if (!key) return res.status(200).json({ error: 'add ?screen_name=someone' });
+  return res.status(200).json({
+    raw_from_x: rawGraphUsers.get(key) || null,
+    bridge_user: knownUsers.get(key) || null,
+    profile_fetch: profileCache.has(key) ? { ...profileCache.get(key), tweets: (profileCache.get(key).tweets || []).length } : null
+  });
 });
 
 // Shows whether the scraper is getting real data from X. Open this after a refresh.
@@ -1321,6 +1383,10 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     return res.status(200).json(currentAcc);
   }
 
+  if (userId && (String(userId) === '12345678' || String(userId) === '0' || (currentAcc && String(userId) === currentAcc.id_str)) && !isPlaceholderUser(currentAcc)) {
+    console.log('[XitterBridge users/show] user_id', userId, 'is you -> @' + currentAcc.screen_name);
+    return res.status(200).json(currentAcc);
+  }
   const lookupHandle = screenName || handleForUserId(userId);
   if (lookupHandle) {
     const prof = await getProfile(lookupHandle);
