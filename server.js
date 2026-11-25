@@ -26,6 +26,10 @@ const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
 const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 20000;
 const STORE = { forStorage: true };
+// IMAGE_PROXY=on: pictures are fetched by this server and passed to the phone, so the phone never has to
+// connect to X's image server itself (fixes phones that can't reach pbs.twimg.com).
+const IMAGE_PROXY = /^(on|true|1|yes)$/i.test(process.env.IMAGE_PROXY || '');
+const IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com'];
 
 // Real users captured from X's own API responses (handle -> sanitized user). Never cleared on refresh.
 const knownUsers = new Map();
@@ -64,7 +68,39 @@ app.use((req, res, next) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
   }
   
-  console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
+  if (req.path !== '/img') console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
+  next();
+});
+
+function proxiedImageUrl(url, base) {
+  return `${base}/img?u=${encodeURIComponent(url)}`;
+}
+
+// Rewrites picture addresses in an API reply to go through /img (only what's sent; storage is untouched).
+function rewriteImagesForClient(obj, base) {
+  const keys = new Set(['profile_image_url', 'profile_image_url_https', 'media_url', 'media_url_https', 'profile_banner_url']);
+  const walk = node => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (typeof v === 'string' && keys.has(k)) {
+        try {
+          const u = new URL(v.replace(/^http:/i, 'https:'));
+          if (IMAGE_HOSTS.includes(u.hostname)) node[k] = proxiedImageUrl(u.toString(), base);
+        } catch (e) {}
+      } else if (v && typeof v === 'object') walk(v);
+    }
+  };
+  walk(obj);
+  return obj;
+}
+
+app.use((req, res, next) => {
+  if (!IMAGE_PROXY || !(req.path.startsWith('/1.1/') || req.path.startsWith('/1/'))) return next();
+  const base = (process.env.PUBLIC_URL || `https://${req.headers.host}`).replace(/\/$/, '');
+  const json = res.json.bind(res);
+  res.json = body => json(rewriteImagesForClient(JSON.parse(JSON.stringify(body)), base));
   next();
 });
 
@@ -694,12 +730,32 @@ function isPlaceholderUser(u) {
   return !u || !u.screen_name || u.screen_name === 'twitter_user' || u.screen_name === 'x_user' || u.screen_name.startsWith('user_');
 }
 
+// The phone stores IDs as floating-point numbers, so 19-digit IDs come back rounded
+// (1088463100137791489 -> 1088463100137791500). Match exactly, or on the same rounded value.
+function idMatches(a, b) {
+  if (a === undefined || a === null || b === undefined || b === null) return false;
+  const sa = String(a), sb = String(b);
+  if (sa === sb) return true;
+  const na = Number(sa), nb = Number(sb);
+  return na > 0 && na === nb;
+}
+
+const recentUsersById = new Map(); // id_str -> user, filled from every timeline read
 function handleForUserId(id) {
   if (!id) return null;
   const sid = String(id);
-  for (const u of knownUsers.values()) if (u.id_str === sid) return u.screen_name;
+  for (const u of knownUsers.values()) if (idMatches(u.id_str, sid)) return u.screen_name;
+  for (const p of profileCache.values()) if (p.user && idMatches(p.user.id_str, sid)) return p.user.screen_name;
+  for (const [k, u] of recentUsersById) if (idMatches(k, sid) && !isPlaceholderUser(u)) return u.screen_name;
   const g = globalUserMap.get(sid);
   return g && !isPlaceholderUser(g) ? g.screen_name : null;
+}
+
+function findUserById(id) {
+  const h = handleForUserId(id);
+  if (!h) return null;
+  const key = h.toLowerCase();
+  return knownUsers.get(key) || (profileCache.get(key) || {}).user || globalUserMap.get(key) || null;
 }
 
 function filterByIdRange(list, query) {
@@ -836,6 +892,10 @@ async function getRawTimelineFromWorker() {
         try {
           if (!t || !t.user) return;
           const s = sanitizeUser(t.user);
+          if (!isPlaceholderUser(s)) {
+            if (recentUsersById.size > 2000) recentUsersById.delete(recentUsersById.keys().next().value);
+            recentUsersById.set(s.id_str, s);
+          }
           // Remember fully-known users (real handle + real avatar) across refreshes.
           if (!isPlaceholderUser(s) && !String(s.profile_image_url_https).includes('default_profile') && !knownUsers.has(s.screen_name.toLowerCase())) {
             knownUsers.set(s.screen_name.toLowerCase(), s);
@@ -1180,6 +1240,46 @@ app.get('/clear-cache', async (req, res) => {
   return res.send(`Cache cleared. Worker timeline wipe: ${workerStatus}. A fresh scrape has started; refresh your app in about a minute.`);
 });
 
+// Image proxy (X image hosts only, so it can't be used to fetch anything else).
+app.get('/img', async (req, res) => {
+  try {
+    const u = new URL(String(req.query.u || ''));
+    if (!IMAGE_HOSTS.includes(u.hostname)) return res.status(400).end();
+    u.protocol = 'https:';
+    const r = await fetch(u.toString(), { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!r.ok) return res.status(r.status).end();
+    res.setHeader('Content-Type', r.headers.get('content-type') || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.status(200).send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    return res.status(502).end();
+  }
+});
+
+// Open on the PHONE's browser: shows the same pictures loaded directly from X and through this server.
+app.get('/debug/images', async (req, res) => {
+  const base = (process.env.PUBLIC_URL || `https://${req.headers.host}`).replace(/\/$/, '');
+  const tweets = (await getCachedTimelineFromWorker()).slice(0, 60);
+  const avatars = [], media = [];
+  for (const t of tweets) {
+    const a = t.user && t.user.profile_image_url_https;
+    if (a && !a.includes('default_profile') && avatars.length < 3 && !avatars.includes(a)) avatars.push(a);
+    const m = t.extended_entities && t.extended_entities.media && t.extended_entities.media[0];
+    if (m && media.length < 3) media.push(m.media_url_https);
+  }
+  const esc = x => String(x).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const row = (label, url) => `<tr><td>${label}<br><small>${esc(url)}</small></td>
+    <td><img src="${esc(url)}" width="80"></td><td><img src="${esc(proxiedImageUrl(url, base))}" width="80"></td></tr>`;
+  const avatarRows = avatars.flatMap(a => [row('avatar as sent', a), row('avatar the way the app resizes it (_bigger)', a.replace('_normal', '_bigger'))]);
+  const mediaRows = media.map(m => row('media', m));
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"><title>Image test</title></head>
+<body style="font-family:sans-serif"><h3>Image test</h3><p>Image proxy is currently <b>${IMAGE_PROXY ? 'ON' : 'OFF'}</b>.</p>
+<table border="1" cellpadding="4" style="border-collapse:collapse"><tr><th>picture</th><th>direct from X</th><th>through bridge</th></tr>
+${avatarRows.join('')}${mediaRows.join('')}</table>
+${avatars.length + media.length === 0 ? '<p>No pictures in the cached timeline yet. Refresh the app first.</p>' : ''}</body></html>`);
+});
+
 // Shows the raw user object X sent and what the bridge made of it: /debug/user?screen_name=brave
 app.get('/debug/user', (req, res) => {
   const key = String(req.query.screen_name || '').toLowerCase();
@@ -1195,6 +1295,7 @@ app.get('/debug/user', (req, res) => {
 app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
     cookieSource: tokenSource,
+    imageProxy: IMAGE_PROXY,
     videoMode: VIDEO_MODE,
     ownAccount: cachedAccountProfile ? cachedAccountProfile.screen_name : null,
     knownUsers: knownUsers.size,
@@ -1373,6 +1474,30 @@ app.get('/1.1/friendships/show.json', (req, res) => {
 
 app.all('/1/account/push_destinations.json', (req, res) => res.status(200).json({ status: "ok" }));
 
+app.get(['/1.1/friendships/lookup.json', '/1/friendships/lookup.json'], (req, res) => {
+  const ids = String(req.query.user_id || '').split(',').map(s => s.trim()).filter(Boolean);
+  const names = String(req.query.screen_name || '').split(',').map(s => s.trim()).filter(Boolean);
+  const out = [];
+  for (const id of ids) {
+    const u = findUserById(id);
+    out.push({ name: u ? u.name : '', screen_name: u ? u.screen_name : '', id: u ? u.id : Number(id), id_str: u ? u.id_str : String(id), connections: ['none'] });
+  }
+  for (const n of names) {
+    const u = knownUsers.get(n.toLowerCase()) || globalUserMap.get(n.toLowerCase());
+    out.push({ name: u ? u.name : n, screen_name: u ? u.screen_name : n, id: u ? u.id : 0, id_str: u ? u.id_str : '0', connections: ['none'] });
+  }
+  return res.status(200).json(out);
+});
+
+// Following isn't supported by the bridge yet: answer like the API so the app doesn't break.
+app.post(['/1.1/friendships/create.json', '/1/friendships/create.json'], (req, res) => {
+  const id = req.body?.user_id || req.query.user_id;
+  const name = req.body?.screen_name || req.query.screen_name;
+  const u = (id && findUserById(id)) || (name && (knownUsers.get(String(name).toLowerCase()) || globalUserMap.get(String(name).toLowerCase())));
+  console.log('[XitterBridge] follow requested for', name || id, '- not sent to X (following is not supported yet).');
+  return res.status(200).json(u || sanitizeUser({ id_str: String(id || '0'), screen_name: name || '' }));
+});
+
 app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const screenName = req.query.screen_name || req.body?.screen_name;
   const userId = req.query.user_id || req.body?.user_id;
@@ -1414,7 +1539,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   const cachedTweets = await getCachedTimelineFromWorker();
   const matchedTweet = cachedTweets.find(t => 
     (screenName && t.user?.screen_name?.toLowerCase() === screenName.toLowerCase()) ||
-    (userId && t.user?.id_str === userId.toString())
+    (userId && idMatches(t.user?.id_str, userId))
   );
 
   if (matchedTweet && matchedTweet.user) {
@@ -1436,7 +1561,11 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
     }));
   }
 
-  console.log('[XitterBridge users/show] fell all the way through with user_id', userId, '- returning own account as last resort.');
+  if (userId) {
+    // Unknown person: answer with a neutral placeholder rather than showing your own profile as theirs.
+    console.log('[XitterBridge users/show] unknown user_id', userId, '- returning a placeholder (not your account).');
+    return res.status(200).json(sanitizeUser({ id_str: String(userId), screen_name: '', name: '' }));
+  }
   return res.status(200).json(currentAcc);
 });
 
@@ -1458,7 +1587,7 @@ app.all(['/1.1/users/lookup.json', '/1/users/lookup.json'], async (req, res) => 
         matchedUsers.push(globalUserMap.get(name));
         continue;
       }
-      const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name || t.user?.id_str === name);
+      const match = cachedTweets.find(t => t.user?.screen_name?.toLowerCase() === name || idMatches(t.user?.id_str, name));
       if (match && match.user) {
         matchedUsers.push(sanitizeUser(match.user));
       }
