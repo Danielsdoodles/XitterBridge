@@ -668,7 +668,7 @@ function tweetFromGraphQL(r, depth = 0) {
 }
 
 function newSink() {
-  return { tweets: [], users: new Map(), userItems: [], trends: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
+  return { tweets: [], users: new Map(), userItems: [], trends: [], ops: [], raw: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
 }
 
 // Render's small instance can only run ONE headless browser. Every job waits for its turn; nothing forces
@@ -748,6 +748,9 @@ function attachGraphQLCapture(page, sink) {
     try { if (resp.request().method() === 'OPTIONS') return; } catch (e) {}
     sink.pending.push(resp.json().then(json => {
       sink.responses++;
+      const op = (url.match(/\/graphql\/[^/]+\/([A-Za-z0-9_]+)/) || [])[1] || url;
+      sink.ops.push(op);
+      if (sink.keepRaw && sink.raw.length < 4) sink.raw.push({ op, body: JSON.stringify(json).slice(0, 6000) });
       collectFromGraphQL(json, sink);
       if (url.includes('UserByScreenName')) {
         const u = userFromGraphQL(json && json.data && json.data.user && json.data.user.result);
@@ -1445,6 +1448,17 @@ app.get('/debug/user', (req, res) => {
   });
 });
 
+// What the server got from X's Explore page: /debug/trends (starts a fetch if none has run yet)
+app.get('/debug/trends', async (req, res) => {
+  if (!scrapeStats.lastTrends) await Promise.race([scrapeTrends(), new Promise(r => setTimeout(r, 60000))]);
+  return res.status(200).json({
+    last_fetch: scrapeStats.lastTrends || 'no fetch finished yet, reload in a minute',
+    trends_found: trendsCache.trends ? trendsCache.trends.slice(0, 5) : [],
+    last_error: scrapeStats.lastError,
+    raw_samples_from_x: lastTrendsRaw
+  });
+});
+
 // Shows whether the scraper is getting real data from X. Open this after a refresh.
 app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
@@ -1970,6 +1984,7 @@ app.get('/1.1/statuses/favoriters/ids.json', (req, res) => res.status(200).json(
 // ---------- Trends ----------
 // Real trends from X's Explore page (the ones X shows your account), refreshed every 15 minutes.
 const trendsCache = { trends: null, fetchedAt: 0 };
+let lastTrendsRaw = [];
 let trendsInFlight = null;
 
 function parseVolume(text) {
@@ -1990,12 +2005,15 @@ function scrapeTrends() {
     let browser;
     const sink = newSink();
     const watchdog = startWatchdog(() => browser, 'Trends fetch');
+    sink.keepRaw = true;
+    let landedUrl = '';
     try {
       const opened = await openXPage(tokens);
       browser = opened.browser;
       const page = opened.page;
       attachGraphQLCapture(page, sink);
       await page.goto('https://x.com/explore/tabs/trending', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      landedUrl = page.url();
       // Wait until a trend has been captured (or give up after ~25s).
       for (let i = 0; i < 50 && sink.trends.length === 0; i++) await new Promise(r => setTimeout(r, 500));
       await new Promise(r => setTimeout(r, 1500));
@@ -2007,7 +2025,8 @@ function scrapeTrends() {
       if (browser) await browser.close().catch(() => {});
       isScraping = false;
     }
-    scrapeStats.lastTrends = { at: new Date().toISOString(), graphqlResponses: sink.responses, trends: sink.trends.length };
+    scrapeStats.lastTrends = { at: new Date().toISOString(), landedUrl, graphqlResponses: sink.responses, operations: sink.ops, trends: sink.trends.length };
+    lastTrendsRaw = sink.raw;
     console.log(`[XitterBridge Trends] ${sink.responses} API responses, ${sink.trends.length} trends.`);
     if (sink.trends.length) {
       trendsCache.trends = sink.trends;
