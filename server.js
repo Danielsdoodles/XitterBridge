@@ -35,6 +35,8 @@ const IMAGE_HOSTS = ['pbs.twimg.com', 'abs.twimg.com'];
 
 // Real users captured from X's own API responses (handle -> sanitized user). Never cleared on refresh.
 const knownUsers = new Map();
+// Handles whose follower/tweet counts came from X itself (not the 100 placeholders in old saved tweets).
+const realCountsFor = new Set();
 // Profile fetches: handle -> { user, tweets, fetchedAt, ttl }
 const profileCache = new Map();
 const profileInFlight = new Map();
@@ -716,7 +718,10 @@ function attachGraphQLCapture(page, sink) {
 function registerSinkUsers(sink) {
   for (const u of sink.users.values()) {
     const s = sanitizeUser(u);
-    if (s && s.screen_name && !s.screen_name.startsWith('user_')) knownUsers.set(s.screen_name.toLowerCase(), s);
+    if (s && s.screen_name && !s.screen_name.startsWith('user_')) {
+      knownUsers.set(s.screen_name.toLowerCase(), s);
+      if (u.followers_count !== undefined) realCountsFor.add(s.screen_name.toLowerCase());
+    }
   }
 }
 
@@ -842,6 +847,7 @@ function scrapeProfile(handle) {
     registerSinkUsers(sink);
     const user = sink.profileUser ? sanitizeUser(sink.profileUser) : (knownUsers.get(key) || null);
     if (user && !isPlaceholderUser(user)) knownUsers.set(key, user);
+    if (sink.profileUser && sink.profileUser.followers_count !== undefined) realCountsFor.add(key);
     const tweets = sink.tweets
       .filter(t => t.user && t.user.screen_name && t.user.screen_name.toLowerCase() === key)
       .map(t => sanitizeTweet(t, STORE))
@@ -940,10 +946,7 @@ async function getRawTimelineFromWorker() {
             if (recentUsersById.size > 2000) recentUsersById.delete(recentUsersById.keys().next().value);
             recentUsersById.set(s.id_str, s);
           }
-          // Remember fully-known users (real handle + real avatar) across refreshes.
-          if (!isPlaceholderUser(s) && !String(s.profile_image_url_https).includes('default_profile') && !knownUsers.has(s.screen_name.toLowerCase())) {
-            knownUsers.set(s.screen_name.toLowerCase(), s);
-          }
+          // (Old saved copies are NOT added to knownUsers: their counts are placeholders from older versions.)
         } catch (e) {}
       });
       return data;
@@ -1279,6 +1282,7 @@ app.get('/clear-cache', async (req, res) => {
   localNotifications = [];
   globalUserMap.clear();
   knownUsers.clear();
+  realCountsFor.clear();
   profileCache.clear();
   backgroundScrape();
   return res.send(`Cache cleared. Worker timeline wipe: ${workerStatus}. A fresh scrape has started; refresh your app in about a minute.`);
@@ -1331,6 +1335,7 @@ app.get('/debug/user', (req, res) => {
   return res.status(200).json({
     raw_from_x: rawGraphUsers.get(key) || null,
     bridge_user: knownUsers.get(key) || null,
+    has_real_counts_from_x: realCountsFor.has(key),
     profile_fetch: profileCache.has(key) ? { ...profileCache.get(key), tweets: (profileCache.get(key).tweets || []).length } : null
   });
 });
@@ -1561,7 +1566,7 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   if (lookupHandle) {
     const lk = lookupHandle.toLowerCase();
     const fresh = profileCache.get(lk);
-    const knownNow = (fresh && fresh.user) || knownUsers.get(lk) || globalUserMap.get(lk);
+    const knownNow = (fresh && fresh.user && realCountsFor.has(lk) ? fresh.user : null) || (realCountsFor.has(lk) ? knownUsers.get(lk) : null);
     if (knownNow && !isPlaceholderUser(knownNow)) {
       // Answer instantly; fetch the full profile in the background for next time.
       if (!fresh || Date.now() - fresh.fetchedAt >= fresh.ttl) getProfile(lookupHandle, false).catch(() => {});
