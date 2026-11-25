@@ -809,8 +809,12 @@ function scrapeProfile(handle) {
       browser = opened.browser;
       const page = opened.page;
       attachGraphQLCapture(page, sink);
+      // Start waiting for X's profile and tweet data before navigating, so a fast reply isn't missed.
+      const gotTweets = page.waitForResponse(r => /\/UserTweets\b/.test(r.url()), { timeout: 30000 }).catch(() => null);
+      const gotUser = page.waitForResponse(r => /\/UserByScreenName\b/.test(r.url()), { timeout: 30000 }).catch(() => null);
       await page.goto(`https://x.com/${encodeURIComponent(handle)}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
-      await page.waitForSelector('article[data-testid="tweet"], [data-testid="emptyState"]', { timeout: 15000 }).catch(() => {});
+      await Promise.all([gotTweets, gotUser]);
+      await page.waitForSelector('article[data-testid="tweet"], [data-testid="emptyState"]', { timeout: 10000 }).catch(() => {});
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
       await new Promise(r => setTimeout(r, 2500));
       await Promise.allSettled(sink.pending);
