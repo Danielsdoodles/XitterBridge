@@ -24,7 +24,7 @@ const MAX_VIDEO_BITRATE = Number(process.env.MAX_VIDEO_BITRATE) || 2176000;
 // native video still show something. Set VIDEO_MODE=video on Render to send real playable video instead.
 const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
-const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 20000;
+const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 6000; // old apps give up after ~10-15s
 const STORE = { forStorage: true };
 // Profile picture size sent to the app. 400x400 is what worked; other options: normal, bigger, 200x200, original.
 const AVATAR_SIZE = (process.env.AVATAR_SIZE || '400x400').toLowerCase();
@@ -432,6 +432,9 @@ function sanitizeUser(u) {
     profile_image_url: avatar,
     profile_image_url_https: avatar,
     profile_banner_url: banner,
+    // The original code always said "no profile picture" here, which tells the app to skip downloading it.
+    default_profile_image: avatar.includes('default_profile'),
+    default_profile: avatar.includes('default_profile') && !banner,
     entities: u.entities || u.legacy?.entities || defaultUser.entities
   };
 
@@ -1544,6 +1547,15 @@ app.all(['/1.1/users/show.json', '/1/users/show.json'], async (req, res) => {
   }
   const lookupHandle = screenName || handleForUserId(userId);
   if (lookupHandle) {
+    const lk = lookupHandle.toLowerCase();
+    const fresh = profileCache.get(lk);
+    const knownNow = (fresh && fresh.user) || knownUsers.get(lk) || globalUserMap.get(lk);
+    if (knownNow && !isPlaceholderUser(knownNow)) {
+      // Answer instantly; fetch the full profile in the background for next time.
+      if (!fresh || Date.now() - fresh.fetchedAt >= fresh.ttl) getProfile(lookupHandle, false).catch(() => {});
+      console.log('[XitterBridge users/show] answered instantly for', lookupHandle);
+      return res.status(200).json(knownNow);
+    }
     const prof = await getProfile(lookupHandle);
     if (prof && prof.user && !isPlaceholderUser(prof.user)) {
       console.log('[XitterBridge users/show] real profile from X for', lookupHandle);
@@ -1689,7 +1701,11 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
 
   const key = targetScreen.toLowerCase();
   const fromTimeline = allTweets.filter(t => t.user?.screen_name?.toLowerCase() === key);
-  const prof = await getProfile(targetScreen);
+  // Only wait for X if there's nothing to show yet; otherwise answer now and refresh in the background.
+  const cachedProf = profileCache.get(key);
+  const prof = (fromTimeline.length || (cachedProf && cachedProf.tweets && cachedProf.tweets.length))
+    ? (getProfile(targetScreen, false).catch(() => {}), cachedProf)
+    : await getProfile(targetScreen);
   const fromProfile = prof && prof.tweets ? prof.tweets.map(t => sanitizeTweet(t)) : [];
 
   const byId = new Map();
