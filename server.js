@@ -77,6 +77,70 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---------- Guest mode -> force login ----------
+// Old Twitter apps browse without an account by getting an app-only token (POST /oauth2/token) or a
+// guest token (POST /1.1/guest/activate.json), then calling the API with "Authorization: Bearer ..."
+// and/or an "x-guest-token" header instead of a signed-in (OAuth 1.0a) request. The bridge refuses
+// all of that with the same 401 "Invalid or expired token" the real API used for a dead session,
+// which makes apps show their sign-in screen. Guests are ALLOWED by default (they can read, and sign in
+// from inside guest mode); set FORCE_LOGIN=on on Render to refuse guest mode.
+const FORCE_LOGIN = /^(on|true|1|yes)$/i.test(process.env.FORCE_LOGIN || '');
+const GUEST_TOKEN_PATHS = new Set(['/oauth2/token', '/oauth2/invalidate_token', '/1.1/guest/activate.json', '/1/guest/activate.json']);
+
+function isGuestRequest(req) {
+  if (GUEST_TOKEN_PATHS.has(req.path)) return true;
+  if (!(req.path.startsWith('/1.1/') || req.path.startsWith('/1/'))) return false;
+  const auth = String(req.headers['authorization'] || '');
+  const signedIn = /oauth_token=/.test(auth) || !!(req.query && req.query.oauth_token) || !!(req.body && req.body.oauth_token);
+  if (signedIn) return false;                      // a signed-in app: never treat as guest
+  if (req.headers['x-guest-token']) return true;   // explicit guest session
+  return /^Bearer\s/i.test(auth);                 // app-only token, no account
+}
+
+function guestGate(req, res, next) {
+  if (!FORCE_LOGIN || !isGuestRequest(req)) return next();
+  console.log(`[XitterBridge] Guest mode refused (${req.method} ${req.path}) -> app should show its login screen.`);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('WWW-Authenticate', 'OAuth realm="https://api.twitter.com", api_error_code=89');
+  return res.status(401).send(JSON.stringify({ errors: [{ code: 89, message: 'Invalid or expired token.' }] }));
+}
+app.use(guestGate);
+
+// ---------- Sign-in key for anything that changes your X account ----------
+// Reading is open (guest mode). Posting, liking, retweeting, deleting, following and DMs only work for a
+// signed-in app holding the key handed out at login. The key is derived from BRIDGE_SECRET, so it
+// can't be guessed from your username.
+function bridgeAccessToken() {
+  return 'xb' + crypto.createHmac('sha256', String(process.env.BRIDGE_SECRET || 'xitterbridge')).update('access-token-v1').digest('hex').slice(0, 38);
+}
+function bridgeAccessSecret() {
+  return crypto.createHmac('sha256', String(process.env.BRIDGE_SECRET || 'xitterbridge')).update('access-secret-v1').digest('hex').slice(0, 40);
+}
+function requestAccessToken(req) {
+  const auth = String(req.headers['authorization'] || '');
+  const m = auth.match(/oauth_token="([^"]+)"/);
+  return (m && decodeURIComponent(m[1])) || (req.body && req.body.oauth_token) || (req.query && req.query.oauth_token) || '';
+}
+const WRITE_ALLOWED_WITHOUT_KEY = /push_destinations|\/scribe|\/oauth\//;
+function writeGate(req, res, next) {
+  if (req.method !== 'POST' && req.method !== 'DELETE') return next();
+  if (!(req.path.startsWith('/1.1/') || req.path.startsWith('/1/'))) return next();
+  if (WRITE_ALLOWED_WITHOUT_KEY.test(req.path)) return next();
+  if (requestAccessToken(req) === bridgeAccessToken()) return next();
+  console.log(`[XitterBridge] Refused ${req.method} ${req.path}: not signed in with this bridge (guests can read only). Sign in to post.`);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  return res.status(401).send(JSON.stringify({ errors: [{ code: 89, message: 'Invalid or expired token.' }] }));
+}
+app.use(writeGate);
+
+// Guest tokens, so guest mode works in apps that ask for one first.
+app.post(['/oauth2/token'], (req, res) => {
+  return res.status(200).json({ token_type: 'bearer', access_token: 'AAAAAAAAAAAAAAAAAAAAAXitterBridgeGuestBearerToken' });
+});
+app.post(['/1.1/guest/activate.json', '/1/guest/activate.json'], (req, res) => {
+  return res.status(200).json({ guest_token: String(1500000000000000000 + Math.floor(Math.random() * 1e15)) });
+});
+
 function proxiedImageUrl(url, base) {
   return `${base}/img?u=${encodeURIComponent(url)}`;
 }
@@ -668,7 +732,7 @@ function tweetFromGraphQL(r, depth = 0) {
 }
 
 function newSink() {
-  return { tweets: [], users: new Map(), userItems: [], trends: [], ops: [], raw: [], seen: new Set(), pending: [], responses: 0, profileUser: null };
+  return { tweets: [], users: new Map(), userItems: [], trends: [], notifications: [], ops: [], raw: [], seen: new Set(), pending: [], responses: 0, profileUser: null, created: null, createdError: null, retweetedId: null };
 }
 
 // Render's small instance can only run ONE headless browser. Every job waits for its turn; nothing forces
@@ -710,6 +774,19 @@ function collectFromGraphQL(json, sink) {
         rawGraphUsers.set(key, node);
       }
     }
+    // Notifications (GraphQL layout): TimelineNotification { notification_icon, timestamp_ms, template: { from_users, target_objects } }
+    if (node.__typename === 'TimelineNotification' || node.itemType === 'TimelineNotification') {
+      const icon = node.notification_icon || (node.icon && node.icon.id) || '';
+      const tpl = node.template || {};
+      const fromRefs = tpl.from_users || tpl.fromUsers || [];
+      const targetRefs = tpl.target_objects || tpl.targetObjects || [];
+      const users = fromRefs.map(x => userFromGraphQL(x && x.user_results && x.user_results.result)).filter(Boolean);
+      const tweets = targetRefs.map(x => tweetFromGraphQL(x && x.tweet_results && x.tweet_results.result)).filter(Boolean);
+      const type = notificationTypeFromIcon(icon);
+      if (type && !sink.notifications.some(n => n.id === node.id)) {
+        sink.notifications.push({ id: String(node.id || ''), type, at: Number(node.timestamp_ms || node.timestampMs) || Date.now(), users, tweets, text: (node.rich_message && node.rich_message.text) || '' });
+      }
+    }
     // Trends (Explore page): { name, trend_metadata: { meta_description: "12.3K posts" }, trend_url: { url } }
     if ((node.itemType === 'TimelineTrend' || node.__typename === 'TimelineTrend') && typeof node.name === 'string' && node.name) {
       if (!sink.trends.some(x => x.name === node.name)) {
@@ -744,7 +821,8 @@ function collectFromGraphQL(json, sink) {
 function attachGraphQLCapture(page, sink) {
   page.on('response', resp => {
     const url = resp.url();
-    if (!url.includes('/i/api/graphql/')) return;
+    const isNotifRest = /\/i\/api\/2\/notifications\//.test(url);
+    if (!url.includes('/i/api/graphql/') && !isNotifRest) return;
     try { if (resp.request().method() === 'OPTIONS') return; } catch (e) {}
     sink.pending.push(resp.json().then(json => {
       sink.responses++;
@@ -752,6 +830,23 @@ function attachGraphQLCapture(page, sink) {
       sink.ops.push(op);
       if (sink.keepRaw && sink.raw.length < 4) sink.raw.push({ op, body: JSON.stringify(json).slice(0, 6000) });
       collectFromGraphQL(json, sink);
+      if (isNotifRest) parseNotificationsV2(json, sink);
+      if (/\/CreateTweet\b/.test(url)) {
+        const r = json && json.data && json.data.create_tweet && json.data.create_tweet.tweet_results && json.data.create_tweet.tweet_results.result;
+        if (r) sink.created = tweetFromGraphQL(r);
+        else sink.createdError = (json && json.errors && json.errors[0] && json.errors[0].message) || 'X did not return the new tweet';
+      }
+      const actionOp = (url.match(/\/(FavoriteTweet|UnfavoriteTweet|DeleteRetweet|DeleteTweet)\b/) || [])[1];
+      if (actionOp) {
+        sink.actionOp = actionOp;
+        sink.actionOk = !(json && json.errors && json.errors.length);
+        if (!sink.actionOk) sink.createdError = json.errors[0].message || `${actionOp} failed`;
+      }
+      if (/\/CreateRetweet\b/.test(url)) {
+        const rr = json && json.data && json.data.create_retweet && json.data.create_retweet.retweet_results && json.data.create_retweet.retweet_results.result;
+        if (rr && rr.rest_id) sink.retweetedId = rr.rest_id;
+        else sink.createdError = (json && json.errors && json.errors[0] && json.errors[0].message) || 'X did not confirm the retweet';
+      }
       if (url.includes('UserByScreenName')) {
         const u = userFromGraphQL(json && json.data && json.data.user && json.data.user.result);
         if (u) sink.profileUser = u;
@@ -905,6 +1000,388 @@ function scrapeProfile(handle) {
   })().finally(() => profileInFlight.delete(key));
   profileInFlight.set(key, job);
   return job;
+}
+
+// ---------- Notifications ----------
+// Real notifications from x.com/notifications. X has used two layouts; both are read:
+//  - REST /i/api/2/notifications/all.json: globalObjects.{notifications,users,tweets} + timeline entries
+//  - GraphQL: TimelineNotification items (see collectFromGraphQL)
+function notificationTypeFromIcon(icon) {
+  const i = String(icon || '').toLowerCase();
+  if (i.includes('heart')) return 'favorite';
+  if (i.includes('retweet')) return 'retweet';
+  if (i.includes('person') || i.includes('follow')) return 'follow';
+  return null; // recommendations, "new posts from", security notices... not shown
+}
+
+function parseNotificationsV2(json, sink) {
+  const go = json && json.globalObjects;
+  if (!go) return;
+  const users = go.users || {}, tweets = go.tweets || {};
+  const tweetFrom = id => {
+    const t = id && tweets[id];
+    if (!t) return null;
+    return { ...t, id_str: t.id_str || String(id), text: t.full_text || t.text || '', full_text: t.full_text || t.text || '', user: users[t.user_id_str] || null };
+  };
+  for (const n of Object.values(go.notifications || {})) {
+    const type = notificationTypeFromIcon(n.icon && n.icon.id);
+    if (!type) continue;
+    const tpl = (n.template && (n.template.aggregateUserActionsV1 || n.template.aggregate_user_actions_v1)) || {};
+    const from = (tpl.fromUsers || []).map(x => users[x && x.user && x.user.id]).filter(Boolean);
+    const targ = (tpl.targetObjects || []).map(x => tweetFrom(x && x.tweet && x.tweet.id)).filter(Boolean);
+    if (!sink.notifications.some(x => x.id === n.id)) {
+      sink.notifications.push({ id: String(n.id), type, at: Number(n.timestampMs) || Date.now(), users: from, tweets: targ, text: (n.message && n.message.text) || '' });
+    }
+  }
+  // Mentions and replies arrive as plain tweet entries in the timeline.
+  const instructions = (json.timeline && json.timeline.instructions) || [];
+  for (const ins of instructions) {
+    const entries = (ins.addEntries && ins.addEntries.entries) || [];
+    for (const e of entries) {
+      const tid = e.content && e.content.item && e.content.item.content && e.content.item.content.tweet && e.content.item.content.tweet.id;
+      const t = tweetFrom(tid);
+      if (!t || !t.user || sink.notifications.some(x => x.id === 'tweet-' + t.id_str)) continue;
+      sink.notifications.push({ id: 'tweet-' + t.id_str, type: 'mentionTweet', at: Date.parse(t.created_at) || Number(e.sortIndex) || Date.now(), users: [t.user], tweets: [t], parent: tweetFrom(t.in_reply_to_status_id_str) });
+    }
+  }
+}
+
+const notificationsCache = { items: null, fetchedAt: 0 };
+let notificationsInFlight = null;
+let lastNotificationsRaw = [];
+
+function scrapeNotifications() {
+  if (notificationsInFlight) return notificationsInFlight;
+  notificationsInFlight = (async () => {
+    const tokens = await getTokens();
+    if (!tokens.auth_token || !tokens.ct0) return null;
+    if (!(await acquireBrowser(60000))) return null;
+    let browser, landedUrl = '';
+    const sink = newSink();
+    sink.keepRaw = true;
+    const watchdog = startWatchdog(() => browser, 'Notifications fetch');
+    try {
+      const opened = await openXPage(tokens);
+      browser = opened.browser;
+      const page = opened.page;
+      attachGraphQLCapture(page, sink);
+      await page.goto('https://x.com/notifications', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      landedUrl = page.url();
+      for (let i = 0; i < 40 && sink.notifications.length === 0 && sink.tweets.length === 0; i++) await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 2000));
+      await Promise.allSettled(sink.pending);
+    } catch (e) {
+      scrapeStats.lastError = `notifications: ${e && e.message ? e.message : e}`;
+    } finally {
+      clearTimeout(watchdog);
+      if (browser) await browser.close().catch(() => {});
+      isScraping = false;
+    }
+    registerSinkUsers(sink);
+    // GraphQL layout: mentions/replies come through as ordinary tweets on the notifications page.
+    const me = cachedAccountProfile && cachedAccountProfile.screen_name ? cachedAccountProfile.screen_name.toLowerCase() : '';
+    for (const t of sink.tweets) {
+      if (!t.user || (me && t.user.screen_name && t.user.screen_name.toLowerCase() === me)) continue;
+      if (sink.notifications.some(x => x.id === 'tweet-' + t.id_str)) continue;
+      sink.notifications.push({ id: 'tweet-' + t.id_str, type: 'mentionTweet', at: Date.parse(t.created_at) || Date.now(), users: [t.user], tweets: [t], parent: null });
+    }
+    sink.notifications.sort((a, b) => b.at - a.at);
+    lastNotificationsRaw = sink.raw;
+    scrapeStats.lastNotifications = { at: new Date().toISOString(), landedUrl, apiResponses: sink.responses, operations: sink.ops, notifications: sink.notifications.length };
+    console.log(`[XitterBridge Notifications] ${sink.responses} API responses, ${sink.notifications.length} notifications.`);
+    if (sink.notifications.length || sink.responses) {
+      notificationsCache.items = sink.notifications;
+      notificationsCache.fetchedAt = Date.now();
+    }
+    return notificationsCache;
+  })().finally(() => { notificationsInFlight = null; });
+  return notificationsInFlight;
+}
+
+// Old activity/about_me item. The app shows "<first source> and <sources_size - 1> others ...",
+// so sources_size must be present. Liked/retweeted items point at YOUR tweet in targets.
+function activityItem(action, at, sources, targets, targetObjects) {
+  return {
+    action,
+    max_position: String(at),
+    min_position: String(at),
+    created_at: formatTwitterDate(new Date(at)),
+    sources, sources_size: sources.length,
+    targets, targets_size: targets.length,
+    target_objects: targetObjects, target_objects_size: targetObjects.length
+  };
+}
+
+function notificationToActivity(n, me) {
+  const sources = (n.users || []).map(u => sanitizeUser(u)).filter(u => !isPlaceholderUser(u));
+  if (!sources.length) return null;
+  const tweets = (n.tweets || []).map(t => sanitizeTweet(t));
+  if (n.type === 'follow') return activityItem('follow', n.at, sources, [me], []);
+  if (n.type === 'favorite' || n.type === 'retweet') {
+    if (!tweets.length) return null;
+    return activityItem(n.type, n.at, sources, tweets, []);
+  }
+  if (n.type === 'mentionTweet') {
+    const t = tweets[0];
+    if (!t) return null;
+    if (t.in_reply_to_status_id_str) return activityItem('reply', n.at, sources.slice(0, 1), [t], n.parent ? [sanitizeTweet(n.parent)] : []);
+    if (t.quoted_status) return activityItem('quote', n.at, sources.slice(0, 1), [t], [t.quoted_status]);
+    return activityItem('mention', n.at, sources.slice(0, 1), [t], []);
+  }
+  return null;
+}
+
+// ---------- Conversations (replies) ----------
+const conversationCache = new Map(); // tweet id -> { tweets, fetchedAt }
+const conversationInFlight = new Map();
+
+function scrapeConversation(tweetId) {
+  const id = String(tweetId);
+  if (conversationInFlight.has(id)) return conversationInFlight.get(id);
+  if (conversationInFlight.size >= 3) return Promise.resolve(null);
+  const job = (async () => {
+    const tokens = await getTokens();
+    if (!tokens.auth_token || !tokens.ct0) return null;
+    if (!(await acquireBrowser(60000))) return null;
+    let browser;
+    const sink = newSink();
+    const watchdog = startWatchdog(() => browser, `Replies for ${id}`);
+    try {
+      const opened = await openXPage(tokens);
+      browser = opened.browser;
+      const page = opened.page;
+      attachGraphQLCapture(page, sink);
+      const got = page.waitForResponse(r => /\/TweetDetail\b/.test(r.url()), { timeout: 30000 }).catch(() => null);
+      await page.goto(`https://x.com/i/status/${encodeURIComponent(id)}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      await got;
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+      await new Promise(r => setTimeout(r, 2000));
+      await Promise.allSettled(sink.pending);
+    } catch (e) {
+      scrapeStats.lastError = `replies ${id}: ${e && e.message ? e.message : e}`;
+    } finally {
+      clearTimeout(watchdog);
+      if (browser) await browser.close().catch(() => {});
+      isScraping = false;
+    }
+    registerSinkUsers(sink);
+    const entry = { tweets: sink.tweets.map(t => sanitizeTweet(t, STORE)), fetchedAt: Date.now() };
+    conversationCache.set(id, entry);
+    if (conversationCache.size > 100) conversationCache.delete(conversationCache.keys().next().value);
+    scrapeStats.lastConversation = { id, at: new Date().toISOString(), apiResponses: sink.responses, tweets: entry.tweets.length };
+    console.log(`[XitterBridge Replies] tweet ${id}: ${sink.responses} API responses, ${entry.tweets.length} tweets in the conversation.`);
+    return entry;
+  })().finally(() => conversationInFlight.delete(id));
+  conversationInFlight.set(id, job);
+  return job;
+}
+
+function findInConversations(tweetId) {
+  const id = String(tweetId);
+  // Exact id first; the rounded match (for ids the app has rounded) only if nothing matches exactly.
+  for (const c of conversationCache.values()) {
+    const t = c.tweets.find(x => x.id_str === id);
+    if (t) return t;
+  }
+  for (const c of conversationCache.values()) {
+    const t = c.tweets.find(x => idMatches(x.id_str, id));
+    if (t) return t;
+  }
+  return null;
+}
+
+async function getConversation(tweetId) {
+  const id = String(tweetId);
+  const cached = conversationCache.get(id);
+  if (cached && Date.now() - cached.fetchedAt < 2 * 60 * 1000) return cached;
+  const fresh = await Promise.race([scrapeConversation(id), new Promise(r => setTimeout(() => r(null), SEARCH_WAIT_MS))]);
+  return fresh || cached || null;
+}
+
+// Splits a conversation into the tweets above the one you opened, that tweet, and the replies below it.
+function splitConversation(list, focalId) {
+  const tweets = list.map(t => sanitizeTweet(t)).sort((a, b) => { try { return BigInt(a.id_str) < BigInt(b.id_str) ? -1 : 1; } catch (e) { return 0; } });
+  const focal = tweets.find(t => t.id_str === String(focalId)) || null;
+  const ancestors = [];
+  if (focal) {
+    let cur = focal;
+    while (cur && cur.in_reply_to_status_id_str) {
+      const parent = tweets.find(t => t.id_str === cur.in_reply_to_status_id_str);
+      if (!parent || ancestors.includes(parent)) break;
+      ancestors.unshift(parent);
+      cur = parent;
+    }
+  }
+  const descendants = tweets.filter(t => t !== focal && !ancestors.includes(t));
+  return { ancestors, focal, descendants };
+}
+
+// ---------- Posting to X ----------
+// The app gets an answer straight away (old apps give up after ~15s, and posting takes longer);
+// the server then posts on x.com in the background. Nothing is retried automatically, so a slow
+// post can never turn into a double post. Results are listed at /debug/posts.
+const postLog = [];       // newest first
+let postQueue = Promise.resolve();
+const recentPostKeys = new Map();
+
+function logPost(entry) {
+  postLog.unshift({ at: new Date().toISOString(), ...entry });
+  if (postLog.length > 30) postLog.pop();
+  console.log(`[XitterBridge Post] ${entry.kind} ${entry.ok ? 'OK' : 'FAILED'}: ${entry.detail || ''}`);
+}
+
+function toXUrl(text) {
+  return String(text || '').replace(/https?:\/\/(?:www\.|mobile\.)?twitter\.com\//gi, 'https://x.com/');
+}
+
+function enqueuePost(job) {
+  // Same post text, or the same action on the same tweet twice in a row within 2 minutes, is a
+  // double-send by the app. A different action in between (like, unlike, like) is allowed.
+  const key = job.tweetId ? `tweet:${job.tweetId}` : `post:${job.text || ''}:${job.replyTo || ''}`;
+  const last = recentPostKeys.get(key);
+  if (last && last.kind === job.kind && Date.now() - last.at < 2 * 60 * 1000) {
+    logPost({ kind: job.kind, ok: false, detail: 'skipped: identical request within 2 minutes (the app probably sent it twice)' });
+    return;
+  }
+  recentPostKeys.set(key, { kind: job.kind, at: Date.now() });
+  if (recentPostKeys.size > 200) recentPostKeys.delete(recentPostKeys.keys().next().value);
+  postQueue = postQueue.then(() => runPostJob(job)).catch(() => {});
+}
+
+// Stand-in ids the app was given -> what they really are on X.
+const localPostIds = new Map();     // stand-in id of a posted tweet -> real tweet id (once X confirms)
+const localRetweetIds = new Map();  // stand-in id of a retweet -> id of the tweet that was retweeted
+
+// Presses a button (by data-testid) on one specific tweet on its page.
+function clickInTweet(page, id, testid) {
+  return page.evaluate((id, testid) => {
+    const arts = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+    const own = a => Array.from(a.querySelectorAll('a[href*="/status/"]')).some(l => {
+      const h = (l.getAttribute('href') || '').split('?')[0].replace(/\/(photo|video|analytics|quotes|retweets|likes).*$/, '');
+      return h.endsWith('/status/' + id);
+    });
+    const art = arts.find(a => own(a) && a.querySelector('time')) || arts.find(a => a.getAttribute('tabindex') === '-1');
+    if (!art) return 'no-tweet';
+    const b = art.querySelector(`[data-testid="${testid}"]`);
+    if (!b) return 'no-button';
+    b.click();
+    return 'ok';
+  }, String(id), testid);
+}
+
+const ACTIONS = {
+  like:      { button: 'like',      done: 'unlike',  op: 'FavoriteTweet' },
+  unlike:    { button: 'unlike',    done: 'like',    op: 'UnfavoriteTweet' },
+  unretweet: { button: 'unretweet', done: 'retweet', op: 'DeleteRetweet', confirm: '[data-testid="unretweetConfirm"]' },
+  delete:    { button: 'caret',                      op: 'DeleteTweet', menu: 'Delete', confirm: '[data-testid="confirmationSheetConfirm"]' }
+};
+
+// mode 'delete': drop that tweet. mode 'unretweet': drop only YOUR retweets of it (the original stays).
+async function removeFromWorker(id, mode) {
+  const workerUrl = process.env.WORKER_URL, secret = process.env.BRIDGE_SECRET;
+  const me = cachedAccountProfile && cachedAccountProfile.id_str;
+  const isMyRetweetOf = t => !!(t && t.retweeted_status && String(t.retweeted_status.id_str) === id && t.user && me && t.user.id_str === me);
+  const drop = t => mode === 'unretweet' ? isMyRetweetOf(t) : (t && String(t.id_str) === id);
+  for (let i = localTimeline.length - 1; i >= 0; i--) if (drop(localTimeline[i])) localTimeline.splice(i, 1);
+  if (!workerUrl || !secret) return;
+  try {
+    const raw = await getRawTimelineFromWorker();
+    const kept = raw.filter(t => !drop(t));
+    if (kept.length !== raw.length) {
+      await fetch(`${workerUrl}/update-timeline`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Bridge-Secret': secret }, body: JSON.stringify(kept) });
+    }
+  } catch (e) {}
+}
+
+async function runTweetAction(page, sink, job) {
+  const a = ACTIONS[job.kind];
+  await page.goto(`https://x.com/i/status/${encodeURIComponent(job.tweetId)}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+  await page.waitForSelector('article[data-testid="tweet"]', { timeout: 25000 });
+  await new Promise(r => setTimeout(r, 1500));
+  const done = page.waitForResponse(r => new RegExp('/' + a.op + '\\b').test(r.url()), { timeout: 20000 }).catch(() => null);
+  const clicked = await clickInTweet(page, job.tweetId, a.button);
+  if (clicked !== 'ok') {
+    // Already in the wanted state (e.g. liking a tweet you already liked) counts as done.
+    if (a.done && (await page.evaluate(t => !!document.querySelector(`article [data-testid="${t}"]`), a.done).catch(() => false))) {
+      return { ok: true, detail: `already ${job.kind === 'like' ? 'liked' : job.kind === 'unlike' ? 'not liked' : 'not retweeted'}` };
+    }
+    return { ok: false, detail: clicked === 'no-tweet' ? 'tweet not found on X (deleted or not visible)' : `no "${a.button}" button on that tweet` };
+  }
+  if (a.menu) {
+    await page.waitForSelector('[role="menuitem"]', { timeout: 10000 });
+    const picked = await page.evaluate(label => {
+      const item = Array.from(document.querySelectorAll('[role="menuitem"]')).find(m => (m.textContent || '').trim().startsWith(label));
+      if (!item) return false;
+      item.click();
+      return true;
+    }, a.menu);
+    if (!picked) return { ok: false, detail: `no "${a.menu}" in the tweet's menu (only your own tweets can be deleted)` };
+  }
+  if (a.confirm) {
+    await page.waitForSelector(a.confirm, { timeout: 10000 });
+    await page.click(a.confirm);
+  }
+  await done;
+  await Promise.allSettled(sink.pending);
+  if (sink.actionOp === a.op && sink.actionOk) return { ok: true, detail: `${job.kind} ${job.tweetId} done` };
+  return { ok: false, detail: sink.createdError || `pressed the button but X did not confirm` };
+}
+
+async function runPostJob(job) {
+  const tokens = await getTokens();
+  if (!tokens.auth_token || !tokens.ct0) return logPost({ kind: job.kind, ok: false, detail: 'no X cookies' });
+  if (!(await acquireBrowser(180000))) return logPost({ kind: job.kind, ok: false, detail: 'browser was busy for 3 minutes; not posted' });
+  let browser;
+  const sink = newSink();
+  const watchdog = startWatchdog(() => browser, `Posting (${job.kind})`);
+  try {
+    const opened = await openXPage(tokens);
+    browser = opened.browser;
+    const page = opened.page;
+    attachGraphQLCapture(page, sink);
+    if (ACTIONS[job.kind]) {
+      const r = await runTweetAction(page, sink, job);
+      if (r.ok && (job.kind === 'delete' || job.kind === 'unretweet')) removeFromWorker(job.tweetId, job.kind).catch(() => {});
+      return logPost({ kind: job.kind, ok: r.ok, detail: r.detail });
+    }
+    if (job.kind === 'retweet') {
+      await page.goto(`https://x.com/intent/retweet?tweet_id=${encodeURIComponent(job.tweetId)}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      const btn = '[data-testid="confirmationSheetConfirm"]';
+      await page.waitForSelector(btn, { timeout: 25000 });
+      const done = page.waitForResponse(r => /\/CreateRetweet\b/.test(r.url()), { timeout: 20000 }).catch(() => null);
+      await page.click(btn);
+      await done;
+      await Promise.allSettled(sink.pending);
+      if (sink.retweetedId) return logPost({ kind: 'retweet', ok: true, detail: `retweeted ${job.tweetId}` });
+      return logPost({ kind: 'retweet', ok: false, detail: sink.createdError || 'clicked Repost but X did not confirm' });
+    }
+    let url = `https://x.com/intent/post?text=${encodeURIComponent(job.text)}`;
+    if (job.replyTo) url += `&in_reply_to=${encodeURIComponent(job.replyTo)}`;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+    const btn = '[data-testid="tweetButton"]:not([aria-disabled="true"])';
+    await page.waitForSelector(btn, { timeout: 25000 });
+    const done = page.waitForResponse(r => /\/CreateTweet\b/.test(r.url()), { timeout: 20000 }).catch(() => null);
+    await page.click(btn);
+    await done;
+    await Promise.allSettled(sink.pending);
+    if (sink.created && sink.created.id_str) {
+      const real = sanitizeTweet(sink.created, STORE);
+      // Swap the stand-in the app was given for the real tweet.
+      const i = localTimeline.findIndex(t => t.id_str === job.localId);
+      if (i >= 0) localTimeline.splice(i, 1);
+      if (job.localId) localPostIds.set(job.localId, real.id_str);
+      localTimeline.unshift(real);
+      appendCachedTimelineToWorker([real]).catch(() => {});
+      return logPost({ kind: job.kind, ok: true, detail: `posted as ${real.id_str}${job.replyTo ? ' (reply to ' + job.replyTo + ')' : ''}` });
+    }
+    return logPost({ kind: job.kind, ok: false, detail: sink.createdError || 'clicked Post but X did not confirm' });
+  } catch (e) {
+    return logPost({ kind: job.kind, ok: false, detail: `could not post: ${e && e.message ? e.message : e}` });
+  } finally {
+    clearTimeout(watchdog);
+    if (browser) await browser.close().catch(() => {});
+    isScraping = false;
+  }
 }
 
 // ---------- Search ----------
@@ -1448,6 +1925,20 @@ app.get('/debug/user', (req, res) => {
   });
 });
 
+// What happened to the last posts/retweets: /debug/posts
+app.get('/debug/posts', (req, res) => res.status(200).json({ queued_or_recent: postLog }));
+
+// What the server got from x.com/notifications: /debug/notifications
+app.get('/debug/notifications', async (req, res) => {
+  if (!scrapeStats.lastNotifications) await Promise.race([scrapeNotifications(), new Promise(r => setTimeout(r, 60000))]);
+  return res.status(200).json({
+    last_fetch: scrapeStats.lastNotifications || 'no fetch finished yet, reload in a minute',
+    first_items: (notificationsCache.items || []).slice(0, 5).map(n => ({ type: n.type, at: new Date(n.at).toISOString(), from: (n.users || []).map(u => u.screen_name), tweet: n.tweets && n.tweets[0] ? (n.tweets[0].text || '').slice(0, 80) : null })),
+    last_error: scrapeStats.lastError,
+    raw_samples_from_x: lastNotificationsRaw
+  });
+});
+
 // What the server got from X's Explore page: /debug/trends (starts a fetch if none has run yet)
 app.get('/debug/trends', async (req, res) => {
   if (!scrapeStats.lastTrends) await Promise.race([scrapeTrends(), new Promise(r => setTimeout(r, 60000))]);
@@ -1463,6 +1954,7 @@ app.get('/debug/trends', async (req, res) => {
 app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
     cookieSource: tokenSource,
+    forceLogin: FORCE_LOGIN,
     imageProxy: IMAGE_PROXY,
     avatarSize: AVATAR_SIZE,
     videoMode: VIDEO_MODE,
@@ -1567,8 +2059,8 @@ app.all('/oauth/access_token', async (req, res) => {
   const activeUserId = cachedAccountProfile?.id_str || "12345678";
   const activeScreenName = cachedAccountProfile?.screen_name || "x_user";
   
-  const accessToken = `xitter_access_${activeScreenName}`;
-  const accessTokenSecret = `xitter_secret_${activeUserId}`;
+  const accessToken = bridgeAccessToken();
+  const accessTokenSecret = bridgeAccessSecret();
 
   res.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=utf-8');
   return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
@@ -1853,6 +2345,147 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
   return res.status(200).json(filterByIdRange(userTweets, req.query));
 });
 
+// ---------- Windows 10 Twitter app ----------
+// Layouts below were read from the app itself (Twitter.Windows.dll data classes + its bundled
+// js/Hometimeline.json sample). The app parses with Newtonsoft (case-insensitive, unknown keys ignored).
+
+// Home timeline: a plain list of tweets, exactly like the sample file the app ships with.
+app.get(['/1.1/timeline/home.json', '/1/timeline/home.json'], async (req, res) => {
+  backgroundScrape();
+  let timeline = [...localTimeline, ...(await getCachedTimelineFromWorker())].map(t => sanitizeTweet(t));
+  const byId = new Map(); timeline.forEach(t => byId.set(t.id_str, t));
+  timeline = Array.from(byId.values()).sort((a, b) => { try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; } });
+  timeline = filterByIdRange(timeline, { since_id: req.query.since_id || req.query.up_cursor, max_id: req.query.max_id || req.query.down_cursor }).slice(0, Number(req.query.count) || 50);
+  console.log(`[XitterBridge timeline/home] ${timeline.length} tweets (Windows 10 app)`);
+  return res.status(200).json(timeline);
+});
+
+// ---------- Moments (rebuilt from trending topics) ----------
+// X ended Moments in 2022, so each current trend becomes a Moment: title = trend, cover = the first
+// picture among its top tweets, pages/tweets = its top search results.
+//   categories.json -> MomentCategoryResponseModel { nav: { default_category_id, categories: [{ category_id, name }] } }
+//   guide.json      -> MomentGuideResponseModel    { modules: [{ module_type, moments: [MomentModuleModel] }] }
+//   capsule.json    -> MomentModuleModel           { moment, tweets: [...], pages: [MomentMedia] }
+//   MomentModel     { id, title, description, url, is_live, time_string, subcategory_string,
+//                     subcategory_favicon_url, sensitive, can_subscribe, is_subscribed, cover_media }
+//   MomentMedia     { tweet_id, type, media: { media_id, size, url, display_url }, render: { crops } }
+const MOMENT_CATEGORIES = [
+  { category_id: 'today', name: 'Today' },
+  { category_id: 'trending', name: 'Trending' }
+];
+const momentIndex = new Map(); // moment id -> trend
+
+function momentIdFor(trend) {
+  return String(parseInt(crypto.createHash('sha1').update(String(trend.name).toLowerCase()).digest('hex').slice(0, 12), 16));
+}
+
+async function ensureTrends() {
+  if (!(trendsCache.trends && Date.now() - trendsCache.fetchedAt < 15 * 60 * 1000)) {
+    const job = scrapeTrends();
+    if (!trendsCache.trends) await Promise.race([job, new Promise(r => setTimeout(r, SEARCH_WAIT_MS))]);
+  }
+  return trendsCache.trends || FALLBACK_TRENDS;
+}
+
+function cropsFor(w, h) {
+  const sq = Math.min(w, h);
+  const pw = Math.min(w, Math.round(h * 9 / 16)), ph = Math.min(h, Math.round(w * 16 / 9));
+  return {
+    no_crop: { x: 0, y: 0, w, h },
+    square: { x: Math.round((w - sq) / 2), y: Math.round((h - sq) / 2), w: sq, h: sq },
+    portrait_9_16: { x: Math.round((w - pw) / 2), y: Math.round((h - ph) / 2), w: pw, h: ph }
+  };
+}
+
+// One page / cover of a Moment, built from a tweet (with its first picture if it has one).
+function momentMediaFromTweet(t) {
+  const m = t.extended_entities && t.extended_entities.media && t.extended_entities.media[0];
+  if (!m) return { tweet_id: t.id_str, type: 'text' };
+  const large = (m.sizes && m.sizes.large) || { w: 1200, h: 1200 };
+  const w = Number(large.w) || 1200, h = Number(large.h) || 1200;
+  return {
+    tweet_id: t.id_str,
+    type: m.type === 'video' || m.type === 'animated_gif' ? 'video' : 'image',
+    media: { media_id: m.id_str, size: { w, h }, url: m.media_url_https, display_url: m.display_url, media_url_https: m.media_url_https, media_url: m.media_url },
+    render: { crops: cropsFor(w, h) }
+  };
+}
+
+function momentTweets(trend) {
+  const found = searchCache.get(`top:${String(trend.query).toLowerCase()}`);
+  return found ? found.tweets.map(t => sanitizeTweet(t)).slice(0, 25) : [];
+}
+
+function momentModel(trend, tweets) {
+  const id = momentIdFor(trend);
+  momentIndex.set(id, trend);
+  const coverTweet = tweets.find(t => t.extended_entities && t.extended_entities.media && t.extended_entities.media.length);
+  return {
+    id,
+    title: trend.name,
+    description: trend.volumeText ? `${trend.name} · ${trend.volumeText}` : `What people are saying about ${trend.name}`,
+    url: `https://twitter.com/i/moments/${id}`,
+    is_live: true,
+    time_string: trend.volumeText || 'Trending now',
+    subcategory_string: trend.context || 'Trending',
+    subcategory_favicon_url: null,
+    sensitive: false,
+    can_subscribe: false,
+    is_subscribed: false,
+    cover_media: coverTweet ? momentMediaFromTweet(coverTweet) : null
+  };
+}
+
+function momentModuleModel(trend, withContents) {
+  const tweets = momentTweets(trend);
+  const out = { moment: momentModel(trend, tweets) };
+  if (withContents) {
+    out.tweets = tweets;
+    out.pages = tweets.map(momentMediaFromTweet);
+  }
+  return out;
+}
+
+// Covers come from each trend's top tweets: fetch the first few trends' results in the background.
+let momentPrefetchAt = 0;
+function prefetchMomentCovers(trends) {
+  if (Date.now() - momentPrefetchAt < 10 * 60 * 1000) return;
+  momentPrefetchAt = Date.now();
+  trends.slice(0, 5).reduce((p, t) => p.then(() => searchCache.has(`top:${String(t.query).toLowerCase()}`) ? null : scrapeSearch(t.query, 'top')).catch(() => {}), Promise.resolve());
+}
+
+app.get(['/1.1/moments/categories.json', '/1/moments/categories.json'], async (req, res) => {
+  console.log(`[XitterBridge Moments] categories requested`);
+  return res.status(200).json({ nav: { default_category_id: 'today', categories: MOMENT_CATEGORIES } });
+});
+
+app.get(['/1.1/moments/guide.json', '/1/moments/guide.json'], async (req, res) => {
+  const trends = await ensureTrends();
+  prefetchMomentCovers(trends);
+  const list = req.query.guide_category_id === 'trending' ? trends.slice(5, 25) : trends.slice(0, 20);
+  const items = list.map(t => momentModuleModel(t, false));
+  const modules = [];
+  if (items.length) modules.push({ module_type: 'hero', moments: items.slice(0, 1) });
+  if (items.length > 1) modules.push({ module_type: 'list', moments: items.slice(1) });
+  const withCover = items.filter(i => i.moment.cover_media).length;
+  console.log(`[XitterBridge Moments] guide (${req.query.guide_category_id || 'default'}): ${items.length} moments from trends, ${withCover} with cover pictures so far`);
+  return res.status(200).json({ modules });
+});
+
+app.get(['/1.1/moments/capsule.json', '/1/moments/capsule.json', '/1.1/moments/capsule/:id.json'], async (req, res) => {
+  const id = String(req.query.moment_id || req.query.id || (req.params && req.params.id) || '').replace('.json', '');
+  let trend = momentIndex.get(id);
+  if (!trend) { const trends = await ensureTrends(); trend = trends.find(t => momentIdFor(t) === id); }
+  if (!trend) {
+    console.log(`[XitterBridge Moments] moment ${id} isn't a current trend anymore`);
+    return res.status(200).json({ errors: [{ code: 34, message: 'Sorry, that page does not exist.' }] });
+  }
+  await getSearch(trend.query, 'top'); // loads (or reuses) the trend's top tweets
+  const body = momentModuleModel(trend, true);
+  console.log(`[XitterBridge Moments] opened "${trend.name}": ${body.pages.length} pages${body.pages.length ? '' : ' (X still loading, open it again shortly)'}`);
+  return res.status(200).json(body);
+});
+
 // Profile "media" section: that person's tweets with pictures or videos.
 app.get(['/1.1/statuses/media_timeline.json', '/1/statuses/media_timeline.json'], async (req, res) => {
   const target = req.query.screen_name || handleForUserId(req.query.user_id) || (req.query.user_id && cachedAccountProfile && idMatches(req.query.user_id, cachedAccountProfile.id_str) ? cachedAccountProfile.screen_name : '');
@@ -1873,48 +2506,22 @@ app.get(['/1/users/recommendations.json', '/1.1/users/recommendations.json'], (r
 app.get(['/1.1/users/suggestions.json', '/1/users/suggestions.json'], (req, res) => res.status(200).json([]));
 app.get(['/1.1/saved_searches/list.json', '/1/saved_searches/list.json'], (req, res) => res.status(200).json([]));
 
+// Notifications tab: real notifications from X (no more made-up ones).
 app.get(['/1.1/activity/about_me.json', '/1/activity/about_me.json'], async (req, res) => {
-  backgroundScrape();
-  const cachedTweets = await getCachedTimelineFromWorker();
-  const sourceList = localNotifications.length > 0 ? localNotifications : cachedTweets.slice(0, 20);
-  const acc = cachedAccountProfile || { id: 12345678, id_str: "12345678", name: "User", screen_name: "x_user" };
-
-  const activities = sourceList.map((t, idx) => {
-    let actionType = "favorite";
-    if (t.retweeted_status || idx % 4 === 0) {
-      actionType = "retweet";
-    } else if (t.in_reply_to_status_id || idx % 4 === 1) {
-      actionType = "reply";
-    } else if (idx % 4 === 2) {
-      actionType = "mention";
-    } else if (idx % 4 === 3) {
-      actionType = "follow";
-    }
-
-    if (actionType === "follow") {
-      return {
-        action: "follow",
-        max_position: String(t.id || Date.now()),
-        min_position: "1234567890",
-        created_at: t.created_at || formatTwitterDate(),
-        sources: [t.user || acc],
-        targets: [acc],
-        target_objects: []
-      };
-    }
-
-    return {
-      action: actionType,
-      max_position: String(t.id || Date.now()),
-      min_position: "1234567890",
-      created_at: t.created_at || formatTwitterDate(),
-      sources: [t.user || acc],
-      targets: [acc],
-      target_objects: [t]
-    };
-  });
-
-  return res.status(200).json(activities);
+  const fresh = notificationsCache.items && Date.now() - notificationsCache.fetchedAt < 2 * 60 * 1000;
+  if (!fresh) {
+    const job = scrapeNotifications();
+    if (!notificationsCache.items) await Promise.race([job, new Promise(r => setTimeout(r, SEARCH_WAIT_MS))]);
+  }
+  const me = sanitizeUser(cachedAccountProfile);
+  let items = (notificationsCache.items || []).map(n => notificationToActivity(n, me)).filter(Boolean);
+  // Positions are millisecond times. Only honour ones that look like times (older app values were tweet ids).
+  const since = Number(req.query.since_id), max = Number(req.query.max_id);
+  if (since > 1e12) items = items.filter(a => Number(a.max_position) > since);
+  if (req.query.max_id) items = max > 1e12 ? items.filter(a => Number(a.max_position) < max) : [];
+  items = items.slice(0, Number(req.query.count) || 30);
+  console.log(`[XitterBridge about_me] ${notificationsCache.items ? items.length + ' real notifications' : 'X still loading notifications (reopen shortly)'}`);
+  return res.status(200).json(items);
 });
 
 app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/summary.json'], async (req, res) => {
@@ -1930,26 +2537,31 @@ app.get(['/1.1/statuses/:id/activity/summary.json', '/1/statuses/:id/activity/su
   });
 });
 
-app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
-  const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
+// Replies under a tweet, fetched from the tweet's page on X.
+async function resolveConversation(rawId) {
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = findTweetById(allTweets, tweetId);
+  const known = findTweetById(allTweets, rawId);
+  const fullId = known ? String(known.id_str) : String(rawId);
+  const conv = await getConversation(fullId);
+  const list = conv && conv.tweets.length ? conv.tweets : allTweets.filter(t => t.id_str === fullId || t.in_reply_to_status_id_str === fullId);
+  const parts = splitConversation(list, fullId);
+  if (!parts.focal && known) parts.focal = sanitizeTweet(known);
+  console.log(`[XitterBridge replies] tweet ${fullId}: ${parts.descendants.length} replies, ${parts.ancestors.length} above ${conv && conv.tweets.length ? '(from X)' : '(X still loading, open again shortly)'}`);
+  return parts;
+}
 
-  if (!found) return res.status(200).json({ ids: [], statuses: [], globalObjects: { tweets: {}, users: {} } });
-
-  const parentIdStr = String(found.id_str || found.id);
-  let replies = allTweets.filter(t => {
-    const replyTo = String(t.in_reply_to_status_id_str || t.in_reply_to_status_id || '');
-    return replyTo === parentIdStr || replyTo.slice(-9) === parentIdStr.slice(-9);
-  });
-
-  const statuses = [sanitizeTweet(found), ...replies.map(r => sanitizeTweet(r))];
+app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conversation/show/:id.json', '/1/conversation/show/:id.json', '/1/conversation/show/:id', '/1/conversation/show/:id'], async (req, res) => {
+  const tweetId = String(req.query.id || req.params.id || '').replace('.json', '');
+  if (!tweetId) return res.status(200).json([]);
+  const { ancestors, focal, descendants } = await resolveConversation(tweetId);
+  const statuses = [...ancestors, ...(focal ? [focal] : []), ...descendants];
   return res.status(200).json({
     ids: statuses.map(s => s.id_str),
-    statuses: statuses,
+    statuses,
     conversation: statuses,
-    descendants: replies.map(r => sanitizeTweet(r)),
+    ancestors,
+    descendants,
     globalObjects: {
       tweets: statuses.reduce((acc, t) => { acc[t.id_str] = t; return acc; }, {}),
       users: statuses.reduce((acc, t) => { if (t.user) acc[t.user.id_str] = t.user; return acc; }, {})
@@ -1957,11 +2569,25 @@ app.get(['/1.1/conversation/show.json', '/1/conversation/show.json', '/1.1/conve
   });
 });
 
+// Older apps ask for replies this way: a list of groups, each with results annotated Ancestor/Descendant.
+app.get(['/1/related_results/show/:id.json', '/1.1/related_results/show/:id.json', '/1/related_results/show/:id', '/1.1/related_results/show/:id'], async (req, res) => {
+  const tweetId = String(req.params.id || '').replace('.json', '');
+  const { ancestors, descendants } = await resolveConversation(tweetId);
+  const asResult = role => t => ({ kind: 'Tweet', score: 1, value: t, annotations: { ConversationRole: role } });
+  const results = [...ancestors.map(asResult('Ancestor')), ...descendants.map(asResult('Descendant'))];
+  return res.status(200).json(results.length ? [{ resultType: 'Tweet', groupName: 'TweetsWithConversation', score: 1, results }] : []);
+});
+
 app.get(['/1.1/statuses/show/:id.json', '/1.1/statuses/show/:id', '/1/statuses/show/:id.json'], async (req, res) => {
   const tweetId = String(req.params.id).replace('.json', '');
   const cachedTweets = await getCachedTimelineFromWorker();
   const allTweets = [...localTimeline, ...cachedTweets];
-  const found = findTweetById(allTweets, tweetId);
+  let found = findTweetById(allTweets, tweetId) || findInConversations(tweetId);
+  if (!found) {
+    // Not loaded anywhere yet (e.g. a tweet you opened from a notification): get it from X.
+    const conv = await getConversation(tweetId);
+    found = conv ? conv.tweets.find(t => t.id_str === tweetId) : null;
+  }
   if (!found) return res.status(200).json({});
   return res.status(200).json(sanitizeTweet(found));
 });
@@ -2239,27 +2865,124 @@ app.get(['/1.1/search/typeahead.json', '/1/search/typeahead.json'], async (req, 
   });
 });
 
-app.post('/1.1/statuses/update.json', (req, res) => {
-  const tweetText = req.body.status || req.query.status || "";
-  const inReplyToStatusId = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id;
-  const author = cachedAccountProfile;
+// Post a tweet, reply, or quote tweet to X for real.
+app.post(['/1.1/statuses/update.json', '/1/statuses/update.json'], async (req, res) => {
+  const tweetText = String(req.body.status || req.query.status || '');
+  let inReplyTo = req.body.in_reply_to_status_id || req.query.in_reply_to_status_id || null;
+  const attachmentUrl = req.body.attachment_url || req.query.attachment_url || '';
+  if (!tweetText.trim() && !attachmentUrl) return res.status(200).json({ errors: [{ code: 170, message: 'Missing required parameter: status.' }] });
 
-  const newTweet = sanitizeTweet({
-    created_at: formatTwitterDate(), id: Date.now().toString(), id_str: Date.now().toString(),
-    text: tweetText, full_text: tweetText, source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
-    truncated: false, in_reply_to_status_id: inReplyToStatusId || null,
-    in_reply_to_status_id_str: inReplyToStatusId ? String(inReplyToStatusId) : null,
-    user: author, retweet_count: 0, favorite_count: 0,
-    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] }, favorited: false, retweeted: false
+  // The app may send a rounded or shortened id; use the full one if we know the tweet.
+  const allTweets = [...localTimeline, ...(await getCachedTimelineFromWorker())];
+  let quoted = null;
+  if (inReplyTo) {
+    const parent = findTweetById(allTweets, inReplyTo) || allTweets.find(t => idMatches(t.id_str, inReplyTo));
+    if (parent) inReplyTo = parent.id_str;
+  }
+  // Quote tweets: old apps put the tweet's link in the text, newer ones send attachment_url.
+  let text = toXUrl(tweetText);
+  const quoteLink = attachmentUrl ? toXUrl(attachmentUrl) : (text.match(/https:\/\/x\.com\/[A-Za-z0-9_]+\/status\/\d+\S*$/) || [])[0];
+  if (attachmentUrl && !text.includes(quoteLink)) text = `${text} ${quoteLink}`.trim();
+  if (quoteLink) {
+    const qid = (quoteLink.match(/status\/(\d+)/) || [])[1];
+    quoted = qid ? (findTweetById(allTweets, qid) || null) : null;
+  }
+
+  const localId = String(Date.now());
+  const stand_in = sanitizeTweet({
+    created_at: new Date().toISOString(), id_str: localId,
+    text, full_text: text, source: '<a href="http://twitter.com" rel="nofollow">Twitter for Windows Phone</a>',
+    in_reply_to_status_id_str: inReplyTo ? String(inReplyTo) : null,
+    user: cachedAccountProfile, retweet_count: 0, favorite_count: 0,
+    entities: { hashtags: [], symbols: [], user_mentions: [], urls: [] },
+    quoted_status: quoted || undefined
   });
-
-  localTimeline.unshift(newTweet);
-  appendCachedTimelineToWorker([newTweet]);
-  return res.status(200).json(newTweet);
+  localTimeline.unshift(stand_in);
+  enqueuePost({ kind: quoted ? 'quote' : (inReplyTo ? 'reply' : 'tweet'), text, replyTo: inReplyTo, localId });
+  return res.status(200).json(stand_in);
 });
 
-app.post('/1.1/favorites/create.json', (req, res) => res.status(200).json({ favorited: true }));
-app.post('/1.1/favorites/destroy.json', (req, res) => res.status(200).json({ favorited: false }));
+// Retweet for real.
+app.post(['/1.1/statuses/retweet/:id.json', '/1/statuses/retweet/:id.json', '/1.1/statuses/retweet/:id', '/1/statuses/retweet/:id'], async (req, res) => {
+  const rawId = String(req.params.id || '').replace('.json', '');
+  const allTweets = [...localTimeline, ...(await getCachedTimelineFromWorker())];
+  const original = findTweetById(allTweets, rawId) || allTweets.find(t => idMatches(t.id_str, rawId));
+  const targetId = original ? original.id_str : rawId;
+  enqueuePost({ kind: 'retweet', tweetId: targetId });
+  const orig = original ? sanitizeTweet(original) : null;
+  const rt = sanitizeTweet({
+    created_at: new Date().toISOString(), id_str: String(Date.now()),
+    text: orig && orig.user ? `RT @${orig.user.screen_name}: ${orig.text}` : '', user: cachedAccountProfile,
+    retweet_count: 0, favorite_count: 0, entities: {}, retweeted: true,
+    retweeted_status: orig ? { ...orig, retweeted: true, retweet_count: (orig.retweet_count || 0) + 1 } : undefined
+  });
+  localRetweetIds.set(rt.id_str, targetId);
+  return res.status(200).json({ ...rt, retweeted: true });
+});
+
+// Finds a tweet the app refers to (full, shortened or rounded id) in everything the server has loaded.
+async function findAnyTweet(rawId) {
+  const id = String(rawId || '').replace('.json', '');
+  const all = [...localTimeline, ...(await getCachedTimelineFromWorker())];
+  return all.find(t => t.id_str === id) || findInConversations(id) || findTweetById(all, id) || all.find(t => idMatches(t.id_str, id)) || null;
+}
+
+// Like / unlike for real.
+async function likeEndpoint(req, res, kind) {
+  const rawId = String(req.body?.id || req.query.id || '');
+  if (!rawId) return res.status(200).json({ errors: [{ code: 170, message: 'Missing required parameter: id.' }] });
+  const t = await findAnyTweet(rawId);
+  const targetId = t ? t.id_str : rawId;
+  enqueuePost({ kind, tweetId: targetId });
+  const out = t ? sanitizeTweet(t) : sanitizeTweet({ id_str: targetId, text: '', user: null, entities: {} });
+  const liked = kind === 'like';
+  return res.status(200).json({ ...out, favorited: liked, favorite_count: Math.max(0, (out.favorite_count || 0) + (liked ? 1 : -1)) });
+}
+app.post(['/1.1/favorites/create.json', '/1/favorites/create.json'], (req, res) => likeEndpoint(req, res, 'like'));
+app.post(['/1.1/favorites/destroy.json', '/1/favorites/destroy.json'], (req, res) => likeEndpoint(req, res, 'unlike'));
+
+// Undo a retweet. The app may send the original tweet's id or the id of its retweet.
+app.post(['/1.1/statuses/unretweet/:id.json', '/1/statuses/unretweet/:id.json', '/1.1/statuses/unretweet/:id', '/1/statuses/unretweet/:id'], async (req, res) => {
+  const rawId = String(req.params.id || '').replace('.json', '');
+  let targetId = localRetweetIds.get(rawId);
+  const t = await findAnyTweet(targetId || rawId);
+  if (!targetId) targetId = t && t.retweeted_status ? t.retweeted_status.id_str : (t ? t.id_str : rawId);
+  enqueuePost({ kind: 'unretweet', tweetId: targetId });
+  const orig = t ? sanitizeTweet(t.retweeted_status || t) : sanitizeTweet({ id_str: targetId, text: '', user: null, entities: {} });
+  return res.status(200).json({ ...orig, retweeted: false, retweet_count: Math.max(0, (orig.retweet_count || 0) - 1) });
+});
+
+// Delete. Old apps also "delete" a retweet to undo it, so retweets become an unretweet.
+app.post(['/1.1/statuses/destroy/:id.json', '/1/statuses/destroy/:id.json', '/1.1/statuses/destroy/:id', '/1/statuses/destroy/:id'], async (req, res) => {
+  const rawId = String(req.params.id || '').replace('.json', '');
+  const me = cachedAccountProfile && cachedAccountProfile.id_str;
+  if (localRetweetIds.has(rawId)) {
+    const target = localRetweetIds.get(rawId);
+    enqueuePost({ kind: 'unretweet', tweetId: target });
+    localRetweetIds.delete(rawId);
+    const i = localTimeline.findIndex(x => x.id_str === rawId);
+    if (i >= 0) localTimeline.splice(i, 1);
+    return res.status(200).json(sanitizeTweet({ id_str: rawId, text: '', user: cachedAccountProfile, entities: {} }));
+  }
+  const t = await findAnyTweet(localPostIds.get(rawId) || rawId);
+  if (t && t.retweeted_status && t.user && me && t.user.id_str === me) {
+    enqueuePost({ kind: 'unretweet', tweetId: t.retweeted_status.id_str });
+    return res.status(200).json(sanitizeTweet(t));
+  }
+  const realId = localPostIds.get(rawId) || (t ? t.id_str : rawId);
+  if (/^\d{13}$/.test(realId) && !localPostIds.has(rawId)) {
+    // A stand-in whose real post hasn't been confirmed yet: there is nothing on X to delete yet.
+    logPost({ kind: 'delete', ok: false, detail: `not deleted: that post (${rawId}) hasn't finished posting yet - try again in a minute` });
+    return res.status(200).json(t ? sanitizeTweet(t) : {});
+  }
+  if (t && t.user && me && t.user.id_str !== me) {
+    logPost({ kind: 'delete', ok: false, detail: `not deleted: ${realId} isn't your tweet` });
+    return res.status(200).json(sanitizeTweet(t));
+  }
+  enqueuePost({ kind: 'delete', tweetId: realId });
+  return res.status(200).json(t ? sanitizeTweet(t) : sanitizeTweet({ id_str: realId, text: '', user: cachedAccountProfile, entities: {} }));
+});
+
 app.get('/1.1/favorites/list.json', (req, res) => res.status(200).json([]));
 
 app.get('/1.1/friends/list.json', (req, res) => res.status(200).json({ users: [], next_cursor: 0 }));
@@ -2279,6 +3002,7 @@ app.post(['/1.1/direct_messages/new.json', '/1.1/direct_messages/events/new.json
 app.all('*', (req, res) => {
   const path = req.path;
   console.log(`[XitterBridge] Unhandled endpoint hit: ${path}`);
+  if (path.includes('/moments')) console.log(`[XitterBridge Moments] UNHANDLED Moments request: ${req.method} ${req.originalUrl} - paste this line so it can be added`);
   if (path.includes('/ids')) return res.status(200).json({ ids: [], previous_cursor: 0, next_cursor: 0, previous_cursor_str: "0", next_cursor_str: "0" });
   if (path.includes('/list') || path.includes('/timeline') || path.includes('/lookup')) return res.status(200).json([]);
   return res.status(200).json({});
