@@ -816,9 +816,10 @@ function newSink() {
 // Render's small instance can only run ONE headless browser. Every job waits for its turn; nothing forces
 // its way in (that caused "Timed out ... waiting for the WS endpoint" when two started at once).
 const BROWSER_JOB_LIMIT_MS = 110000; // a stuck job gets its browser closed after this
-async function acquireBrowser(maxWaitMs) {
+let homeScrapeQueued = false;   // a timeline refresh is waiting: it goes first
+async function acquireBrowser(maxWaitMs, priority = false) {
   const start = Date.now();
-  while (isScraping) {
+  while (isScraping || (!priority && homeScrapeQueued)) {
     if (Date.now() - start > maxWaitMs) return false;
     await new Promise(r => setTimeout(r, 500));
   }
@@ -1682,23 +1683,35 @@ async function appendCachedTimelineToWorker(newTweets) {
   } catch (e) {}
 }
 
+// The timeline refresh waits for its turn (and other jobs let it go first) instead of skipping when the
+// browser is busy - with Moments, search and suggestions it used to be skipped almost every time.
+let lastHomeScrapeAt = 0;
+const HOME_SCRAPE_EVERY_MS = 45000;
 async function backgroundScrape() {
-  const now = Date.now();
-  if (isScraping) {
-    // Another browser job is running. Never start a second browser; only recover from a flag left stuck.
-    if (now - lastScrapeTime > BROWSER_JOB_LIMIT_MS + 30000) { isScraping = false; } else { return; }
+  if (homeScrapeQueued) return;
+  if (Date.now() - lastHomeScrapeAt < HOME_SCRAPE_EVERY_MS) return;
+  homeScrapeQueued = true;
+  try {
+    const tokens = await getTokens();
+    console.log(`[XitterBridge Scraper] Token Check -> auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
+    if (!tokens.auth_token || !tokens.ct0) {
+      console.log(`[XitterBridge Scraper] ABORTED: Missing auth_token or ct0 cookies!`);
+      return;
+    }
+    if (isScraping && Date.now() - lastScrapeTime > BROWSER_JOB_LIMIT_MS + 30000) isScraping = false; // recover a stuck flag
+    if (!(await acquireBrowser(150000, true))) {
+      console.log('[XitterBridge Scraper] Browser stayed busy; timeline refresh skipped this time.');
+      return;
+    }
+    lastHomeScrapeAt = Date.now();
+    homeScrapeQueued = false; // running now: queued jobs line up behind it as usual
+    await runHomeScrape(tokens);
+  } finally {
+    homeScrapeQueued = false;
   }
-  isScraping = true;
-  lastScrapeTime = now;
+}
 
-  const tokens = await getTokens();
-  console.log(`[XitterBridge Scraper] Token Check -> auth_token present: ${!!tokens.auth_token}, ct0 present: ${!!tokens.ct0}`);
-
-  if (!tokens.auth_token || !tokens.ct0) {
-    console.log(`[XitterBridge Scraper] ABORTED: Missing auth_token or ct0 cookies!`);
-    isScraping = false;
-    return;
-  }
+async function runHomeScrape(tokens) {
 
   let browser;
   const sink = newSink();
