@@ -133,6 +133,48 @@ function writeGate(req, res, next) {
 }
 app.use(writeGate);
 
+// Your timeline, notifications, messages and "who am I" are personal: only an app signed in with this
+// bridge's key gets them. Everyone else (guest mode, or an app still holding an old login) gets what a
+// logged-out Twitter app saw: empty personal lists and "not signed in" for "who am I". Moments, search,
+// trends, profiles and single tweets stay open.
+const PERSONAL_EMPTY_LIST = [
+  /^\/1(\.1)?\/statuses\/(home_timeline|mentions_timeline)\.json$/,
+  /^\/1(\.1)?\/activity\/about_me\.json$/,
+  /^\/1(\.1)?\/direct_messages(\/sent)?\.json$/,
+  /^\/1(\.1)?\/(friends|followers)\/ids\.json$/,
+  /^\/1(\.1)?\/saved_searches\/list\.json$/
+];
+const PERSONAL_NOT_SIGNED_IN = [
+  /^\/1(\.1)?\/account\/verify_credentials\.json$/,
+  /^\/1(\.1)?\/account\/settings\.json$/,
+  /^\/1(\.1)?\/dm\//,
+  /^\/1(\.1)?\/direct_messages\//
+];
+function isSignedIn(req) { return requestAccessToken(req) === bridgeAccessToken(); }
+function personalGate(req, res, next) {
+  if (req.method !== 'GET' || isSignedIn(req)) return next();
+  const p = req.path;
+  if (/^\/1(\.1)?\/timeline\/home\.json$/.test(p)) {
+    console.log(`[XitterBridge] Not signed in -> logged-out (empty) home timeline`);
+    return res.status(200).json({ twitter_objects: { tweets: {}, users: {}, events: {} }, response: { timeline: [], cursor: { top: '0', bottom: '0' } } });
+  }
+  if (PERSONAL_EMPTY_LIST.some(rx => rx.test(p))) {
+    console.log(`[XitterBridge] Not signed in -> empty ${p}`);
+    if (/\/ids\.json$/.test(p)) return res.status(200).json({ ids: [], next_cursor: 0, next_cursor_str: '0', previous_cursor: 0, previous_cursor_str: '0' });
+    return res.status(200).json([]);
+  }
+  if (PERSONAL_NOT_SIGNED_IN.some(rx => rx.test(p))) {
+    console.log(`[XitterBridge] Not signed in -> "please sign in" for ${p}`);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.status(401).send(JSON.stringify({ errors: [{ code: 89, message: 'Invalid or expired token.' }] }));
+  }
+  return next();
+}
+app.use(personalGate);
+
+// Guest settings the Windows 10 app asks for before showing guest mode.
+app.get(['/1.1/mobile/settings/guest.json', '/1/mobile/settings/guest.json'], (req, res) => res.status(200).json({}));
+
 // Guest tokens, so guest mode works in apps that ask for one first.
 app.post(['/oauth2/token'], (req, res) => {
   return res.status(200).json({ token_type: 'bearer', access_token: 'AAAAAAAAAAAAAAAAAAAAAXitterBridgeGuestBearerToken' });
@@ -2063,6 +2105,7 @@ app.get('/debug/trends', async (req, res) => {
 app.get('/debug/scrape-status', (req, res) => {
   return res.status(200).json({
     cookieSource: tokenSource,
+    signInPassword: process.env.BRIDGE_PASSWORD ? 'set' : 'not set (any username/password signs in)',
     forceLogin: FORCE_LOGIN,
     imageProxy: IMAGE_PROXY,
     avatarSize: AVATAR_SIZE,
@@ -2156,6 +2199,17 @@ app.get('/oauth/callback', (req, res) => {
 app.all('/oauth/access_token', async (req, res) => {
   const usernameInput = (req.body.x_auth_username || req.query.x_auth_username || "").trim();
   const passwordInput = (req.body.x_auth_password || req.query.x_auth_password || "").trim();
+  const mode = req.body.x_auth_mode || req.query.x_auth_mode || (req.body.oauth_verifier || req.query.oauth_verifier ? 'oauth_verifier' : 'none');
+  console.log(`[XitterBridge Login] ${req.method} /oauth/access_token: mode=${mode}, username ${usernameInput ? 'given' : 'missing'}, password ${passwordInput ? 'given' : 'missing'}`);
+
+  // BRIDGE_PASSWORD (optional, set on Render): username/password sign-ins must use it, so only you can
+  // sign in. Any username works; X's own password is never needed or checked.
+  const required = process.env.BRIDGE_PASSWORD;
+  if (usernameInput && required && passwordInput !== required) {
+    console.log('[XitterBridge Login] Refused: wrong bridge password.');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.status(401).send(JSON.stringify({ errors: [{ code: 32, message: 'Could not authenticate you.' }] }));
+  }
 
   if (usernameInput.length > 5 && passwordInput.length > 5) {
     backgroundScrape();
