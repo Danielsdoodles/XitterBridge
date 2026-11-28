@@ -956,15 +956,34 @@ function registerSinkUsers(sink) {
   }
 }
 
-async function openXPage(tokens) {
-  const browser = await puppeteer.launch({
+// One Chrome kept running and reused by every job (each job gets its own tab). Starting Chrome took
+// several seconds per job on Render; with many jobs queued, that made everything slow and timed out
+// notifications. It's restarted after 30 jobs (to keep memory in check) or if it crashes.
+let sharedBrowser = null;
+let sharedBrowserJobs = 0;
+const BROWSER_RECYCLE_AFTER = 30;
+async function getSharedBrowser() {
+  if (sharedBrowser && sharedBrowser.isConnected() && sharedBrowserJobs < BROWSER_RECYCLE_AFTER) return sharedBrowser;
+  if (sharedBrowser) { const old = sharedBrowser; sharedBrowser = null; old.close().catch(() => {}); }
+  sharedBrowser = await puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote', '--disable-extensions'],
     defaultViewport: { width: 1280, height: 800 },
     executablePath: await chromium.executablePath(),
     headless: chromium.headless,
     ignoreHTTPSErrors: true,
   });
-  const page = await browser.newPage();
+  sharedBrowserJobs = 0;
+  sharedBrowser.on('disconnected', () => { sharedBrowser = null; });
+  console.log('[XitterBridge] Started the shared browser.');
+  return sharedBrowser;
+}
+
+async function openXPage(tokens) {
+  const real = await getSharedBrowser();
+  sharedBrowserJobs++;
+  const page = await real.newPage();
+  // Jobs call browser.close() when done: for the shared browser that closes just this job's tab.
+  const browser = { close: () => page.close().catch(() => {}), isConnected: () => real.isConnected() };
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
   const clean = v => String(v || '').trim().replace(/^["']|["']$/g, '');
   await page.setCookie(
@@ -1146,7 +1165,10 @@ function scrapeNotifications() {
   notificationsInFlight = (async () => {
     const tokens = await getTokens();
     if (!tokens.auth_token || !tokens.ct0) return null;
-    if (!(await acquireBrowser(60000))) return null;
+    if (!(await acquireBrowser(150000, true))) {
+      console.log('[XitterBridge Notifications] Browser stayed busy; will try again on the next open.');
+      return null;
+    }
     let browser, landedUrl = '';
     const sink = newSink();
     sink.keepRaw = true;
@@ -2764,7 +2786,7 @@ function prefetchMomentCovers(trends, key = 'today') {
   if (Date.now() - (momentPrefetchAt.get(key) || 0) < 10 * 60 * 1000) return;
   momentPrefetchAt.set(key, Date.now());
   // Only trends without their own picture need a search to find one; do the first few, one at a time.
-  trends.filter(t => !t.image).slice(0, 4).reduce((p, t) => p.then(() => searchCache.has(`top:${String(t.query).toLowerCase()}`) ? null : scrapeSearch(t.query, 'top')).catch(() => {}), Promise.resolve());
+  trends.filter(t => !t.image).slice(0, 2).reduce((p, t) => p.then(() => searchCache.has(`top:${String(t.query).toLowerCase()}`) ? null : scrapeSearch(t.query, 'top')).catch(() => {}), Promise.resolve());
 }
 
 app.get(['/1.1/moments/categories.json', '/1/moments/categories.json'], async (req, res) => {
