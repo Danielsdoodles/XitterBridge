@@ -731,6 +731,18 @@ function tweetFromGraphQL(r, depth = 0) {
   };
 }
 
+// First picture URL inside a trend/story object (X attaches a thumbnail to many of them).
+function firstImageUrl(node, depth = 0) {
+  if (!node || depth > 6) return null;
+  if (typeof node === 'string') return /^https:\/\/pbs\.twimg\.com\/(?!profile_images|profile_banners)/.test(node) ? node : null;
+  if (typeof node !== 'object') return null;
+  for (const v of Array.isArray(node) ? node : Object.values(node)) {
+    const r = firstImageUrl(v, depth + 1);
+    if (r) return r;
+  }
+  return null;
+}
+
 function newSink() {
   return { tweets: [], users: new Map(), userItems: [], trends: [], notifications: [], ops: [], raw: [], seen: new Set(), pending: [], responses: 0, profileUser: null, created: null, createdError: null, retweetedId: null };
 }
@@ -797,8 +809,13 @@ function collectFromGraphQL(json, sink) {
           if (m) { try { query = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch (e) {} }
         }
         const meta = node.trend_metadata || {};
-        sink.trends.push({ name: node.name, query, volumeText: meta.meta_description || '', context: meta.domain_context || '' });
+        sink.trends.push({ name: node.name, query, volumeText: meta.meta_description || '', context: meta.domain_context || '', image: firstImageUrl(node) });
       }
+    }
+    // News / event stories on Explore tabs: they have a title and usually a picture.
+    const tn = String(node.__typename || node.itemType || '');
+    if (/Event(Summary)?$|NewsArticle|Story/.test(tn) && typeof node.title === 'string' && node.title && !sink.trends.some(x => x.name === node.title)) {
+      sink.trends.push({ name: node.title, query: node.title, volumeText: '', context: typeof node.supportingText === 'string' ? node.supportingText : (typeof node.timeString === 'string' ? node.timeString : ''), image: firstImageUrl(node), isStory: true });
     }
     // People results (search "People" tab): keep them in the order X lists them.
     if ((node.itemType === 'TimelineUser' || node.__typename === 'TimelineUser') && node.user_results && node.user_results.result) {
@@ -1829,6 +1846,10 @@ async function backgroundScrape() {
   }
 }
 
+setTimeout(() => {
+  scrapeTrends('trending').then(() => scrapeTrends('for-you')).then(r => { if (r && r.trends) prefetchMomentCovers(r.trends, 'today'); }).catch(() => {});
+}, 20000);
+
 getCachedAccountFromWorker().then(acc => {
   if (acc) cachedAccountProfile = acc;
 });
@@ -2062,8 +2083,9 @@ app.all('/oauth/access_token', async (req, res) => {
   const accessToken = bridgeAccessToken();
   const accessTokenSecret = bridgeAccessSecret();
 
+  console.log(`[XitterBridge Login] ${usernameInput ? 'username/password (xAuth)' : 'OAuth'} sign-in -> @${activeScreenName} (${activeUserId})`);
   res.setHeader('Content-Type', 'application/x-www-form-urlencoded; charset=utf-8');
-  return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${activeScreenName}`);
+  return res.status(200).send(`oauth_token=${accessToken}&oauth_token_secret=${accessTokenSecret}&user_id=${activeUserId}&screen_name=${encodeURIComponent(activeScreenName)}&x_auth_expires=0`);
 });
 
 app.get('/1.1/help/configuration.json', (req, res) => res.status(200).json({ dm_text_character_limit: 10000 }));
@@ -2349,15 +2371,65 @@ app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
 // Layouts below were read from the app itself (Twitter.Windows.dll data classes + its bundled
 // js/Hometimeline.json sample). The app parses with Newtonsoft (case-insensitive, unknown keys ignored).
 
-// Home timeline: a plain list of tweets, exactly like the sample file the app ships with.
+// Timelines use Twitter's "timeline" format (the app's TimelineResponse class):
+//   { twitter_objects: { tweets: { id: tweet }, users: { id: user }, events: {} },
+//     response: { timeline: [{ entity_id, tweet: { id } }], cursor: { top, bottom } } }
+function timelineResponse(tweets) {
+  const tw = {}, us = {};
+  const add = t => {
+    if (!t || tw[t.id_str]) return;
+    tw[t.id_str] = t;
+    if (t.user) us[t.user.id_str] = t.user;
+    if (t.retweeted_status) add(t.retweeted_status);
+    if (t.quoted_status) add(t.quoted_status);
+  };
+  tweets.forEach(add);
+  return {
+    twitter_objects: { tweets: tw, users: us, events: {} },
+    response: {
+      timeline: tweets.map(t => ({ entity_id: t.id_str, tweet: { id: t.id_str } })),
+      cursor: { top: tweets.length ? tweets[0].id_str : '0', bottom: tweets.length ? tweets[tweets.length - 1].id_str : '0' }
+    }
+  };
+}
+
+function cursorQuery(q) {
+  // The app pages with up_cursor (newer) / down_cursor (older), or the usual since_id / max_id.
+  return { since_id: q.since_id || q.up_cursor, max_id: q.max_id || q.down_cursor };
+}
+
 app.get(['/1.1/timeline/home.json', '/1/timeline/home.json'], async (req, res) => {
   backgroundScrape();
   let timeline = [...localTimeline, ...(await getCachedTimelineFromWorker())].map(t => sanitizeTweet(t));
   const byId = new Map(); timeline.forEach(t => byId.set(t.id_str, t));
   timeline = Array.from(byId.values()).sort((a, b) => { try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; } });
-  timeline = filterByIdRange(timeline, { since_id: req.query.since_id || req.query.up_cursor, max_id: req.query.max_id || req.query.down_cursor }).slice(0, Number(req.query.count) || 50);
+  timeline = filterByIdRange(timeline, cursorQuery(req.query)).slice(0, Number(req.query.count) || 50);
   console.log(`[XitterBridge timeline/home] ${timeline.length} tweets (Windows 10 app)`);
-  return res.status(200).json(timeline);
+  return res.status(200).json(timelineResponse(timeline));
+});
+
+// A person's tweets on their profile (Windows 10 app).
+app.get(['/1.1/timeline/user.json', '/1/timeline/user.json'], async (req, res) => {
+  const target = req.query.screen_name || handleForUserId(req.query.user_id) || (req.query.user_id && cachedAccountProfile && idMatches(req.query.user_id, cachedAccountProfile.id_str) ? cachedAccountProfile.screen_name : '');
+  if (!target) return res.status(200).json(timelineResponse([]));
+  const key = String(target).toLowerCase();
+  const fromHome = (await getCachedTimelineFromWorker()).filter(t => t.user?.screen_name?.toLowerCase() === key);
+  const cachedProf = profileCache.get(key);
+  const prof = (fromHome.length || (cachedProf && cachedProf.tweets && cachedProf.tweets.length)) ? (getProfile(target, false).catch(() => {}), cachedProf) : await getProfile(target);
+  const fromProfile = prof && prof.tweets ? prof.tweets.map(t => sanitizeTweet(t)) : [];
+  const byId = new Map(); [...fromHome, ...fromProfile].forEach(t => byId.set(t.id_str, t));
+  let list = Array.from(byId.values()).sort((a, b) => { try { return Number(BigInt(b.id_str) - BigInt(a.id_str)); } catch (e) { return 0; } });
+  list = filterByIdRange(list, cursorQuery(req.query)).slice(0, Number(req.query.count) || 20);
+  console.log(`[XitterBridge timeline/user] @${target}: ${list.length} tweets (Windows 10 app)`);
+  return res.status(200).json(timelineResponse(list));
+});
+
+// statuses/show.json?id=... (the Windows 10 app's way of opening one tweet)
+app.get(['/1.1/statuses/show.json', '/1/statuses/show.json'], async (req, res) => {
+  const id = String(req.query.id || '');
+  if (!id) return res.status(200).json({});
+  const found = (await findAnyTweet(id)) || ((await getConversation(id)) || { tweets: [] }).tweets.find(t => t.id_str === id);
+  return res.status(200).json(found ? sanitizeTweet(found) : {});
 });
 
 // ---------- Moments (rebuilt from trending topics) ----------
@@ -2371,7 +2443,10 @@ app.get(['/1.1/timeline/home.json', '/1/timeline/home.json'], async (req, res) =
 //   MomentMedia     { tweet_id, type, media: { media_id, size, url, display_url }, render: { crops } }
 const MOMENT_CATEGORIES = [
   { category_id: 'today', name: 'Today' },
-  { category_id: 'trending', name: 'Trending' }
+  { category_id: 'trending', name: 'Trending' },
+  { category_id: 'news', name: 'News' },
+  { category_id: 'sports', name: 'Sports' },
+  { category_id: 'entertainment', name: 'Entertainment' }
 ];
 const momentIndex = new Map(); // moment id -> trend
 
@@ -2379,12 +2454,22 @@ function momentIdFor(trend) {
   return String(parseInt(crypto.createHash('sha1').update(String(trend.name).toLowerCase()).digest('hex').slice(0, 12), 16));
 }
 
-async function ensureTrends() {
-  if (!(trendsCache.trends && Date.now() - trendsCache.fetchedAt < 15 * 60 * 1000)) {
-    const job = scrapeTrends();
-    if (!trendsCache.trends) await Promise.race([job, new Promise(r => setTimeout(r, SEARCH_WAIT_MS))]);
+// The Windows 10 app waits much longer than the phone app, so Moments can wait for real trends
+// instead of showing placeholders.
+const MOMENTS_WAIT_MS = Number(process.env.MOMENTS_WAIT_MS) || 45000;
+// Real trends/stories for one Moments tab. Never placeholders: if X hasn't answered, the list is empty
+// and the app shows its own "couldn't load Moments" message (pull to refresh tries again).
+async function ensureTrends(category = 'today') {
+  const tab = EXPLORE_TABS[category] || 'for-you';
+  const cached = tabCache.get(tab);
+  if (!(cached && Date.now() - cached.fetchedAt < 15 * 60 * 1000)) {
+    const job = scrapeTrends(tab);
+    if (!cached) await Promise.race([job, new Promise(r => setTimeout(r, MOMENTS_WAIT_MS))]);
   }
-  return trendsCache.trends || FALLBACK_TRENDS;
+  const fresh = tabCache.get(tab);
+  if (fresh) return fresh.trends;
+  if (category === 'trending' && trendsCache.trends) return trendsCache.trends;
+  return [];
 }
 
 function cropsFor(w, h) {
@@ -2411,6 +2496,17 @@ function momentMediaFromTweet(t) {
   };
 }
 
+// A cover made from a picture URL alone (X's trend/story thumbnails are 16:9 crops).
+function momentMediaFromImage(url, momentId) {
+  const w = 1200, h = 675;
+  return {
+    tweet_id: null,
+    type: 'image',
+    media: { media_id: momentId, size: { w, h }, url, display_url: url, media_url_https: url, media_url: url.replace(/^https:/, 'http:') },
+    render: { crops: cropsFor(w, h) }
+  };
+}
+
 function momentTweets(trend) {
   const found = searchCache.get(`top:${String(trend.query).toLowerCase()}`);
   return found ? found.tweets.map(t => sanitizeTweet(t)).slice(0, 25) : [];
@@ -2420,19 +2516,21 @@ function momentModel(trend, tweets) {
   const id = momentIdFor(trend);
   momentIndex.set(id, trend);
   const coverTweet = tweets.find(t => t.extended_entities && t.extended_entities.media && t.extended_entities.media.length);
+  // Prefer the picture X shows with the trend/story; otherwise the first picture among its top tweets.
+  const cover = trend.image ? momentMediaFromImage(trend.image, id) : (coverTweet ? momentMediaFromTweet(coverTweet) : null);
   return {
     id,
     title: trend.name,
-    description: trend.volumeText ? `${trend.name} · ${trend.volumeText}` : `What people are saying about ${trend.name}`,
+    description: trend.isStory ? (trend.context || `The latest on ${trend.name}`) : (trend.volumeText ? `${trend.name} · ${trend.volumeText}` : `What people are saying about ${trend.name}`),
     url: `https://twitter.com/i/moments/${id}`,
-    is_live: true,
-    time_string: trend.volumeText || 'Trending now',
-    subcategory_string: trend.context || 'Trending',
+    is_live: false, // the app draws a "Now" badge on top of the time text for live Moments
+    time_string: trend.volumeText || (trend.isStory ? 'Today' : 'Trending'),
+    subcategory_string: (trend.isStory ? '' : trend.context) || (trend.category ? trend.category.replace(/^./, c => c.toUpperCase()) : 'Trending'),
     subcategory_favicon_url: null,
     sensitive: false,
     can_subscribe: false,
     is_subscribed: false,
-    cover_media: coverTweet ? momentMediaFromTweet(coverTweet) : null
+    cover_media: cover
   };
 }
 
@@ -2447,11 +2545,12 @@ function momentModuleModel(trend, withContents) {
 }
 
 // Covers come from each trend's top tweets: fetch the first few trends' results in the background.
-let momentPrefetchAt = 0;
-function prefetchMomentCovers(trends) {
-  if (Date.now() - momentPrefetchAt < 10 * 60 * 1000) return;
-  momentPrefetchAt = Date.now();
-  trends.slice(0, 5).reduce((p, t) => p.then(() => searchCache.has(`top:${String(t.query).toLowerCase()}`) ? null : scrapeSearch(t.query, 'top')).catch(() => {}), Promise.resolve());
+const momentPrefetchAt = new Map(); // tab -> time
+function prefetchMomentCovers(trends, key = 'today') {
+  if (Date.now() - (momentPrefetchAt.get(key) || 0) < 10 * 60 * 1000) return;
+  momentPrefetchAt.set(key, Date.now());
+  // Only trends without their own picture need a search to find one; do the first few, one at a time.
+  trends.filter(t => !t.image).slice(0, 4).reduce((p, t) => p.then(() => searchCache.has(`top:${String(t.query).toLowerCase()}`) ? null : scrapeSearch(t.query, 'top')).catch(() => {}), Promise.resolve());
 }
 
 app.get(['/1.1/moments/categories.json', '/1/moments/categories.json'], async (req, res) => {
@@ -2460,22 +2559,24 @@ app.get(['/1.1/moments/categories.json', '/1/moments/categories.json'], async (r
 });
 
 app.get(['/1.1/moments/guide.json', '/1/moments/guide.json'], async (req, res) => {
-  const trends = await ensureTrends();
-  prefetchMomentCovers(trends);
-  const list = req.query.guide_category_id === 'trending' ? trends.slice(5, 25) : trends.slice(0, 20);
-  const items = list.map(t => momentModuleModel(t, false));
+  const category = EXPLORE_TABS[req.query.guide_category_id] ? req.query.guide_category_id : 'today';
+  const trends = (await ensureTrends(category)).map(t => ({ ...t, category }));
+  prefetchMomentCovers(trends, category);
+  const items = trends.slice(0, 25).map(t => momentModuleModel(t, false));
   const modules = [];
   if (items.length) modules.push({ module_type: 'hero', moments: items.slice(0, 1) });
   if (items.length > 1) modules.push({ module_type: 'list', moments: items.slice(1) });
   const withCover = items.filter(i => i.moment.cover_media).length;
-  console.log(`[XitterBridge Moments] guide (${req.query.guide_category_id || 'default'}): ${items.length} moments from trends, ${withCover} with cover pictures so far`);
+  console.log(`[XitterBridge Moments] guide "${category}": ${items.length} moments, ${withCover} with cover pictures${items.length ? '' : ' (X has not answered yet - pull to refresh in a minute)'}`);
   return res.status(200).json({ modules });
 });
 
 app.get(['/1.1/moments/capsule.json', '/1/moments/capsule.json', '/1.1/moments/capsule/:id.json'], async (req, res) => {
   const id = String(req.query.moment_id || req.query.id || (req.params && req.params.id) || '').replace('.json', '');
   let trend = momentIndex.get(id);
-  if (!trend) { const trends = await ensureTrends(); trend = trends.find(t => momentIdFor(t) === id); }
+  if (!trend) {
+    for (const entry of tabCache.values()) { trend = entry.trends.find(t => momentIdFor(t) === id); if (trend) break; }
+  }
   if (!trend) {
     console.log(`[XitterBridge Moments] moment ${id} isn't a current trend anymore`);
     return res.status(200).json({ errors: [{ code: 34, message: 'Sorry, that page does not exist.' }] });
@@ -2622,15 +2723,21 @@ function parseVolume(text) {
   return Math.round(n);
 }
 
-function scrapeTrends() {
-  if (trendsInFlight) return trendsInFlight;
-  trendsInFlight = (async () => {
+// Explore tabs -> Moments tabs. Each tab is fetched and cached on its own.
+const EXPLORE_TABS = { today: 'for-you', trending: 'trending', news: 'news', sports: 'sports', entertainment: 'entertainment' };
+const tabCache = new Map();      // tab -> { trends, fetchedAt }
+const tabInFlight = new Map();
+
+function scrapeTrends(tab = 'trending') {
+  if (tab === 'trending' && trendsInFlight) return trendsInFlight;
+  if (tab !== 'trending' && tabInFlight.has(tab)) return tabInFlight.get(tab);
+  const job = (async () => {
     const tokens = await getTokens();
     if (!tokens.auth_token || !tokens.ct0) return null;
     if (!(await acquireBrowser(60000))) return null;
     let browser;
     const sink = newSink();
-    const watchdog = startWatchdog(() => browser, 'Trends fetch');
+    const watchdog = startWatchdog(() => browser, `Explore "${tab}" fetch`);
     sink.keepRaw = true;
     let landedUrl = '';
     try {
@@ -2638,11 +2745,13 @@ function scrapeTrends() {
       browser = opened.browser;
       const page = opened.page;
       attachGraphQLCapture(page, sink);
-      await page.goto('https://x.com/explore/tabs/trending', { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
+      await page.goto(`https://x.com/explore/tabs/${tab}`, { waitUntil: 'domcontentloaded', timeout: 35000 }).catch(() => {});
       landedUrl = page.url();
       // Wait until a trend has been captured (or give up after ~25s).
       for (let i = 0; i < 50 && sink.trends.length === 0; i++) await new Promise(r => setTimeout(r, 500));
-      await new Promise(r => setTimeout(r, 1500));
+      // Stories further down load as you scroll.
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+      await new Promise(r => setTimeout(r, 2000));
       await Promise.allSettled(sink.pending);
     } catch (e) {
       scrapeStats.lastError = `trends: ${e && e.message ? e.message : e}`;
@@ -2651,16 +2760,22 @@ function scrapeTrends() {
       if (browser) await browser.close().catch(() => {});
       isScraping = false;
     }
-    scrapeStats.lastTrends = { at: new Date().toISOString(), landedUrl, graphqlResponses: sink.responses, operations: sink.ops, trends: sink.trends.length };
+    const withPics = sink.trends.filter(t => t.image).length;
+    scrapeStats.lastTrends = { tab, at: new Date().toISOString(), landedUrl, graphqlResponses: sink.responses, operations: sink.ops, trends: sink.trends.length, withPictures: withPics };
     lastTrendsRaw = sink.raw;
-    console.log(`[XitterBridge Trends] ${sink.responses} API responses, ${sink.trends.length} trends.`);
-    if (sink.trends.length) {
-      trendsCache.trends = sink.trends;
-      trendsCache.fetchedAt = Date.now();
+    console.log(`[XitterBridge Trends] Explore "${tab}": ${sink.responses} API responses, ${sink.trends.length} trends/stories (${withPics} with pictures).`);
+    if (!sink.trends.length) return null;
+    const entry = { trends: sink.trends, fetchedAt: Date.now() };
+    tabCache.set(tab, entry);
+    if (tab === 'trending') {
+      // The plain trends list (trends/place) only uses real trends, not news stories.
+      const real = sink.trends.filter(t => !t.isStory);
+      if (real.length) { trendsCache.trends = real; trendsCache.fetchedAt = Date.now(); }
     }
-    return sink.trends.length ? trendsCache : null;
-  })().finally(() => { trendsInFlight = null; });
-  return trendsInFlight;
+    return entry;
+  })().finally(() => { if (tab === 'trending') trendsInFlight = null; else tabInFlight.delete(tab); });
+  if (tab === 'trending') trendsInFlight = job; else tabInFlight.set(tab, job);
+  return job;
 }
 
 function toApiTrend(t) {
