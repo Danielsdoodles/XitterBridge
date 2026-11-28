@@ -26,9 +26,12 @@ const VIDEO_MODE = (process.env.VIDEO_MODE || 'photo').toLowerCase();
 // How long users/show and user_timeline wait for a fresh profile fetch before answering with what's known.
 const PROFILE_WAIT_MS = Number(process.env.PROFILE_WAIT_MS) || 6000; // old apps give up after ~10-15s
 const STORE = { forStorage: true };
-// Profile picture size sent to the app. Tested on the phone: "normal" stops ALL pictures and media from
-// loading in this app, 400x400 loads. Other options to try for sizing: 200x200, bigger, original.
-const AVATAR_SIZE = (process.env.AVATAR_SIZE || '400x400').toLowerCase();
+// Profile pictures. Default "normal": the app gets addresses ending in "_normal" (so it can swap in the
+// size it wants, like old Twitter), served through the bridge, which always answers with the sharp
+// 400x400 picture - so they're never blurry. Other values send X's address directly at that size:
+// 400x400, 200x200, bigger, original.
+const AVATAR_SIZE = (process.env.AVATAR_SIZE || 'normal').toLowerCase();
+let publicBase = (process.env.PUBLIC_URL || 'https://xitterbridge.onrender.com').replace(/\/$/, '');
 // IMAGE_PROXY=on: pictures are fetched by this server and passed to the phone, so the phone never has to
 // connect to X's image server itself (fixes phones that can't reach pbs.twimg.com).
 const IMAGE_PROXY = /^(on|true|1|yes)$/i.test(process.env.IMAGE_PROXY || '');
@@ -73,6 +76,7 @@ app.use((req, res, next) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
   }
   
+  if (req.path.startsWith('/1.1/') || req.path.startsWith('/1/')) rememberBase(req);
   if (!req.path.startsWith('/img')) console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
   next();
 });
@@ -322,14 +326,34 @@ function forceJpgUrl(url) {
   return fixed.split('?')[0];
 }
 
+// https://<bridge>/img/a/<hex of the picture's address>_normal.jpg  (hex: no "_" inside the code, so
+// whatever size the app swaps in after it is easy to strip)
+function bridgeAvatarUrl(base, ext) {
+  const e = /png/i.test(ext) ? 'png' : 'jpg';
+  return `${publicBase}/img/a/${Buffer.from(`${base}|${ext}`).toString('hex')}_normal.${e}`;
+}
+function decodeBridgeAvatar(url) {
+  const m = String(url).match(/\/img\/a\/([0-9a-f]+)(?:_[a-z0-9_]+)?(?:\.[a-z]+)?(?::[a-z]+)?$/i);
+  if (!m) return null;
+  const [base, ext] = Buffer.from(m[1], 'hex').toString('utf8').split('|');
+  return base && ext && base.startsWith('https://pbs.twimg.com/profile_images/') ? { base, ext } : null;
+}
+
 function forceJpgAvatarUrl(url) {
   const defaultAvatar = "https://abs.twimg.com/sticky/default_profile_images/default_profile_normal.png";
   if (!url) return defaultAvatar;
   let fixed = fixUrl(url);
+  // Already one of ours (e.g. read back from the Worker): rebuild it so it stays consistent.
+  const mine = fixed.includes('/img/a/') ? decodeBridgeAvatar(fixed) : null;
+  if (mine) {
+    if (AVATAR_SIZE === 'normal') return bridgeAvatarUrl(mine.base, mine.ext);
+    fixed = `${mine.base}.${mine.ext}`;
+  }
   if (fixed.includes('pbs.twimg.com/profile_images/')) {
     // Size comes from AVATAR_SIZE (default 400x400, the format the app displayed correctly).
     // Keep the picture's real file type: a .png avatar asked for as .jpg can fail to load.
     const m = fixed.split('?')[0].match(/^(.*?)(?:_(?:normal|mini|bigger|reasonably_small|200x200|x96|400x400))?\.(jpe?g|png|gif|webp)$/i);
+    if (m && AVATAR_SIZE === 'normal') return bridgeAvatarUrl(m[1], m[2].toLowerCase());
     if (m) return AVATAR_SIZE === 'original' ? `${m[1]}.${m[2].toLowerCase()}` : `${m[1]}_${AVATAR_SIZE}.${m[2].toLowerCase()}`;
     return fixed.split('?')[0];
   }
@@ -1946,7 +1970,6 @@ app.get('/clear-cache', async (req, res) => {
 // ---------- Pictures for Moments ----------
 // Served as https://<bridge>/img/c/<code>.jpg: no "?format=..." in the address (old apps append ":large",
 // which breaks those), a phone-sized version, and any ":size" the app adds is ignored.
-let publicBase = (process.env.PUBLIC_URL || 'https://xitterbridge.onrender.com').replace(/\/$/, '');
 function rememberBase(req) {
   if (process.env.PUBLIC_URL || !req || !req.headers || !req.headers.host) return;
   publicBase = `https://${req.headers.host}`;
@@ -2002,6 +2025,23 @@ async function pictureSize(url) {
 async function measurePictures(trends) {
   for (const t of trends) if (t.image && !pictureSizeCache.has(t.image)) await pictureSize(t.image);
 }
+
+app.get('/img/a/:file', async (req, res) => {
+  const pic = decodeBridgeAvatar('/img/a/' + String(req.params.file));
+  if (!pic) return res.status(400).end();
+  try {
+    for (const candidate of [`${pic.base}_400x400.${pic.ext}`, `${pic.base}.${pic.ext}`, `${pic.base}_normal.${pic.ext}`]) {
+      const r = await fetch(candidate, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!r.ok) continue;
+      res.setHeader('Content-Type', r.headers.get('content-type') || (pic.ext === 'png' ? 'image/png' : 'image/jpeg'));
+      res.setHeader('Cache-Control', 'public, max-age=604800');
+      return res.status(200).send(Buffer.from(await r.arrayBuffer()));
+    }
+    return res.status(404).end();
+  } catch (e) {
+    return res.status(502).end();
+  }
+});
 
 app.get('/img/c/:file', async (req, res) => {
   try {
