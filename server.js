@@ -2503,6 +2503,12 @@ app.get('/1.1/statuses/home_timeline.json', async (req, res) => {
       timeline = timeline.filter(tweet => { try { return BigInt(tweet.id_str || tweet.id) < maxIdNum; } catch (e) { return true; } });
     } catch (e) {}
   }
+  // Send only as many tweets as the app asked for (Twitter's default 20, max 200). The whole cache
+  // (up to 500 tweets, several MB) is more than the phone app can take in one reply.
+  const want = Math.min(Math.max(Number(req.query.count) || 20, 1), 200);
+  timeline = timeline.slice(0, want);
+  const body = exactJsonStringify(timeline);
+  console.log(`[XitterBridge home_timeline] ${timeline.length} tweets (asked for ${req.query.count || 'default'}), ${Math.round(body.length / 1024)} KB`);
   return res.status(200).json(timeline);
 });
 
@@ -2515,8 +2521,9 @@ app.get('/1.1/statuses/mentions_timeline.json', async (req, res) => {
     const queryTag = `@${acc.screen_name.toLowerCase()}`;
     mentions = cachedTweets.filter(t => t.text && t.text.toLowerCase().includes(queryTag));
   }
-  const finalMentions = mentions.length > 0 ? mentions : cachedTweets.slice(0, 15);
-  return res.status(200).json(finalMentions.map(t => sanitizeTweet(t)));
+  // Only real mentions (it used to fill the list with random timeline tweets when there were none).
+  const want = Math.min(Math.max(Number(req.query.count) || 20, 1), 200);
+  return res.status(200).json(filterByIdRange(mentions.map(t => sanitizeTweet(t)), req.query).slice(0, want));
 });
 
 app.get('/1.1/statuses/user_timeline.json', async (req, res) => {
