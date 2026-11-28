@@ -73,7 +73,7 @@ app.use((req, res, next) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
   }
   
-  if (req.path !== '/img') console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
+  if (!req.path.startsWith('/img')) console.log(`[XitterBridge WP CLIENT] ${req.method} ${req.originalUrl || req.url}`);
   next();
 });
 
@@ -846,7 +846,14 @@ function attachGraphQLCapture(page, sink) {
       const op = (url.match(/\/graphql\/[^/]+\/([A-Za-z0-9_]+)/) || [])[1] || url;
       sink.ops.push(op);
       if (sink.keepRaw && sink.raw.length < 4) sink.raw.push({ op, body: JSON.stringify(json).slice(0, 6000) });
+      const trendsBefore = sink.trends.length;
       collectFromGraphQL(json, sink);
+      if (sink.keepRaw && sink.trends.length > trendsBefore && !sink.trendSnippet) {
+        // Keep X's own data around the first trend in this reply, to see where its picture lives.
+        const text = JSON.stringify(json);
+        const at = text.indexOf(JSON.stringify(sink.trends[trendsBefore].name).slice(1, -1));
+        sink.trendSnippet = { op, around_first_trend: text.slice(Math.max(0, at - 2500), at + 3500) };
+      }
       if (isNotifRest) parseNotificationsV2(json, sink);
       if (/\/CreateTweet\b/.test(url)) {
         const r = json && json.data && json.data.create_tweet && json.data.create_tweet.tweet_results && json.data.create_tweet.tweet_results.result;
@@ -1894,6 +1901,82 @@ app.get('/clear-cache', async (req, res) => {
   return res.send(`Cache cleared. Worker timeline wipe: ${workerStatus}. A fresh scrape has started; refresh your app in about a minute.`);
 });
 
+// ---------- Pictures for Moments ----------
+// Served as https://<bridge>/img/c/<code>.jpg: no "?format=..." in the address (old apps append ":large",
+// which breaks those), a phone-sized version, and any ":size" the app adds is ignored.
+let publicBase = (process.env.PUBLIC_URL || 'https://xitterbridge.onrender.com').replace(/\/$/, '');
+function rememberBase(req) {
+  if (process.env.PUBLIC_URL || !req || !req.headers || !req.headers.host) return;
+  publicBase = `https://${req.headers.host}`;
+}
+function cleanPictureUrl(url) {
+  return `${publicBase}/img/c/${Buffer.from(String(url)).toString('base64url')}.jpg`;
+}
+// Ask X for a medium-size version (originals can be 4096px, too big for a phone).
+function phoneSizedPicture(url) {
+  try {
+    const u = new URL(url);
+    if (!IMAGE_HOSTS.includes(u.hostname)) return null;
+    if (u.searchParams.has('format') || u.searchParams.has('name')) {
+      u.searchParams.set('name', 'medium');
+      if (!u.searchParams.has('format')) u.searchParams.set('format', 'jpg');
+      return u.toString();
+    }
+    if (/\/media\//.test(u.pathname)) { u.pathname = u.pathname.replace(/:(small|medium|large|orig|thumb)$/, ''); return u.toString() + ':medium'; }
+    return u.toString();
+  } catch (e) { return null; }
+}
+
+// Real width/height of a picture (reads only the start of the file).
+const pictureSizeCache = new Map();
+function sizeFromBytes(b) {
+  if (b.length > 24 && b[0] === 0x89 && b[1] === 0x50) return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };     // PNG
+  if (b.length > 4 && b[0] === 0xff && b[1] === 0xd8) {                                                              // JPEG
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const marker = b[i + 1];
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) return { w: b.readUInt16BE(i + 7), h: b.readUInt16BE(i + 5) };
+      i += 2 + b.readUInt16BE(i + 2);
+    }
+  }
+  if (b.length > 30 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP') {              // WebP (VP8X)
+    if (b.toString('ascii', 12, 16) === 'VP8X') return { w: 1 + b.readUIntLE(24, 3), h: 1 + b.readUIntLE(27, 3) };
+  }
+  return null;
+}
+async function pictureSize(url) {
+  if (pictureSizeCache.has(url)) return pictureSizeCache.get(url);
+  const src = phoneSizedPicture(url);
+  if (!src) return null;
+  try {
+    const r = await fetch(src, { headers: { 'User-Agent': 'Mozilla/5.0', Range: 'bytes=0-65535' } });
+    if (!r.ok && r.status !== 206) return null;
+    const size = sizeFromBytes(Buffer.from(await r.arrayBuffer()));
+    if (size && size.w > 0 && size.h > 0) { pictureSizeCache.set(url, size); if (pictureSizeCache.size > 500) pictureSizeCache.delete(pictureSizeCache.keys().next().value); }
+    return size;
+  } catch (e) { return null; }
+}
+async function measurePictures(trends) {
+  for (const t of trends) if (t.image && !pictureSizeCache.has(t.image)) await pictureSize(t.image);
+}
+
+app.get('/img/c/:file', async (req, res) => {
+  try {
+    const code = String(req.params.file).replace(/:[a-z]+$/i, '').replace(/\.(jpe?g|png)$/i, '');
+    const original = Buffer.from(code, 'base64url').toString('utf8');
+    const src = phoneSizedPicture(original);
+    if (!src) return res.status(400).end();
+    const r = await fetch(src, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!r.ok) return res.status(r.status).end();
+    res.setHeader('Content-Type', r.headers.get('content-type') || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.status(200).send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    return res.status(502).end();
+  }
+});
+
 // Image proxy (X image hosts only, so it can't be used to fetch anything else).
 app.get('/img', async (req, res) => {
   try {
@@ -1962,12 +2045,17 @@ app.get('/debug/notifications', async (req, res) => {
 
 // What the server got from X's Explore page: /debug/trends (starts a fetch if none has run yet)
 app.get('/debug/trends', async (req, res) => {
-  if (!scrapeStats.lastTrends) await Promise.race([scrapeTrends(), new Promise(r => setTimeout(r, 60000))]);
+  // /debug/trends?tab=for-you (or trending, news, sports, entertainment)
+  const tab = Object.values(EXPLORE_TABS).includes(req.query.tab) ? req.query.tab : 'for-you';
+  if (!tabCache.get(tab)) await Promise.race([scrapeTrends(tab), new Promise(r => setTimeout(r, 70000))]);
+  const entry = tabCache.get(tab);
   return res.status(200).json({
+    tab,
     last_fetch: scrapeStats.lastTrends || 'no fetch finished yet, reload in a minute',
-    trends_found: trendsCache.trends ? trendsCache.trends.slice(0, 5) : [],
-    last_error: scrapeStats.lastError,
-    raw_samples_from_x: lastTrendsRaw
+    trends_found: entry ? entry.trends.slice(0, 6).map(t => ({ name: t.name, context: t.context, volume: t.volumeText, picture: t.image || null, story: !!t.isStory })) : [],
+    with_pictures: entry ? entry.trends.filter(t => t.image).length + ' of ' + entry.trends.length : null,
+    x_data_around_first_trend: entry ? entry.snippet : null,
+    last_error: scrapeStats.lastError
   });
 });
 
@@ -2441,12 +2529,13 @@ app.get(['/1.1/statuses/show.json', '/1/statuses/show.json'], async (req, res) =
 //   MomentModel     { id, title, description, url, is_live, time_string, subcategory_string,
 //                     subcategory_favicon_url, sensitive, can_subscribe, is_subscribed, cover_media }
 //   MomentMedia     { tweet_id, type, media: { media_id, size, url, display_url }, render: { crops } }
+// Same tabs as the original Twitter app. "Fun" shows what's trending (X has no Fun tab).
 const MOMENT_CATEGORIES = [
   { category_id: 'today', name: 'Today' },
-  { category_id: 'trending', name: 'Trending' },
   { category_id: 'news', name: 'News' },
   { category_id: 'sports', name: 'Sports' },
-  { category_id: 'entertainment', name: 'Entertainment' }
+  { category_id: 'entertainment', name: 'Entertainment' },
+  { category_id: 'fun', name: 'Fun' }
 ];
 const momentIndex = new Map(); // moment id -> trend
 
@@ -2486,23 +2575,29 @@ function cropsFor(w, h) {
 function momentMediaFromTweet(t) {
   const m = t.extended_entities && t.extended_entities.media && t.extended_entities.media[0];
   if (!m) return { tweet_id: t.id_str, type: 'text' };
-  const large = (m.sizes && m.sizes.large) || { w: 1200, h: 1200 };
-  const w = Number(large.w) || 1200, h = Number(large.h) || 1200;
+  // Crops are worked out on the medium-size picture the app is actually given (longest side 1200).
+  const big = (m.sizes && (m.sizes.large || m.sizes.medium)) || { w: 1200, h: 1200 };
+  const scale = Math.min(1, 1200 / Math.max(Number(big.w) || 1200, Number(big.h) || 1200));
+  const w = Math.round((Number(big.w) || 1200) * scale), h = Math.round((Number(big.h) || 1200) * scale);
+  const pic = cleanPictureUrl(m.media_url_https);
   return {
     tweet_id: t.id_str,
     type: m.type === 'video' || m.type === 'animated_gif' ? 'video' : 'image',
-    media: { media_id: m.id_str, size: { w, h }, url: m.media_url_https, display_url: m.display_url, media_url_https: m.media_url_https, media_url: m.media_url },
+    media: { media_id: m.id_str, size: { w, h }, url: pic, display_url: m.display_url, media_url_https: pic, media_url: pic },
     render: { crops: cropsFor(w, h) }
   };
 }
 
 // A cover made from a picture URL alone (X's trend/story thumbnails are 16:9 crops).
 function momentMediaFromImage(url, momentId) {
-  const w = 1200, h = 675;
+  // Real size if we've measured it (crops must fit inside the picture), else X's usual 16:9 thumbnail.
+  const real = pictureSizeCache.get(url);
+  const w = real ? real.w : 1200, h = real ? real.h : 675;
+  const pic = cleanPictureUrl(url);
   return {
     tweet_id: null,
     type: 'image',
-    media: { media_id: momentId, size: { w, h }, url, display_url: url, media_url_https: url, media_url: url.replace(/^https:/, 'http:') },
+    media: { media_id: momentId, size: { w, h }, url: pic, display_url: pic, media_url_https: pic, media_url: pic },
     render: { crops: cropsFor(w, h) }
   };
 }
@@ -2512,8 +2607,13 @@ function momentTweets(trend) {
   return found ? found.tweets.map(t => sanitizeTweet(t)).slice(0, 25) : [];
 }
 
+function isHeadline(trend) {
+  return trend.isStory || String(trend.name).length > 40 || String(trend.name).split(/\s+/).length >= 5;
+}
+
 function momentModel(trend, tweets) {
   const id = momentIdFor(trend);
+  const headline = isHeadline(trend);
   momentIndex.set(id, trend);
   const coverTweet = tweets.find(t => t.extended_entities && t.extended_entities.media && t.extended_entities.media.length);
   // Prefer the picture X shows with the trend/story; otherwise the first picture among its top tweets.
@@ -2521,11 +2621,11 @@ function momentModel(trend, tweets) {
   return {
     id,
     title: trend.name,
-    description: trend.isStory ? (trend.context || `The latest on ${trend.name}`) : (trend.volumeText ? `${trend.name} · ${trend.volumeText}` : `What people are saying about ${trend.name}`),
+    description: headline ? (trend.context && trend.context !== trend.name ? trend.context : (trend.volumeText || '')) : (trend.volumeText ? `${trend.name} · ${trend.volumeText}` : `What people are saying about ${trend.name}`),
     url: `https://twitter.com/i/moments/${id}`,
     is_live: false, // the app draws a "Now" badge on top of the time text for live Moments
-    time_string: trend.volumeText || (trend.isStory ? 'Today' : 'Trending'),
-    subcategory_string: (trend.isStory ? '' : trend.context) || (trend.category ? trend.category.replace(/^./, c => c.toUpperCase()) : 'Trending'),
+    time_string: trend.volumeText || (headline ? 'Today' : 'Trending'),
+    subcategory_string: (headline ? '' : trend.context) || (headline ? 'News' : 'Trending'),
     subcategory_favicon_url: null,
     sensitive: false,
     can_subscribe: false,
@@ -2559,19 +2659,24 @@ app.get(['/1.1/moments/categories.json', '/1/moments/categories.json'], async (r
 });
 
 app.get(['/1.1/moments/guide.json', '/1/moments/guide.json'], async (req, res) => {
-  const category = EXPLORE_TABS[req.query.guide_category_id] ? req.query.guide_category_id : 'today';
+  rememberBase(req);
+  const asked = req.query.guide_category_id || req.query.category_id || req.query.category || '';
+  const category = EXPLORE_TABS[asked] ? asked : 'today';
   const trends = (await ensureTrends(category)).map(t => ({ ...t, category }));
+  // Measure the pictures we don't know yet (a few seconds at most) so the hero's crop fits.
+  await Promise.race([measurePictures(trends.slice(0, 25)), new Promise(r => setTimeout(r, 4000))]);
   prefetchMomentCovers(trends, category);
   const items = trends.slice(0, 25).map(t => momentModuleModel(t, false));
   const modules = [];
   if (items.length) modules.push({ module_type: 'hero', moments: items.slice(0, 1) });
   if (items.length > 1) modules.push({ module_type: 'list', moments: items.slice(1) });
   const withCover = items.filter(i => i.moment.cover_media).length;
-  console.log(`[XitterBridge Moments] guide "${category}": ${items.length} moments, ${withCover} with cover pictures${items.length ? '' : ' (X has not answered yet - pull to refresh in a minute)'}`);
+  console.log(`[XitterBridge Moments] guide "${category}" (app asked: ${req.originalUrl}): ${items.length} moments, ${withCover} with cover pictures${items.length ? '' : ' (X has not answered yet - pull to refresh in a minute)'}`);
   return res.status(200).json({ modules });
 });
 
 app.get(['/1.1/moments/capsule.json', '/1/moments/capsule.json', '/1.1/moments/capsule/:id.json'], async (req, res) => {
+  rememberBase(req);
   const id = String(req.query.moment_id || req.query.id || (req.params && req.params.id) || '').replace('.json', '');
   let trend = momentIndex.get(id);
   if (!trend) {
@@ -2724,7 +2829,7 @@ function parseVolume(text) {
 }
 
 // Explore tabs -> Moments tabs. Each tab is fetched and cached on its own.
-const EXPLORE_TABS = { today: 'for-you', trending: 'trending', news: 'news', sports: 'sports', entertainment: 'entertainment' };
+const EXPLORE_TABS = { today: 'for-you', news: 'news', sports: 'sports', entertainment: 'entertainment', fun: 'trending', trending: 'trending' };
 const tabCache = new Map();      // tab -> { trends, fetchedAt }
 const tabInFlight = new Map();
 
@@ -2765,8 +2870,9 @@ function scrapeTrends(tab = 'trending') {
     lastTrendsRaw = sink.raw;
     console.log(`[XitterBridge Trends] Explore "${tab}": ${sink.responses} API responses, ${sink.trends.length} trends/stories (${withPics} with pictures).`);
     if (!sink.trends.length) return null;
-    const entry = { trends: sink.trends, fetchedAt: Date.now() };
+    const entry = { trends: sink.trends, fetchedAt: Date.now(), snippet: sink.trendSnippet || null };
     tabCache.set(tab, entry);
+    measurePictures(sink.trends.slice(0, 25)).catch(() => {});
     if (tab === 'trending') {
       // The plain trends list (trends/place) only uses real trends, not news stories.
       const real = sink.trends.filter(t => !t.isStory);
