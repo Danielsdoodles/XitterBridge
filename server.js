@@ -2763,7 +2763,50 @@ app.get(['/1.1/statuses/media_timeline.json', '/1/statuses/media_timeline.json']
 // Suggestion lists the app shows on profiles and in Discover. The bridge has none yet, so answer with
 // the empty list the app expects (an empty {} isn't a list and can break the page).
 app.get(['/1/users/recommendations.json', '/1.1/users/recommendations.json'], (req, res) => res.status(200).json([]));
-app.get(['/1.1/users/suggestions.json', '/1/users/suggestions.json'], (req, res) => res.status(200).json([]));
+// ---------- Browse categories ("who to follow" by topic) ----------
+// Old API: users/suggestions.json -> [{ name, slug, size }], users/suggestions/<slug>.json -> { name, slug,
+// size, users: [...] }, users/suggestions/<slug>/members.json -> [...]. Each topic's people come from X's
+// people search for that topic; "Suggested" is the most-followed accounts the bridge has seen.
+const SUGGESTION_CATEGORIES = [
+  { name: 'Suggested', slug: 'suggested', query: null },
+  { name: 'News', slug: 'news', query: 'news' },
+  { name: 'Sports', slug: 'sports', query: 'sports' },
+  { name: 'Music', slug: 'music', query: 'music' },
+  { name: 'Entertainment', slug: 'entertainment', query: 'entertainment' },
+  { name: 'Gaming', slug: 'gaming', query: 'gaming' },
+  { name: 'Technology', slug: 'technology', query: 'technology' },
+  { name: 'Funny', slug: 'funny', query: 'funny' }
+];
+
+async function suggestionUsers(cat) {
+  const me = cachedAccountProfile && cachedAccountProfile.id_str;
+  const known = [...knownUsers.values()].filter(u => !isPlaceholderUser(u) && u.id_str !== me);
+  if (!cat.query) {
+    return known.filter(u => realCountsFor.has(u.screen_name.toLowerCase()))
+      .sort((a, b) => (b.followers_count || 0) - (a.followers_count || 0)).slice(0, 20);
+  }
+  const found = await getSearch(cat.query, 'users');
+  if (found && found.users.length) return found.users.filter(u => u.id_str !== me).slice(0, 20);
+  // X hasn't answered yet: people already known whose name/bio mention the topic.
+  const q = cat.query.toLowerCase();
+  return known.filter(u => (u.description || '').toLowerCase().includes(q) || (u.name || '').toLowerCase().includes(q)).slice(0, 20);
+}
+
+app.get(['/1.1/users/suggestions.json', '/1/users/suggestions.json'], (req, res) => {
+  console.log('[XitterBridge Suggestions] categories listed');
+  return res.status(200).json(SUGGESTION_CATEGORIES.map(c => ({ name: c.name, slug: c.slug, size: 20 })));
+});
+
+async function suggestionCategory(req, res, membersOnly) {
+  const slug = String(req.params.slug || '').replace('.json', '').toLowerCase();
+  const cat = SUGGESTION_CATEGORIES.find(c => c.slug === slug) || { name: slug.replace(/^./, c => c.toUpperCase()), slug, query: slug.replace(/-/g, ' ') };
+  const users = await suggestionUsers(cat);
+  console.log(`[XitterBridge Suggestions] "${cat.name}": ${users.length} people${users.length ? '' : ' (X still loading, try again shortly)'}`);
+  if (membersOnly) return res.status(200).json(users);
+  return res.status(200).json({ name: cat.name, slug: cat.slug, size: users.length, users });
+}
+app.get(['/1.1/users/suggestions/:slug/members.json', '/1/users/suggestions/:slug/members.json'], (req, res) => suggestionCategory(req, res, true));
+app.get(['/1.1/users/suggestions/:slug.json', '/1/users/suggestions/:slug.json', '/1.1/users/suggestions/:slug', '/1/users/suggestions/:slug'], (req, res) => suggestionCategory(req, res, false));
 app.get(['/1.1/saved_searches/list.json', '/1/saved_searches/list.json'], (req, res) => res.status(200).json([]));
 
 // Notifications tab: real notifications from X (no more made-up ones).
